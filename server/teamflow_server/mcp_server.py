@@ -6,7 +6,8 @@
   content 文本以错误码开头（``needs_human：…``），因为出错时模型只看得到 content（S1 实测），
   instructions 又是按错误码下的指令。
 - 鉴权在 HTTP 层（gateway）完成，这里只从 scope["state"] 读身份。
-- 会话归属统一走 ``Service.resolve_session``（plan 6.5）。
+- 会话归属统一走 ``Service.resolve_session``（plan 6.5）。Claude Code 的调用带 ``_meta["claudecode/toolUseId"]``，
+  校验格式后记到这次调用产生的事件上（和 token_id 一起）；PostToolUse 上报的映射据此把成员级补成 exact（D40）。
 - 能力宣告只有 tools（两代都不宣告 listChanged、logging、prompts、resources、ui 扩展）；
   ``server/discover`` 列出两代支持的全部版本。见 server/README.md「已知协议偏差」。
 """
@@ -28,9 +29,9 @@ from pydantic import Field
 
 from . import __version__
 from .errors import DomainError, error_text
-from .gateway import CODEX_TURN_KEY, codex_turn_fields
+from .gateway import CLAUDE_TOOL_USE_KEY, CODEX_TURN_KEY, codex_turn_fields
 from .sanitize import ident_or_hash
-from .service import Actor, Service
+from .service import Actor, Service, tool_use_id
 
 # 两代都支持的版本，新代在前（与规范示例 ["2026-07-28", "2025-11-25"] 同序：新到旧）
 SUPPORTED_VERSIONS: tuple[str, ...] = (*reversed(MODERN_PROTOCOL_VERSIONS), *reversed(HANDSHAKE_PROTOCOL_VERSIONS))
@@ -104,13 +105,22 @@ def codex_turn(meta: dict[str, Any] | None) -> dict[str, Any] | None:
     return codex_turn_fields((meta or {}).get(CODEX_TURN_KEY)) or None
 
 
-def _attribution(state: dict[str, Any], svc: Service, tok: Any) -> tuple[str | None, str, str | None]:
-    """MCP 调用归属（plan 6.5），返回 (会话, exact|member, Codex 子线程)。
+def claude_tool_use(meta: dict[str, Any] | None) -> str | None:
+    """取出 _meta["claudecode/toolUseId"]，格式不合格（不是 toolu_…）就丢弃。"""
+    return tool_use_id((meta or {}).get(CLAUDE_TOOL_USE_KEY))
+
+
+def _attribution(
+    state: dict[str, Any], svc: Service, tok: Any, tool_use: str | None
+) -> tuple[str | None, str, str | None, str | None]:
+    """MCP 调用归属（plan 6.5），返回 (会话, exact|member, Codex 子线程, exact 的来源)。
 
     - Codex：用 _meta.x-codex-turn-metadata.session_id 匹配 hooks 登记的会话（hook 输入里的 session_id 来自
       ``sess.session_id()``，与它相同）；thread_id 只记为子线程，子线程的 thread_id 本来就对不上 hook 会话（m3）。
     - X-Teamflow-Session 请求头。
-    两者都要经 ``resolve_session`` 校验（存在、未结束、同 token、同 client）；都不成立就是成员级。
+    - Claude Code：PostToolUse 的映射已经先到了（理论上不会，要处理），按 (token_id, toolUseId) 找到会话。
+      平常映射在调用之后才到，由 hooks/batch 把这次调用的事件补成 exact（D40）。
+    都要经 ``resolve_session`` 校验（存在、未结束、同 token、同 client）；都不成立就是成员级。
     """
     rpc = state.get("tf_rpc") or {}
     turn = codex_turn(rpc.get("meta"))
@@ -118,7 +128,7 @@ def _attribution(state: dict[str, Any], svc: Service, tok: Any) -> tuple[str | N
     if turn and turn.get("session_id"):
         s = svc.resolve_session(tok.handle, tok.client, tok.token_id, turn["session_id"], source="codex_meta")
         if s is not None:
-            return s.external_id, "exact", (thread if thread != s.external_id else None)
+            return s.external_id, "exact", (thread if thread != s.external_id else None), "codex_meta"
     sess = None
     try:
         sess = get_http_request().headers.get("x-teamflow-session")
@@ -127,8 +137,12 @@ def _attribution(state: dict[str, Any], svc: Service, tok: Any) -> tuple[str | N
     if sess:
         s = svc.resolve_session(tok.handle, tok.client, tok.token_id, sess, source="header")
         if s is not None:
-            return s.external_id, "exact", thread
-    return None, "member", thread
+            return s.external_id, "exact", thread, "header"
+    if tool_use:
+        s = svc.tool_map_session(tok.handle, tok.client, tok.token_id, tool_use)
+        if s is not None:
+            return s.external_id, "exact", thread, "tool_map"
+    return None, "member", thread, None
 
 
 def build_mcp(svc: Service) -> FastMCP:
@@ -146,13 +160,25 @@ def build_mcp(svc: Service) -> FastMCP:
         tok = state.get("tf_ident")
         if tok is None:  # gateway 已经挡掉；这里防御一下
             raise DomainError("not_allowed", "未鉴权。")
-        if not write:  # 读工具不产生事件，不做会话归属（也就不会每次读都写一条审计）
-            return Actor(tok.handle, "agent", tok.client, tok.token_id, "mcp"), state.get("tf_rpc") or {}
-        session, attribution, thread = _attribution(state, svc, tok)
-        return (
-            Actor(tok.handle, "agent", tok.client, tok.token_id, "mcp", session, attribution, thread),
-            state.get("tf_rpc") or {},
+        rpc = state.get("tf_rpc") or {}
+        tool_use = claude_tool_use(rpc.get("meta"))
+        if not write:
+            # 读工具不产生事件，不做会话归属（也就不会每次读都写一条审计）；toolUseId 照样带上，读工具以后若产生事件也会记上
+            return Actor(tok.handle, "agent", tok.client, tok.token_id, "mcp", tool_use=tool_use), rpc
+        session, attribution, thread, src = _attribution(state, svc, tok, tool_use)
+        actor = Actor(
+            tok.handle,
+            "agent",
+            tok.client,
+            tok.token_id,
+            "mcp",
+            session=session,
+            attribution=attribution,
+            thread=thread,
+            tool_use=tool_use,
+            session_src=src,
         )
+        return actor, rpc
 
     def _ok(data: dict[str, Any]) -> ToolResult:
         return ToolResult(structured_content=data)

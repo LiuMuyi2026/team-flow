@@ -14,6 +14,11 @@
 - 令牌没有缺省值（复审新问题 8）：以前写在仓库里的 tf_pat_dev_alice 等一律 401（除非服务端显式配了它们）。
 再用官方 mcp 2.2.0 客户端（auto 与 legacy 两种模式）交叉验证一次，并记录它见到的所有 HTTP 状态码。
 
+Claude Code 会话归属（D40，只要 --token，它必须是 Claude Code 令牌）：hooks/session-start 登记一个新会话 → 带
+_meta["claudecode/toolUseId"] 发布并开始一个指派给自己的任务（成员级）→ hooks/batch 上报 tool_map（PostToolUse 写的那条）
+→ 这次调用的事件补成会话级；同 key 重放 409；格式不合格 422。给了 --peer-token 时再断言：对方的 /status 里能看到
+"我 · Claude Code · 会话 xxxx 在做 T-xx"，对方 token 把映射挂到我的会话上 403 ignored。最后取消任务、结束会话。
+
 可选的 DEV 段（复审新问题 1）：给了 --dev-secret 和 --peer-token 时，模拟"bob 打开 T-52 详情页 → alice 的 agent
 写评论 → bob 点接受"：不带 through 400、through 超过最大事件 400、带页面上的 through 200；之后 bob 的 agent
 读 T-52 能看到正文、看不到那条评论（peer_agent_text n=1）。最后 dev/reset 恢复种子数据。需要服务端用种子数据启动，
@@ -34,7 +39,9 @@ import hashlib
 import json
 import os
 import sys
+import secrets
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -279,6 +286,79 @@ async def modern_call(c: httpx.AsyncClient, url: str, token: str, name: str, arg
     return ((parse_body(r) or {}).get("result")) or {}
 
 
+async def modern_call_meta(c: httpx.AsyncClient, url: str, token: str, name: str, args: dict[str, Any], **meta: Any) -> dict[str, Any]:
+    h = {
+        "accept": ACCEPT,
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": "tools/call",
+        "mcp-name": name,
+    }
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": modern_meta(**meta)}}
+    r = await c.post(url, json=body, headers=h)
+    return ((parse_body(r) or {}).get("result")) or {}
+
+
+async def tool_map_flow(raw: Raw, rep: Report, base: str, peer_token: str | None) -> None:
+    """D40：PostToolUse 的 tool_map 把 Claude Code 的成员级调用补成会话级（跨包约定见 server/README.md）。"""
+    c = raw.c
+    mcp = f"{base}/mcp/"
+    tok = {"authorization": f"Bearer {raw.token}"}
+    sid = str(uuid.uuid4())
+    tag = sid.replace("-", "")[:8]
+    r = await c.post(f"{base}/api/v1/hooks/session-start", headers=tok, json={"client": "claude", "session_id": sid, "source": "startup"})
+    me = (parse_body(r) or {}).get("me")
+    rep.check("tool_map: session-start registers a Claude Code session", r.status_code == 200 and bool(me), r.status_code)
+    if r.status_code != 200 or not me:
+        return
+    res = await modern_call(c, mcp, raw.token, "create_task", {"title": "smoke 会话归属", "assignee": me})
+    tid = (res.get("structuredContent") or {}).get("id")
+    rep.check("tool_map: create a task assigned to myself", res.get("isError") is False and bool(tid), res.get("structuredContent"))
+    if not tid:
+        return
+    tu = "toolu_01" + secrets.token_hex(11)
+    res = await modern_call_meta(c, mcp, raw.token, "claim_task", {"id": tid}, **{"claudecode/toolUseId": tu})
+    rep.check("tool_map: claim_task with claudecode/toolUseId", res.get("isError") is False and (res.get("structuredContent") or {}).get("st") == "doing", res.get("structuredContent"))
+
+    async def batch(token: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rr = await c.post(f"{base}/api/v1/hooks/batch", headers={"authorization": f"Bearer {token}"}, json={"items": items})
+        return ((parse_body(rr) or {}).get("results")) or []
+
+    async def my_sess() -> list[dict[str, Any]] | None:
+        if not peer_token:
+            return None
+        rr = await c.get(f"{base}/api/v1/status", headers={"authorization": f"Bearer {peer_token}"})
+        row = next((o for o in (parse_body(rr) or {}).get("others") or [] if o.get("h") == me), {})
+        return row.get("sess")
+
+    before = await my_sess()
+    if before is not None:
+        rep.check("tool_map: before the mapping the peer sees member level only", not [x for x in before if x.get("task") == tid], before)
+        out = await batch(peer_token, [{"type": "tool_map", "key": f"smoke-forge-{tu}", "session_id": sid, "tool_use_id": tu, "tool": "claim_task"}])
+        got = [(x.get("st"), x.get("status")) for x in out]
+        rep.check("tool_map: peer token mapping onto my session → 403 ignored", got == [("ignored", 403)], got)
+    key = f"smoke-tm-{tu}"
+    item = {"type": "tool_map", "key": key, "session_id": sid, "tool_use_id": tu, "tool": "claim_task"}
+    out = await batch(raw.token, [item])
+    got = [(x.get("st"), x.get("status"), x.get("n")) for x in out]
+    rep.check("tool_map: mapping upgrades the call's events to the session", got == [("ok", 200, 1)], got)
+    out = await batch(raw.token, [item])
+    got = [(x.get("st"), x.get("status")) for x in out]
+    rep.check("tool_map: replay of the same key → 409 dup", got == [("dup", 409)], got)
+    out = await batch(raw.token, [{**item, "key": key + "-bad", "tool_use_id": "toolu_x"}])
+    got = [(x.get("st"), x.get("status"), x.get("err")) for x in out]
+    rep.check("tool_map: malformed tool_use_id → 422 bad", got == [("bad", 422, "tool_use_id")], got)
+    after = await my_sess()
+    if after is not None:
+        want = {"client": "claude_code", "s": tag, "task": tid}
+        rep.check("tool_map: peer /status shows me · Claude Code · session tag · task", want in after, after)
+    res = await modern_call(c, mcp, raw.token, "update_task", {"id": tid, "status": "canceled", "note": "smoke 用完取消"})
+    rep.check("tool_map: cleanup cancels the task", res.get("isError") is False, res.get("structuredContent"))
+    out = await batch(raw.token, [{"type": "end", "key": f"smoke-end-{sid}", "session_id": sid, "reason": "other"}])
+    rep.check("tool_map: cleanup ends the session", [x.get("st") for x in out] == ["ok"], out)
+
+
 async def dev_through_flow(raw: Raw, rep: Report, base: str, peer_token: str, secret: str) -> None:
     """复审新问题 1：页面渲染后、点按钮前对方 agent 写的评论不放给本人的 agent；through 必填。"""
     c = raw.c
@@ -393,6 +473,9 @@ async def main() -> int:
             await negative_auth(raw, rep, url)
         await rest_checks(raw, rep, base, token_was_default=args.token == "tf_pat_dev_alice")
         skipped: list[str] = []
+        await tool_map_flow(raw, rep, base, args.peer_token)
+        if not args.peer_token:
+            skipped.append("tool_map_flow 的对方视角与伪造用例（需要 --peer-token）")
         if args.peer_token and args.dev_secret:
             await dev_through_flow(raw, rep, base, args.peer_token, args.dev_secret)
         else:

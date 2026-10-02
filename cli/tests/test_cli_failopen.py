@@ -74,7 +74,7 @@ def test_server_error_status(env, stub, status):
     assert len(env.spool_records()) == (1 if status >= 500 else 0)
 
 
-@pytest.mark.parametrize("event", ["session-start", "prompt", "stop", "session-end"])
+@pytest.mark.parametrize("event", ["session-start", "prompt", "stop", "session-end", "tool"])
 @pytest.mark.parametrize("stdin", [b"not json{", b"[1,2,3]", b"\xff\xfe", b""])
 def test_bad_stdin(env, stub, event, stdin):
     env.write_cred(stub.url)
@@ -98,6 +98,8 @@ def test_missing_or_broken_creds(env, event, tmp_path):
     "args",
     [
         ["hook", "session-start", "--client", "claude", "--cred", "relative.json"],
+        ["hook", "tool", "--client", "claude", "--cred", "relative.json"],
+        ["hook", "tool", "--client", "gemini", "--cred", "/x.json"],
         ["hook", "bogus", "--client", "claude", "--cred", "/x.json"],
         ["hook", "prompt", "--client", "gemini", "--cred", "/x.json"],
         ["hook", "stop", "--client"],

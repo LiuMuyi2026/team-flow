@@ -240,3 +240,72 @@ def test_chunks_respects_count_and_bytes():
     by_bytes = spool._chunks(entries, max_items=100, max_bytes=1100)
     assert all(len(c) <= 10 for c in by_bytes) and sum(len(c) for c in by_bytes) == 250
     assert spool._chunks([("p", {"item": {"k": "x" * 5000}})], max_bytes=1000) == [[("p", {"item": {"k": "x" * 5000}})]]
+
+
+# ---------------------------------------------------------------- 同一会话按写入顺序上报（D40 验证阶段发现）
+
+
+def _set(env, key, **fields):
+    path = os.path.join(env.state, "spool", key + ".json")
+    rec = json.load(open(path))
+    rec.update(fields)
+    json.dump(rec, open(path, "w"))
+
+
+def _batches(stub):
+    return [[it["type"] for it in r["body"]["items"]] for r in stub.requests if r["path"] == "/api/v1/hooks/batch"]
+
+
+def test_end_waits_for_same_session_tool_map_in_backoff(env, stub):
+    """Stop 那一轮没连上、tool_map 在退避时，SessionEnd 的 end 不能先单独送到：否则服务端把迟到的
+    tool_map 判成"会话已结束"（403 ignored），映射丢了还进 dead-letter。end 要等它到期、一起发。"""
+    env.write_cred(stub.url)
+    env.hook("tool", "claude", stdin_for("claude", "tool", "/tmp"))
+    env.hook("stop", "claude", stdin_for("claude", "stop", "/tmp"))
+    age = {"tool_map": 6, "turn_end": 5}
+    for r in env.spool_records():
+        _set(env, r["key"], attempts=1, next_try=time.time() + 60, created=time.time() - age[r["item"]["type"]])
+    env.hook("session-end", "claude", stdin_for("claude", "session-end", "/tmp"))
+    env.run(["flush"])
+    assert _batches(stub) == []  # end 被同会话退避中的记录压住
+    assert sorted(r["item"]["type"] for r in env.spool_records()) == ["end", "tool_map", "turn_end"]
+    for r in env.spool_records():
+        if r["item"]["type"] != "end":
+            _set(env, r["key"], next_try=0)
+    env.run(["flush"])
+    assert _batches(stub) == [["tool_map", "turn_end", "end"]]  # 同一批，按写入顺序
+    assert env.spool_records() == [] and env.dead_records() == []
+
+
+def test_other_sessions_not_held_back(env, stub):
+    env.write_cred(stub.url)
+    env.hook("tool", "claude", stdin_for("claude", "tool", "/tmp"))
+    _set(env, env.spool_records()[0]["key"], attempts=1, next_try=time.time() + 60)
+    other = "11111111-2222-4333-8444-555555555555"
+    env.hook("session-end", "claude", stdin_for("claude", "session-end", "/tmp", session_id=other))
+    env.run(["flush"])
+    assert _batches(stub) == [["end"]]
+    assert [r["item"]["type"] for r in env.spool_records()] == ["tool_map"]
+
+
+def test_older_due_record_still_sent_while_newer_one_backs_off(env, stub):
+    """只压住比退避中那条更晚写的；更早写、已到期的照常发。"""
+    env.write_cred(stub.url)
+    env.hook("tool", "claude", stdin_for("claude", "tool", "/tmp"))
+    env.hook("stop", "claude", stdin_for("claude", "stop", "/tmp"))
+    by_type = {r["item"]["type"]: r for r in env.spool_records()}
+    _set(env, by_type["tool_map"]["key"], created=time.time() - 10)
+    _set(env, by_type["turn_end"]["key"], created=time.time() - 5, attempts=1, next_try=time.time() + 60)
+    env.run(["flush"])
+    assert _batches(stub) == [["tool_map"]]
+
+
+def test_flush_waits_for_blocking_record_within_budget(env, stub, monkeypatch):
+    """预算内会等压住 end 的那条退避到期，然后两条一起发，不白白空转几轮就退出。"""
+    env.write_cred(stub.url)
+    env.hook("tool", "claude", stdin_for("claude", "tool", "/tmp"))
+    _set(env, env.spool_records()[0]["key"], attempts=1, next_try=time.time() + 0.3, created=time.time() - 5)
+    env.hook("session-end", "claude", stdin_for("claude", "session-end", "/tmp"))
+    res = spool.flush(budget=5, max_retries=3)
+    assert res["pending"] == 0 and res["dead"] == 0
+    assert _batches(stub) == [["tool_map", "end"]]

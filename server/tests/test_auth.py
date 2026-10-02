@@ -124,6 +124,7 @@ DEV_CALLS = [
     ("POST", "/api/v1/dev/blockers/B-7:help"),
     ("GET", "/api/v1/dev/outbox"),
     ("GET", "/api/v1/dev/items/T-52"),
+    ("GET", "/api/v1/dev/home"),
     ("POST", "/api/v1/dev/reset"),
 ]
 

@@ -39,6 +39,8 @@ python spike/smoke_mcp.py --base http://127.0.0.1:8100 --token "$TF_A"   # 两�
   `/proc/<uvicorn pid>/environ`，所以在有真实 agent 的机器上做实验时，用完就关掉开关。
 - 人类动作必须带上页面上看到的值（H3）：
   - `GET /api/v1/dev/items/{id}`：模拟详情页，返回表单会带的 `v`、`sha`、`seq`（任务）、`through`（页面渲染时这个对象最大的动态编号）。
+  - `GET /api/v1/dev/home`：模拟首页（plan 7.1）的结构化数据 `{me, mine, blockers, doing, counts}`；`doing` 每个进行中的
+    任务一行 `{h, id, client, sess?[{client, s}], today}`，精确归属到会话时才有 `sess`（见下方"会话归属"）。
   - `POST /api/v1/dev/tasks/{id}:accept` `{v, sha, seq, through}`；`:claim` `{v, sha, through}`；`:forward` `{through}`。
   - `POST /api/v1/dev/blockers/{id}:help` `{v, sha, through}`；`:ask`；`:forward` `{through}`。
   - 字段全部必填，缺了 400 `invalid`；版本与当前不一致 409 `conflict`（"内容刚被修改，请重新查看"）；
@@ -101,6 +103,38 @@ token 的 client，才算 exact；否则降为成员级并写审计（`session.r
 - hooks：条目里的 client 一律取 token 的 client；条目指向的会话属于别的 token 时整条忽略（返回 403 `ignored`，
   不记提交、不改会话、`end` 也不清对方会话的 `current_task`）。
 - token 在日志、事件、会话里只以 `token_id`（token 的 sha256 前缀）出现；`TokenRec` 的 repr 不含 token。
+
+### Claude Code 的 PostToolUse 映射（D40）
+
+Claude Code 的 MCP 调用没有可信的会话头（S3），到达时只是成员级。补成会话级靠第 5 个 hook：
+
+- **调用**：读写工具都取 `_meta["claudecode/toolUseId"]`，格式不合格（`^toolu_[A-Za-z0-9_]{8,80}$`，fullmatch）就丢弃；
+  合格的和调用的 `token_id` 一起记到这次调用产生的事件上（`Event.tool_use`）。归属仍按上面的规则，事件带
+  `attribution`（exact / member）和 `session_src`（codex_meta / header / tool_map）。读工具不产生事件。观测日志记
+  `tool_use_id`（不合格的只记 `tool_use_bad`）。
+- **映射**：`POST /api/v1/hooks/batch` 的条目 `{"type":"tool_map","key","session_id","tool_use_id","tool"}`（`tool` 去掉
+  `mcp__teamflow__` 前缀，只认 9 个工具名）。逐条结果：
+  - `ok`（200，附 `n`：这次补成 exact 的事件数）；
+  - `bad`（422，`err` 是 `tool_use_id` / `session` / `tool`）；
+  - `ignored`（403，写审计）：token 不是 Claude Code 的（`client`，审计 `tool_map.client`）；会话不存在、已结束、
+    不是这枚 token 登记的（`session`，审计 `session.resolve`，`source=tool_map`）；同一个 tool_use_id 已经映射到这枚
+    token 的另一个会话（`conflict`，先到的为准，审计 `tool_map.conflict`）；
+  - `dup`（409）：同 key 重放。
+- **补写**：只改"同一 `token_id`、`tool_use` 相同、当前成员级"的事件（`session` 设为该会话，`session_src=tool_map`），
+  已经 exact 的不动，幂等。这是 M0 内存原型的做法，效果等于读时联查；M1 落库按 plan 5.1：event 只追加、不回填，
+  映射另存 `tool_map` 表，读时取 `coalesce(actor_session_id, tool_map.session_id)`。A 的 token 上报的映射按 A 的 token_id 存，碰不到 B 的事件；会话必须是 A 这枚 token 以
+  claude_code 登记的。
+- **current_task**：认领/开始类事件（`task.claimed`、`task.started`）补成 exact 时，任务仍由该成员进行中、之后没有
+  别的调用再开始过它、会话没有指向更新的任务，才设置会话的 `current_task`。
+- **顺序**：映射先于调用到达时先存着，调用到达时（`mcp_server._attribution`）直接判 exact，会话仍要过 `resolve_session`；
+  调用途中到达的，`_emit` 时直接挂上。读工具的映射确认收下但不存。CLI 的 spool 不保证上报顺序，所以同一批里的
+  tool_map 放到最后处理（同批的 `start`、`turn_end` 先登记会话）；同批里被这枚 token 自己的 `end` 刚结束的会话仍然认
+  （PostToolUse 一定在 SessionEnd 之前），只是不再设置 current_task；上一批就结束了的会话不认（CLI 按会话保序上报：
+  同会话更早的记录还在退避时，`end` 不会先单独送到，见 `cli/src/teamflow/spool.py` 的 `_due`）。结果按条目原顺序返回。
+- **保留**：映射和"按 tool_use_id 找事件"的索引都只保留 24 小时；超过 24 小时的事件不再补。
+- **读接口**：`team_status`（MCP 和 `GET /api/v1/status`）的 `others[]` 多一个 `sess[{client, s, task}]`，`s` 是会话
+  短标签（external_id 去掉分隔符后的前 8 个字母数字）；首页数据见 DEV `GET /api/v1/dev/home`。只有精确归属的会话
+  才有 `current_task`，所以成员级的认领在这里是空的，显示退回"某人 · Claude Code · 在做 T-xx"。
 
 ## 已知协议偏差
 

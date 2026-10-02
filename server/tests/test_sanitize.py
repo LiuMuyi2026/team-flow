@@ -281,3 +281,23 @@ def test_round3_invisible_cannot_split_domain_or_secret(svc):
     with pytest.raises(DomainError) as e:
         svc.comment(a, "T-51", "令牌 " + gh[:6] + fvs + gh[6:] + " 别外传")
     assert e.value.code == "secret_detected" and e.value.extra["rule"] == "github_pat"
+
+
+def test_anchored_checks_reject_trailing_newline(svc):
+    """`^…$` 配 .match 会放过结尾的换行（$ 匹配末尾换行之前）：标识、提交 SHA、结束原因、handle 一律整串匹配。"""
+    from teamflow_server.sanitize import ident_or_hash
+    from teamflow_server.service import Actor
+
+    assert ident_or_hash("feature/login") == "feature/login"
+    assert ident_or_hash("feature/login\n").startswith("h:")
+    assert ident_or_hash("c-1\n") != "c-1\n"
+    alice = Actor("alice", "agent", "claude_code", "tok_nl", "hook")
+    svc.hook_session_start(alice, {"session_id": "c-nl", "repo": "github.com/x/team-flow"})
+    r = svc.hook_batch(alice, [
+        {"key": "nl-1", "type": "commit", "session_id": "c-nl", "repo": "github.com/x/team-flow", "sha": "abc1234\n", "title": "x"},
+        {"key": "nl-2", "type": "end", "session_id": "c-nl", "reason": "clear\n"},
+    ])["results"]
+    assert [x["st"] for x in r] == ["bad", "ok"]
+    assert svc.sessions[("claude_code", "c-nl")].end_reason == "other"
+    with pytest.raises(ValueError):
+        svc.add_member("carol\n", "Carol", [])

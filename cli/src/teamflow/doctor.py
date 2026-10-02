@@ -91,6 +91,11 @@ def _check_group(r: Report, who: str, event: str, arr, want: dict, fix: str):
     if _handler_cmd(h) != _handler_cmd(want["hooks"][0]):
         r.fail(name + " 命令串", "与本机安装不一致；" + fix)
         return
+    bg = [k for k in ("async", "asyncRewake") if h.get(k) and not want["hooks"][0].get(k)]
+    if bg:
+        # cc_hooks.md「Run hooks in the background」：claude -p 收尾时杀掉还在跑的后台 hook，记录会丢；也不受 timeout 约束
+        r.fail(name + " " + bg[0], "teamflow 的 hook 不能在后台运行（claude -p 收尾时会被杀掉，记录丢失）；" + fix)
+        return
     if event in setup_cmd.MATCHER_EVENTS and \
             setup_cmd._norm_matcher(arr[gi].get("matcher")) != setup_cmd._norm_matcher(want.get("matcher")):
         r.fail(name + " matcher", "所在的第 %d 组 matcher 是 %r，应为 %r；teamflow 的 hook 和别人的在同一组时，setup 不改"
@@ -182,7 +187,8 @@ def check_codex(r: Report, paths: setup_cmd.Paths, bin_path: str):
     hooks = hj.get("hooks") if isinstance(hj.get("hooks"), dict) else {}
     for event, grp in want.items():
         _check_group(r, "Codex", event, hooks.get(event), grp, "运行 teamflow setup，然后在 Codex 的 /hooks 重新信任")
-    r.info("Codex 信任状态", "doctor 不读 Codex 的信任记录；请在 Codex 的 /hooks 确认 4 条 teamflow hook 都是 Trusted")
+    r.info("Codex 信任状态", "doctor 不读 Codex 的信任记录；请在 Codex 的 /hooks 确认 %d 条 teamflow hook 都是 Trusted"
+           % len(want))
     if os.path.isdir(os.path.join(os.getcwd(), ".codex")):
         r.info("仓库级 .codex", "交互会话里仓库级 hooks 可能不触发（openai/codex#17532），teamflow 只装用户级")
 

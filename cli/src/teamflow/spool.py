@@ -5,6 +5,8 @@
 - 已成功上传的键留一个空的 sent/<key> 标记 8 天，防止同一事件被重新写入后再发一遍。
 - flush 用 O_EXCL 创建的锁文件保证同一时间只有一个上传者。
 - 5xx、429、408、网络错误：指数退避 5 秒到 5 分钟；其他 4xx：移进 dead/，不再重试。
+- 同一会话按写入顺序上报：更早的记录还在退避时，同会话后写的记录等它到期一起发（_due），
+  免得 end 先到、服务端把迟到的 tool_map 判成"会话已结束"。
 - 一批最多 BATCH_MAX 条、编码后不超过 BATCH_BYTES：服务端和 nginx 的请求体上限都是 64KB，超了整批 413。
   万一还是 413（服务端上限更小），对半拆开重发；只有单条就超限的才进 dead/。
 - 心跳类记录 24 小时后丢弃，提交类记录保留 7 天。
@@ -32,11 +34,22 @@ def spool_dir() -> str:
     return os.path.join(common.state_dir(), "spool")
 
 
-def idem_key(client: str, session: str, event: str, turn: str) -> str:
-    import hashlib
+def _sha256(data: bytes):
+    """sha256 对象。先用 CPython 内置的 _sha2（3.12+）/_sha256（3.11）：import hashlib 会加载 OpenSSL 的 _hashlib，
+    冷启动多约 3ms，而 PostToolUse 是同步 hook，每次 teamflow 工具调用都要跑一次。摘要与 hashlib 完全相同。"""
+    try:
+        from _sha2 import sha256
+    except ImportError:
+        try:
+            from _sha256 import sha256
+        except ImportError:
+            from hashlib import sha256
+    return sha256(data)
 
+
+def idem_key(client: str, session: str, event: str, turn: str) -> str:
     raw = "\x1f".join((client, session, event, turn)).encode("utf-8", "replace")
-    return hashlib.sha256(raw).hexdigest()[:40]
+    return _sha256(raw).hexdigest()[:40]
 
 
 def write(rec: dict) -> bool:
@@ -188,6 +201,39 @@ def _retry(path, rec, now, why):
         pass
 
 
+def _order_key(rec):
+    sid = (rec.get("item") or {}).get("session_id")
+    if not isinstance(sid, str) or not sid:
+        return None
+    return (rec.get("cred") or "", rec.get("ws") or "", rec.get("client") or "", sid)
+
+
+def _due(recs, now):
+    """这一轮可以发的记录，按写入时间排序。
+
+    同一会话按写入顺序上报：同会话里更早写的记录还在退避时，后写的也先不发，等它到期一起发。
+    否则 Stop 那一轮连不上服务端、tool_map 进了退避，服务端恢复后 SessionEnd 的 end 会先单独送到，
+    服务端把迟到的 tool_map 判成"会话已结束"（403 ignored），映射丢了还进 dead-letter（D40）。
+    同一批里的先后由服务端处理（tool_map 放到最后），这里只保证它们落在同一批或按写入顺序到达。"""
+    held = {}
+    for _, r in recs:
+        if float(r.get("next_try") or 0) > now:
+            k = _order_key(r)
+            if k is not None:
+                c = float(r.get("created") or 0)
+                held[k] = min(held.get(k, c), c)
+    out = []
+    for p, r in recs:
+        if float(r.get("next_try") or 0) > now:
+            continue
+        k = _order_key(r)
+        if k in held and float(r.get("created") or 0) >= held[k]:
+            continue
+        out.append((p, r))
+    out.sort(key=lambda e: float(e[1].get("created") or 0))
+    return out
+
+
 def _expired(rec, now) -> bool:
     ttl = COMMIT_TTL if rec.get("kind") == "commit" else HEARTBEAT_TTL
     return now - float(rec.get("created") or 0) > ttl
@@ -312,7 +358,7 @@ def flush(budget: float | None = None, max_retries: int = MAX_RETRIES) -> dict:
                     common.log("spool expired %s" % rec.get("key"))
                     continue
                 recs.append((path, rec))
-            due = [(p, r) for p, r in recs if float(r.get("next_try") or 0) <= now]
+            due = _due(recs, now)
             groups = {}
             for p, r in due:
                 k = (r.get("cred") or "", r.get("ws") or "", r.get("client") or "")
@@ -326,7 +372,10 @@ def flush(budget: float | None = None, max_retries: int = MAX_RETRIES) -> dict:
             pending = [r for _, r in _load(d)]
             if not pending or rnd == max_retries:
                 break
-            wait = min(float(r.get("next_try") or 0) for r in pending) - time.time()
+            # 只看还在退避的记录：被 _due 压住的同会话记录 next_try 是 0，要等压住它们的那条到期
+            t = time.time()
+            later = [float(r.get("next_try") or 0) for r in pending if float(r.get("next_try") or 0) > t]
+            wait = (min(later) - t) if later else 0.0
             if wait > budget - (time.time() - start):
                 break
             if wait > 0:

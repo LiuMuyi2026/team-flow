@@ -12,6 +12,13 @@
   .venv/bin/python spike/bench_hooks.py --stub normal --shell sh      # 模拟 Codex：sh -c 执行命令串
   .venv/bin/python spike/bench_hooks.py --stub normal --shell login   # 模拟 Codex 退回 $SHELL -lc
   $V/bin/python spike/bench_hooks.py --stub normal --events prompt --bin $V/bin/teamflow   # 只测 UserPromptSubmit 四条路径
+  $V/bin/python spike/bench_hooks.py --stub normal --events tool --clients claude --bin $V/bin/teamflow  # 只测 PostToolUse
+
+目标（plan 6.4；D48 放宽后）：SessionStart ≤1200ms，UserPromptSubmit ≤50ms（原 30ms），Stop、SessionEnd ≤100ms，
+PostToolUse（tool，D40，只装在 Claude Code）≤100ms。tool 是同步 hook（不设 async，见 cli/src/teamflow/setup_cmd.py
+TOOL_MATCHER 上方的说明），每次 teamflow 工具调用后都要等它跑完，所以和 Stop 用同一条线。
+tool 的输入按 cc_hooks.md「PostToolUse input」和 S3 实测到的键构造，tool_response 约 2KB（teamflow 工具结果的量级），
+每次一个新的 tool_use_id，所以每次都真正写一条 spool。Codex 不装这个 hook，不测。
 
 UserPromptSubmit 测四条路径（M0 评审 I3：S4 原来只测了第一条）：
   prompt             SessionStart 刚预热完：缓存新鲜、没有新条目、不输出
@@ -19,7 +26,8 @@ UserPromptSubmit 测四条路径（M0 评审 I3：S4 原来只测了第一条）
   prompt:emit        缓存新鲜、有新的「需要我」条目、距上次输出超过 10 分钟：输出增量并写会话状态
   prompt:stale+emit  两者都有
 后三条每次运行前都重写缓存和会话状态（并删掉旧版的 .spawned 标记，让旧版每次都走拉起分支，便于前后对比）。
-「拉起」列是这一行里 hook 拉起分离进程的次数（TEAMFLOW_SPAWN_LOG 计数）。
+「拉起」列是这一行里 hook 拉起分离进程的次数（TEAMFLOW_SPAWN_LOG 计数）；「写入」列只有 tool 行有，是这一行写进 spool 的
+tool_map 条数（还在 spool 里的加上已被分离的 flush 传给桩服务端的），应当等于 n。
 
 状态目录、凭据都放在临时目录里，不碰真实 HOME。分离出来的 flush 带 TEAMFLOW_FLUSH_BUDGET=0，不会在后台重试。
 """
@@ -40,12 +48,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "cli", "tests"))
 
-TARGET_MS = {  # plan 11.2 S4 的通过标准
+TARGET_MS = {  # plan 11.2 S4 的通过标准；prompt 按 D48 放宽到 50ms；tool（PostToolUse，D40）与 Stop 相同
     "session-start": 1200,
-    "prompt": 30,
+    "prompt": 50,
     "stop": 100,
     "session-end": 100,
+    "tool": 100,
 }
+CLAUDE_ONLY = ("tool",)
+# PostToolUse 的 tool_response：teamflow 工具结果的量级（inbox / get_item 约 1–3KB）
+TOOL_RESPONSE = [{"type": "text", "text": json.dumps(
+    {"id": "T-42", "st": "doing", "t": {"t": "整理接口错误码" * 4, "by": "alice", "trust": "self_agent", "client": "claude_code"},
+     "ev": [{"e": i, "ty": "comment", "by": "bob", "x": "x" * 40} for i in range(20)], "next": "get_item"},
+    ensure_ascii=False)}]
 
 
 # prompt 后三条路径的缓存数据：BASE 里的条目都已通知过；NEW 多一条待接受
@@ -69,9 +84,14 @@ def payload(client, event, sid, cwd, turn):
     if client == "claude":
         base["transcript_path"] = "/tmp/x.jsonl"
         base["hook_event_name"] = {"session-start": "SessionStart", "prompt": "UserPromptSubmit", "stop": "Stop",
-                                   "session-end": "SessionEnd"}[event]
+                                   "session-end": "SessionEnd", "tool": "PostToolUse"}[event]
         if event == "session-start":
             base["source"] = "startup"
+        elif event == "tool":
+            base.update({"permission_mode": "default", "prompt_id": "p-%d" % turn, "effort": {"level": "high"},
+                         "tool_name": "mcp__teamflow__claim_task", "tool_input": {"id": "T-42"},
+                         "tool_response": TOOL_RESPONSE, "tool_use_id": "toolu_bench%08dXyZ" % turn,
+                         "duration_ms": 87, "mcp_server": {"name": "teamflow", "source": "user"}})
         elif event == "prompt":
             base.update({"prompt": "bench", "prompt_id": "p-%d" % turn})
         elif event == "stop":
@@ -102,7 +122,8 @@ def main():
     ap.add_argument("--token-codex", default=os.environ.get("TEAMFLOW_PAT_CODEX", "tf_pat_bench_codex"))
     ap.add_argument("--n", type=int, default=50)
     ap.add_argument("--clients", default="claude,codex")
-    ap.add_argument("--events", default="session-start,prompt,stop,session-end")
+    ap.add_argument("--events", default="session-start,prompt,stop,session-end,tool",
+                    help="tool 只对 claude 测（Codex 不装 PostToolUse）")
     ap.add_argument("--bin", default=None, help="teamflow 可执行文件（默认 .venv/bin/teamflow 或 PATH 里的）")
     ap.add_argument("--shell", choices=("exec", "sh", "bash", "zsh", "login"), default="exec",
                     help="exec：Claude Code 的 exec form；sh/bash/zsh：Codex 用会话 shell -c；login：Codex 退回 $SHELL -lc")
@@ -175,6 +196,35 @@ def main():
         except OSError:
             return 0
 
+    def tool_maps(sid):
+        """这个会话写进 spool 的 tool_map 条数：还在 spool（含 dead/）里的，加上已经被分离的 flush 传给桩服务端的。"""
+        ids = set()
+        d = os.path.join(state, "spool")
+        for sub in (d, os.path.join(d, "dead")):
+            try:
+                names = os.listdir(sub)
+            except OSError:
+                continue
+            for n in names:
+                if not n.endswith(".json") or n.startswith("."):
+                    continue
+                try:
+                    with open(os.path.join(sub, n), encoding="utf-8") as f:
+                        it = (json.load(f) or {}).get("item") or {}
+                except (OSError, ValueError):
+                    continue
+                if it.get("type") == "tool_map" and it.get("session_id") == sid:
+                    ids.add(it.get("tool_use_id"))
+        if stub:
+            with stub.lock:
+                reqs = list(stub.requests)
+            for r in reqs:
+                if r["path"] == "/api/v1/hooks/batch" and isinstance(r["body"], dict):
+                    for it in r["body"].get("items") or []:
+                        if it.get("type") == "tool_map" and it.get("session_id") == sid:
+                            ids.add(it.get("tool_use_id"))
+        return len(ids)
+
     def prep_prompt_path(client, sid, age, data):
         cache = os.path.join(state, "cache", "bench", client + ".json")
         os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -192,7 +242,7 @@ def main():
     rows = []
     # 基线：空解释器
     base = [timed([sys.executable, "-c", "pass"], b"")[0] for _ in range(a.n)]
-    rows.append(("python -c pass", "-", base, None, None, None))
+    rows.append(("python -c pass", "-", base, None, None, None, None))
     pp_names = [x for x in a.prompt_paths.split(",") if x]
     bad = [x for x in pp_names if x not in PROMPT_PATHS]
     if bad:
@@ -204,6 +254,8 @@ def main():
         timed(argv_for(["hook", "session-start", "--client", client, "--cred", cred]),
               payload(client, "session-start", sid, a.cwd, 0))
         for event in [e for e in a.events.split(",") if e]:
+            if event in CLAUDE_ONLY and client != "claude":
+                continue
             xs, nonempty, sp0 = [], 0, spawns()
             for i in range(a.n):
                 s = sid if event != "session-end" else "%s-end-%d" % (sid, i)
@@ -211,7 +263,8 @@ def main():
                               payload(client, event, s, a.cwd, i + 1))
                 xs.append(ms)
                 nonempty += 1 if p.stdout.strip() else 0
-            rows.append((event, client, xs, TARGET_MS.get(event), nonempty, spawns() - sp0))
+            written = tool_maps(sid) if event == "tool" else None
+            rows.append((event, client, xs, TARGET_MS.get(event), nonempty, spawns() - sp0, written))
             if event != "prompt":
                 continue
             for name in pp_names:
@@ -227,22 +280,26 @@ def main():
                     nonempty += 1 if p.stdout.strip() else 0
                     time.sleep(a.gap)
                     sp += spawns() - sp0
-                rows.append(("prompt:" + name, client, xs, TARGET_MS["prompt"], nonempty, sp))
+                rows.append(("prompt:" + name, client, xs, TARGET_MS["prompt"], nonempty, sp, None))
         hx = [timed(argv_for(["mcp-headers", "--client", client, "--cred", cred]), b"")[0] for _ in range(a.n)]
-        rows.append(("mcp-headers", client, hx, None, None, None))
+        rows.append(("mcp-headers", client, hx, None, None, None, None))
 
     mode = "api=%s" % api if a.api else "stub=%s" % a.stub
     print("teamflow hook 基准  %s  n=%d  执行方式=%s  spawn=%s" % (mode, a.n, a.shell, "off" if a.no_spawn else "on"))
-    print("%-18s %-7s %8s %8s %8s %6s  %-6s %-4s %s" % ("命令", "客户端", "p50", "p95", "max", "目标", "有输出", "拉起", ""))
+    print("%-18s %-7s %8s %8s %8s %6s  %-6s %-4s %-4s %s" % ("命令", "客户端", "p50", "p95", "max", "目标", "有输出", "拉起",
+                                                          "写入", ""))
     out = []
-    for name, client, xs, target, nonempty, spawned in rows:
+    for name, client, xs, target, nonempty, spawned, written in rows:
         p50, p95, mx = statistics.median(xs), pct(xs, 95), max(xs)
         flag = "" if target is None else ("通过" if p95 <= target else "超标")
-        print("%-18s %-7s %8.1f %8.1f %8.1f %6s  %-6s %-4s %s" % (
+        print("%-18s %-7s %8.1f %8.1f %8.1f %6s  %-6s %-4s %-4s %s" % (
             name, client, p50, p95, mx, target or "-", "" if nonempty is None else nonempty,
-            "" if spawned is None else spawned, flag))
-        out.append({"cmd": name, "client": client, "p50": round(p50, 1), "p95": round(p95, 1), "max": round(mx, 1),
-                    "target": target, "nonempty": nonempty, "spawned": spawned})
+            "" if spawned is None else spawned, "" if written is None else written, flag))
+        row = {"cmd": name, "client": client, "p50": round(p50, 1), "p95": round(p95, 1), "max": round(mx, 1),
+               "target": target, "nonempty": nonempty, "spawned": spawned}
+        if written is not None:
+            row["written"] = written
+        out.append(row)
     if a.json:
         print(json.dumps({"mode": mode, "n": a.n, "shell": a.shell, "rows": out}, ensure_ascii=False))
     # 等分离出去的 flush 收尾（最多 10 秒），再停桩服务端、删临时目录

@@ -1,0 +1,22 @@
+# D40/D48 验证阶段的 hook 基准（2026-10-02，云端容器，独立 venv 非 editable 安装的 teamflow，n=50，桩服务端）。
+# 命令：$V/bin/python spike/bench_hooks.py --stub normal|slow|down --bin $V/bin/teamflow --json
+#       另跑：--events prompt,tool（第 2 轮）、--events prompt --clients codex --shell sh、--stub slow --clients claude（安静重跑）
+# 目标（plan 6.4，D48 后）：SessionStart ≤1200；UserPromptSubmit（prompt 四条路径）≤50；Stop、SessionEnd ≤100；PostToolUse（tool）≤100。
+# 单位 ms，都是 p95。全部格子判"通过"。prompt 四条路径每轮拉起子进程 0 次；tool 拉起 0 次、每轮写入 50 条 tool_map（=n）。
+轮次               执行方式 客户端  空解释器 session-start prompt stale  emit   stale+emit stop  session-end tool
+正常               exec    claude  21.0   110.9        26.8   28.3   29.0   28.9       63.6  54.6        24.6
+正常               exec    codex   21.0    98.9        28.9   29.3   28.6   28.4       57.8  50.5        -
+慢 3s              exec    claude  18.7  1112.1        26.2   26.5   29.4   27.3       60.1  44.5        54.2 *
+慢 3s              exec    codex   18.7  1101.5        27.3   23.9   32.3   26.6       51.6  56.5        -
+不可达             exec    claude  19.6    98.6        27.2   29.9   28.6   26.8       61.8  52.9        28.4
+不可达             exec    codex   19.6    91.4        24.6   26.5   28.4   26.1       65.6  52.8        -
+正常（第 2 轮）    exec    claude  21.9      -         23.5   26.3   29.0   30.0         -     -         25.9
+正常（第 2 轮）    exec    codex   21.9      -         27.6   27.5   30.2   28.4         -     -         -
+正常               sh -c   codex   24.1      -         29.6   28.0   31.5   38.6         -     -         -
+慢 3s（安静重跑）  exec    claude  22.1  1115.9        32.8   33.3   28.7   32.5       59.8  58.0        31.7
+# * p50 只有 19.3，是尾部被挤占：前一行 session-end 刚拉起的 50 个 flush 还在跑，那几分钟验证者也在同一容器跑过 pytest。不跑别的东西重测是 31.7（max 51.9）。
+## 判定
+  UserPromptSubmit：40 格 p95 在 23.5–38.6，全部 ≤50（D48）；最高 38.6 是 Codex sh -c 的"过期且有输出"。按原来的 30ms 线有 7/40 格超标。
+  PostToolUse（tool，只有 Claude Code）：p95 24.6–31.7（干扰那格 54.2），全部 ≤100；p50 18.7–23.0，比空解释器的 p50 多约 3–6ms。
+  Stop、SessionEnd 44.5–65.6，SessionStart 正常/不可达 91.4–110.9、慢 3s 1101.5–1115.9，都在原目标内。
+  Codex 走 $SHELL -lc 退回路径、成员 Mac、zsh、真实 Codex 未测（docs/m0.md 补测清单）。

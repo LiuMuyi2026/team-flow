@@ -32,11 +32,12 @@ from starlette.datastructures import Headers
 
 from . import config
 from .errors import rest_error
-from .service import TZ
+from .service import TZ, tool_use_id
 
 PV_KEY = "io.modelcontextprotocol/protocolVersion"
 CI_KEY = "io.modelcontextprotocol/clientInfo"
 CODEX_TURN_KEY = "x-codex-turn-metadata"
+CLAUDE_TOOL_USE_KEY = "claudecode/toolUseId"  # Claude Code 的 tools/call 带；等于 PostToolUse 的 tool_use_id（S3）
 
 _log_lock = threading.Lock()
 _last_init: dict[str, dict[str, Any]] = {}  # token_id → 最近一次 initialize 的 {pv, ci}（旧代后续请求不再带 clientInfo）
@@ -127,6 +128,12 @@ def parse_rpc(body: bytes, headers: Headers) -> dict[str, Any]:
             info["codex_turn"] = codex_turn_fields(meta[CODEX_TURN_KEY])  # 只留 session_id、thread_id、turn_id
         if "callId" in meta:
             info["call_id"] = meta["callId"]
+        if CLAUDE_TOOL_USE_KEY in meta:
+            tu = meta[CLAUDE_TOOL_USE_KEY]
+            if tool_use_id(tu):
+                info["tool_use_id"] = tu  # 不透明 ID，记进日志方便和 hooks 上报的 tool_map 对照
+            else:
+                info["tool_use_bad"] = True
         info["meta"] = meta  # 只放进 scope，不写日志
     return info
 

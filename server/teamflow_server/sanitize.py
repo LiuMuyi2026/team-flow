@@ -448,6 +448,6 @@ def ident_or_hash(value: str | None) -> str | None:
     """标识类字段（分支名、仓库、会话 ID）：不匹配白名单正则的只存哈希。"""
     if value is None or value == "":
         return None
-    if _IDENT.match(value):
+    if _IDENT.fullmatch(value):  # fullmatch：$ 会放过结尾的换行
         return value
     return "h:" + sha256(value)[:12]

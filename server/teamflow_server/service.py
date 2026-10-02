@@ -33,6 +33,28 @@ LIMITS = {"title": 120, "body": 4000, "note": 500, "comment": 2000, "detail": 20
 
 TEXT_EVENT_TYPES = {"note", "comment", "task.released", "task.canceled", "task.done", "blocker.resolved"}
 
+# MCP 工具名（与 mcp_server.TOOL_ORDER 一致，测试里断言）。tool_map 条目的 tool 字段只认这些。
+TOOL_NAMES = ("inbox", "list_tasks", "get_item", "team_status", "create_task", "claim_task", "update_task", "report_blocker", "comment")
+READ_TOOL_NAMES = frozenset({"inbox", "list_tasks", "get_item", "team_status"})
+
+# Claude Code 的 tools/call 带 _meta["claudecode/toolUseId"]，等于同一次调用 PostToolUse hook 输入的 tool_use_id
+# （spike/results/S3.md 结论 3）。一方 API 是 toolu_ + 字母数字；Bedrock、Vertex 的形如 toolu_bdrk_…、toolu_vrtx_…，
+# 所以放行下划线。不合格的一律丢弃（不记、不匹配）。
+TOOL_USE_RE = re.compile(r"^toolu_[A-Za-z0-9_]{8,80}$")
+TOOL_MAP_TTL = timedelta(hours=24)  # 映射（和按 tool_use_id 找事件的索引）只保留 24 小时
+START_EVENT_TYPES = frozenset({"task.claimed", "task.started"})
+
+
+def tool_use_id(raw: Any) -> str | None:
+    """校验 tool_use_id（_meta["claudecode/toolUseId"] 或 tool_map 条目里的）：不合格返回 None。"""
+    return raw if isinstance(raw, str) and TOOL_USE_RE.fullmatch(raw) else None  # fullmatch：$ 会放过结尾的换行
+
+
+def session_tag(s: "AgentSession") -> str:
+    """会话短标签（"会话 1a6941c0"）：external_id 去掉哈希前缀和分隔符后的前 8 个字母数字。"""
+    ext = s.external_id[2:] if s.external_id.startswith("h:") else s.external_id
+    return re.sub(r"[^0-9A-Za-z]", "", ext)[:8]
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -67,6 +89,8 @@ class Actor:
     session: str | None = None  # 精确归属到的会话 external_id（必须经 resolve_session 校验）
     attribution: str = "member"  # exact / member
     thread: str | None = None  # Codex 子线程（x-codex-turn-metadata.thread_id），只作记录，不参与归属
+    tool_use: str | None = None  # Claude Code 的 _meta["claudecode/toolUseId"]（已校验格式），记到这次调用产生的事件上
+    session_src: str | None = None  # 精确归属的来源：codex_meta / header / tool_map
 
     @property
     def bk(self) -> str:
@@ -172,8 +196,11 @@ class Event:
     text: str | None = None
     data: dict[str, Any] = field(default_factory=dict)
     token_id: str | None = None
-    session: str | None = None
+    session: str | None = None  # actor_session_id：精确归属到的会话 external_id
     thread: str | None = None
+    tool_use: str | None = None  # 产生这条事件的 MCP 调用的 claudecode/toolUseId（和 token_id 一起用来对映射）
+    attribution: str | None = None  # agent 事件：exact / member；人和系统的事件为 None
+    session_src: str | None = None  # exact 的来源：codex_meta / header / tool_map（tool_map 是事后补上的）
 
 
 @dataclass
@@ -211,10 +238,21 @@ class AgentSession:
     source: str | None = None
     machine_id: str | None = None
     current_task: str | None = None
+    current_task_ev: int | None = None  # 设置 current_task 的那条事件 ID：迟到的映射不能用更早的事件覆盖更新的指向
     started_at: datetime | None = None
     last_seen_at: datetime | None = None
     ended_at: datetime | None = None
     end_reason: str | None = None
+
+
+@dataclass
+class ToolMap:
+    """PostToolUse 上报的映射：(token_id, tool_use_id) → 会话。只保留 24 小时。"""
+
+    session: str  # 会话 external_id（登记它的 token 必须是上报映射的 token，client 必须是 claude_code）
+    tool: str | None
+    at: datetime
+    expires_at: datetime
 
 
 @dataclass
@@ -253,6 +291,9 @@ class Service:
             self.idem: dict[tuple[str, str, str], IdemRec] = {}
             self.dedupe: dict[tuple[str, str, str], tuple[datetime, dict[str, Any]]] = {}
             self.hook_keys: dict[tuple[str, str], datetime] = {}
+            # (token_id, tool_use_id) → 映射；(token_id, tool_use_id) → 这次调用产生的事件（24 小时内的索引）
+            self.tool_maps: dict[tuple[str, str], ToolMap] = {}
+            self.call_events: dict[tuple[str, str], list[Event]] = {}
             self.commit_keys: set[tuple[str, str]] = set()
             self.cursors: dict[str, int] = {}
             self.pool_seen: dict[str, datetime] = {}
@@ -268,7 +309,7 @@ class Service:
         return f"{config.public_url()}/{kind}?w={WS}&id={obj_id}"
 
     def add_member(self, handle: str, name: str, git_emails: Iterable[str] = ()) -> Member:
-        if not HANDLE_RE.match(handle):
+        if not HANDLE_RE.fullmatch(handle):
             raise ValueError(f"bad handle {handle!r}")
         with self.lock:
             m = Member(handle, name, True, list(git_emails))
@@ -289,6 +330,7 @@ class Service:
         text: str | None = None,
         **data: Any,
     ) -> Event:
+        exact = bool(actor and actor.session and actor.attribution == "exact")
         ev = Event(
             id=self._next_event_id,
             type=type_,
@@ -301,11 +343,21 @@ class Service:
             text=text,
             data={k: v for k, v in data.items() if v is not None},
             token_id=actor.token_id if actor else None,
-            session=actor.session if actor else None,
+            session=actor.session if exact and actor else None,
             thread=actor.thread if actor else None,
+            tool_use=tool_use_id(actor.tool_use) if actor else None,
+            attribution=("exact" if exact else "member") if actor and actor.kind == "agent" else None,
+            session_src=(actor.session_src if exact and actor else None),
         )
         self._next_event_id += 1
         self.events.append(ev)
+        if ev.tool_use and ev.token_id:
+            self.call_events.setdefault((ev.token_id, ev.tool_use), []).append(ev)
+            if ev.attribution == "member":
+                # 映射先到、或在调用途中到了：这条事件直接判 exact（会话仍要有效）
+                s = self._tool_map_target(ev.token_id, ev.tool_use, ev.actor, ev.client)
+                if s is not None:
+                    self._attach(ev, s)
         return ev
 
     def _notify(self, to: str | None, kind: str, subject: str, text: str, actor: Actor | None, dedupe_key: str) -> None:
@@ -699,6 +751,7 @@ class Service:
         with self.lock:
             tasks = [t for t in self.tasks.values() if not project or t.project == project]
             blockers = [b for b in self.blockers.values() if not project or b.project == project]
+            task_ids = {t.id for t in tasks}
             others = []
             for m in sorted(self.members.values(), key=lambda m: m.handle):
                 if m.handle == me or not m.active:
@@ -708,6 +761,8 @@ class Service:
                         "h": m.handle,
                         "doing": [t.id for t in tasks if t.assignee == m.handle and t.status == "in_progress"],
                         "blockers": [b.id for b in blockers if b.raised_by == m.handle and b.status == "open"],
+                        # 精确归属到会话的：{client, s, task}，即"bob · Claude Code · 会话 1a6941c0 在做 T-53"
+                        "sess": [r for r in self._session_rows(m.handle) if r["task"] in task_ids],
                     }
                 )
             helpers = self._suggest(me, project=project, exclude=set())
@@ -719,6 +774,58 @@ class Service:
                 "blockers": sum(1 for b in blockers if b.status == "open"),
             }
             return {"others": others, "helpers": helpers, "counts": counts}
+
+    def _task_sessions(self, t: Task) -> list[AgentSession]:
+        """指向某个进行中任务的会话：没结束、current_task 是它、会话属于负责人。只有精确归属才会设置 current_task
+        （Codex 的 _meta、Claude Code 的 PostToolUse 映射），所以成员级的认领这里是空的。"""
+        if t.status != "in_progress" or not t.assignee:
+            return []
+        rows = [
+            s
+            for s in self.sessions.values()
+            if s.current_task == t.id and s.ended_at is None and s.handle == t.assignee
+        ]
+        return sorted(rows, key=lambda s: (s.current_task_ev or 0, s.external_id))
+
+    def _session_rows(self, handle: str) -> list[dict[str, Any]]:
+        """某人的会话在做什么：[{client, s, task}]。只有 ID、枚举值和会话短标签，不给仓库、分支、时长（7.4）。"""
+        rows: list[dict[str, Any]] = []
+        for t in sorted(self.tasks.values(), key=lambda t: t.no):
+            if t.assignee != handle:
+                continue
+            for s in self._task_sessions(t):
+                rows.append({"client": s.client, "s": session_tag(s), "task": t.id})
+        return rows
+
+    def home(self, viewer: str) -> dict[str, Any]:
+        """首页（7.1）的结构化数据：①待我处理 ②困难（按卡住时长）③大家在做什么 ④计数。
+
+        ③ 每个进行中的任务一行 {h, id, client, sess[{client, s}], today}：没有会话指向时是成员级
+        （"李 · Codex · 在做 T-52"）；有精确归属的会话时带上会话短标签（"李 · Claude Code · 会话 1a6941c0 在做 T-52"）。
+        只放 ID、handle、枚举值，标题由页面按闸门另取。"""
+        with self.lock:
+            me = self._member(viewer).handle
+            ib = self.inbox(Actor(me, "human", None, None, "web"), limit=10, advance=False)
+            today = self.now().astimezone(TZ).date()
+            doing = []
+            for t in sorted(self.tasks.values(), key=lambda t: (t.last_activity_at or t.created_at), reverse=True):
+                if t.status != "in_progress":
+                    continue
+                row: dict[str, Any] = {"h": t.assignee, "id": t.id, "client": t.claimed_client}
+                sess = [{"client": s.client, "s": session_tag(s)} for s in self._task_sessions(t)]
+                if sess:
+                    row["sess"] = sess
+                last = t.last_activity_at or t.created_at
+                row["today"] = last.astimezone(TZ).date() == today
+                doing.append(row)
+            open_b = sorted((b for b in self.blockers.values() if b.status == "open"), key=lambda b: b.created_at)
+            return {
+                "me": me,
+                "mine": {k: ib[k] for k in ("to_accept", "help_me", "proposed", "fwd", "replies")},
+                "blockers": [{"id": b.id, "by": b.raised_by, "task": b.task_id, "since": mdhm(b.created_at)} for b in open_b],
+                "doing": doing,
+                "counts": self.team_status(Actor(me, "human", None, None, "web"))["counts"],
+            }
 
     def _suggest(self, me: str, project: str | None, exclude: set[str], repo: str | None = None) -> list[dict[str, str]]:
         """谁能帮忙：解决或帮过困难的、在同一仓库有会话的、同项目在做事的，取前 3 个，附理由（枚举）。"""
@@ -905,10 +1012,10 @@ class Service:
         t.claimed_client = actor.client or t.claimed_client
         t.claimed_at = t.claimed_at or now
         self._touch(t)
-        self._emit("task.started", t.id, actor)
+        ev = self._emit("task.started", t.id, actor)
         s = self._owned_session(actor)
         if s is not None:
-            s.current_task = t.id
+            s.current_task, s.current_task_ev = t.id, ev.id
         self._check_task(t)
         return self._claim_summary(t, actor.handle)
 
@@ -1337,7 +1444,8 @@ class Service:
         """统一的会话归属（plan 6.5、H7）：请求里自称的会话必须存在、未结束、token_id 与当前 token 相同、
         client 与 token 的 client 相同，才算精确归属；否则返回 None（降为成员级）并写审计。
 
-        source 只进审计：header（X-Teamflow-Session）、codex_meta（x-codex-turn-metadata.session_id）。
+        source 只进审计：header（X-Teamflow-Session）、codex_meta（x-codex-turn-metadata.session_id）、
+        tool_map（Claude Code 的 PostToolUse 映射，D40）。
         """
         sid = ident_or_hash(str(raw_sid)) if raw_sid else None
         if not sid:
@@ -1368,6 +1476,155 @@ class Service:
         if s and s.ended_at is None and s.token_id == actor.token_id and s.client == actor.client and s.handle == actor.handle:
             return s
         return None
+
+    # -- Claude Code 的 PostToolUse 映射（D40） -------------------------------------------
+    #
+    # Claude Code 的 MCP 调用没有可信的会话头（S3），只到成员级。PostToolUse hook 在本地 spool 写
+    # {"type":"tool_map","session_id","tool_use_id","tool"}，由 Stop 拉起的 flush 经 hooks/batch 上报；
+    # tool_use_id 等于这次调用 _meta["claudecode/toolUseId"]。服务端：
+    # - 映射按 (token_id, tool_use_id) 存，只能补"同一 token_id 的"事件：A 的 token 碰不到 B 的事件；
+    # - 映射指向的会话要过 resolve_session（同一 token、client=claude_code 登记、未结束），否则整条忽略并写审计；
+    # - 只把成员级的事件补成 exact（actor_session_id=该会话），已经 exact 的不动；幂等；
+    # - 同一个 tool_use_id 先后指向两个会话时，以先到的为准，后到的忽略并写审计；
+    # - 映射先于调用到达时先存着（24 小时），调用到达时直接判 exact；
+    # - 认领/开始类事件、且任务仍由该成员进行中时，设置该会话的 current_task（不覆盖更新的指向）。
+
+    def _purge_tool_maps(self) -> None:
+        now = self.now()
+        for k, m in list(self.tool_maps.items()):
+            if m.expires_at <= now:
+                del self.tool_maps[k]
+        cutoff = now - TOOL_MAP_TTL
+        for k, evs in list(self.call_events.items()):
+            if not evs or evs[-1].at < cutoff:
+                del self.call_events[k]
+
+    def _live_tool_map(self, token_id: str | None, tuid: str | None) -> ToolMap | None:
+        if not token_id or not tuid:
+            return None
+        m = self.tool_maps.get((token_id, tuid))
+        if m is None or m.expires_at <= self.now():
+            return None
+        return m
+
+    def _claude_session_ok(self, s: AgentSession | None, token_id: str | None, handle: str | None) -> bool:
+        return (
+            s is not None
+            and s.ended_at is None
+            and s.client == "claude_code"
+            and s.token_id is not None
+            and s.token_id == token_id
+            and s.handle == handle
+        )
+
+    def _tool_map_target(self, token_id: str | None, tuid: str | None, handle: str | None, client: str | None) -> AgentSession | None:
+        """_emit 用（不写审计）：这次调用已有映射、而且映射的会话现在仍然有效，就返回该会话。"""
+        if client != "claude_code":
+            return None
+        m = self._live_tool_map(token_id, tuid)
+        if m is None:
+            return None
+        s = self.sessions.get(("claude_code", m.session))
+        return s if self._claude_session_ok(s, token_id, handle) else None
+
+    def tool_map_session(self, handle: str, client: str | None, token_id: str | None, raw_tuid: Any) -> AgentSession | None:
+        """MCP 调用到达时（mcp_server._attribution）：映射已经先到了，就按它判 exact。
+
+        会话仍要过 resolve_session（存在、未结束、同 token、同 client），不成立就是成员级并写审计。"""
+        tuid = tool_use_id(raw_tuid)
+        if client != "claude_code" or tuid is None:
+            return None
+        with self.lock:
+            m = self._live_tool_map(token_id, tuid)
+            if m is None:
+                return None
+            return self.resolve_session(handle, client, token_id, m.session, source="tool_map")
+
+    def _attach(self, ev: Event, s: AgentSession) -> None:
+        """把一条成员级事件补成 exact（幂等：已经有会话的不动）。认领/开始类事件顺带设置会话的 current_task。"""
+        if ev.session is not None or ev.attribution != "member":
+            return
+        ev.session, ev.attribution, ev.session_src = s.external_id, "exact", "tool_map"
+        if ev.type in START_EVENT_TYPES:
+            self._current_from_event(s, ev)
+
+    def _current_from_event(self, s: AgentSession, ev: Event) -> bool:
+        """认领/开始类事件补成 exact 之后：任务仍由该成员进行中、这次调用之后没有别的调用再开始过它，
+        而且会话没有指向更新的任务，才把会话的 current_task 设为它。"""
+        t = self.tasks.get(ev.subject or "")
+        if s.ended_at is not None or t is None or t.status != "in_progress" or t.assignee != s.handle:
+            return False
+        later = any(
+            e.subject == t.id
+            and e.id > ev.id
+            and e.type in ("task.started", "task.released")
+            and not (e.token_id == ev.token_id and e.tool_use == ev.tool_use)
+            for e in self.events
+        )
+        if later:
+            return False
+        if s.current_task not in (None, t.id) and (s.current_task_ev or 0) > ev.id:
+            return False
+        s.current_task, s.current_task_ev = t.id, ev.id
+        return True
+
+    def _hook_tool_map(
+        self, actor: Actor, client: str, sid: str | None, it: dict[str, Any], *, ended_here: set[str] = frozenset()  # type: ignore[assignment]
+    ) -> tuple[str, str | None, int]:
+        """处理一条 tool_map，返回 (st, err, 补成 exact 的事件数)。st：ok / bad / ignored。
+
+        ended_here：同一批里由这枚 token 自己的 end 刚结束的会话。PostToolUse 写映射一定在 SessionEnd 之前，
+        CLI 的 spool 却不保证上报顺序，所以这种会话仍然认（同 token、client、handle 照查），只是不再设置 current_task。"""
+        tuid = tool_use_id(it.get("tool_use_id"))
+        if tuid is None:
+            return "bad", "tool_use_id", 0
+        if not sid:
+            return "bad", "session", 0
+        tool = it.get("tool")
+        if tool is not None and tool not in TOOL_NAMES:
+            return "bad", "tool", 0
+        if client != "claude_code" or not actor.token_id:
+            # 只有 Claude Code 装 PostToolUse；Codex 的调用自带 _meta 的 session_id
+            self._audit("tool_map.client", actor, "ignored", client=client)
+            return "ignored", "client", 0
+        s: AgentSession | None = None
+        if sid in ended_here:
+            cand = self.sessions.get((client, sid))
+            if (
+                cand is not None
+                and cand.ended_at is not None
+                and cand.client == "claude_code"
+                and cand.token_id == actor.token_id
+                and cand.handle == actor.handle
+            ):
+                s = cand
+        if s is None:
+            s = self.resolve_session(actor.handle, client, actor.token_id, sid, source="tool_map", via="hook")
+        if s is None:  # 不存在、已结束、别的 token 或别人登记的：resolve_session 已写审计
+            return "ignored", "session", 0
+        key = (actor.token_id, tuid)
+        prev = self._live_tool_map(actor.token_id, tuid)
+        if prev is not None and prev.session != s.external_id:
+            self._audit("tool_map.conflict", actor, "ignored", client=client)
+            return "ignored", "conflict", 0
+        now = self.now()
+        if prev is None and tool not in READ_TOOL_NAMES:
+            # 读工具不产生事件，不用存；其余（包括没写 tool 的）存 24 小时，调用晚到时直接判 exact
+            self.tool_maps[key] = ToolMap(s.external_id, tool, now, now + TOOL_MAP_TTL)
+        n = 0
+        cutoff = now - TOOL_MAP_TTL
+        for ev in self.call_events.get(key, []):
+            if (
+                ev.attribution == "member"
+                and ev.session is None
+                and ev.token_id == actor.token_id
+                and ev.client == "claude_code"
+                and ev.actor == s.handle
+                and ev.at >= cutoff
+            ):
+                self._attach(ev, s)
+                n += 1
+        return "ok", None, n
 
     @staticmethod
     def _sid(d: dict[str, Any]) -> str | None:
@@ -1433,14 +1690,14 @@ class Service:
             snap["cursor"] = self.latest_event_id()
             return snap
 
-    HOOK_TYPES = ("turn_end", "commit", "end", "start")
+    HOOK_TYPES = ("turn_end", "commit", "end", "start", "tool_map")
     _REASON = re.compile(r"^[a-z_]{1,32}$")
     _SHA = re.compile(r"^[0-9a-f]{7,40}$")
 
     def _hook_commit(self, actor: Actor, repo: str | None, sha: Any, title: Any) -> str:
         """记一条本人提交；返回 ok / masked / bad。提交标题命中扫描只遮蔽，不拒绝，不计熔断。"""
         sha = str(sha or "")
-        if not self._SHA.match(sha) or not repo:
+        if not self._SHA.fullmatch(sha) or not repo:  # fullmatch：$ 会放过结尾的换行
             return "bad"
         text, rules = mask(clean(str(title))[:200]) if title else ("", [])
         if (repo, sha) not in self.commit_keys:
@@ -1451,30 +1708,41 @@ class Service:
     def hook_batch(self, actor: Actor, items: list[dict[str, Any]]) -> dict[str, Any]:
         """批量上报：最多 100 条，逐条处理并返回状态；按幂等键去重（保留 8 天）；命中扫描只遮蔽不拒绝。
 
-        条目：{"type": turn_end|commit|end|start, "key", "session_id", "client", "ts", ...}
+        条目：{"type": turn_end|commit|end|start|tool_map, "key", "session_id", "client", "ts", ...}
         （也接受旧写法 ev / k / session）。turn_end 可带 commits[{sha,title}]（最多 5 条，只限本人邮箱）
-        和 other_commits（他人提交只计数）。
+        和 other_commits（他人提交只计数）。tool_map 带 tool_use_id、tool（D40，见 _hook_tool_map）：
+        会话要过 resolve_session，不成立整条忽略（403 ignored）；结果多带 n（补成 exact 的事件数）。
+        CLI 的 spool 不保证顺序，所以同一批里的 tool_map 放到最后处理：同批的 start / turn_end 先把会话登记上；
+        同批的 end 刚结束的这枚 token 自己的会话仍然认（调用一定发生在结束之前），但不再设置 current_task。
+        结果按条目原来的顺序返回。
         条目里的 client 强制等于 token 的 client；条目指向的会话属于别的 token 时，整条忽略（不记提交、
         不改会话、end 也不清对方会话的 current_task），写审计，返回 403 ignored。
         返回 results[{key, status, st}]：status 是逐条 HTTP 语义（200 成功、409 重复、422 不合格、403 忽略），st 是枚举。
         """
         if len(items) > 100:
             raise DomainError("too_many", "一次最多 100 条，请分批发送。", max=100)
-        results: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = [{} for _ in items]
         codes = {"ok": 200, "masked": 200, "dup": 409, "bad": 422, "ignored": 403}
+        idx = 0
 
-        def res(key: str | None, st: str, err: str | None = None) -> None:
+        def res(key: str | None, st: str, err: str | None = None, at: int | None = None, **more: Any) -> None:
             r: dict[str, Any] = {"key": key, "status": codes[st], "st": st}
             if err:
                 r["err"] = err
-            results.append(r)
+            r.update(more)
+            results[idx if at is None else at] = r
+
+        deferred: list[tuple[int, str, tuple[str, str], str, str | None, dict[str, Any]]] = []
+        tool_map_keys: set[str] = set()
+        ended_here: set[str] = set()  # 这一批里由这枚 token 自己的 end 结束的会话
 
         with self.lock:
             now = self.now()
             for k_, exp in list(self.hook_keys.items()):
                 if exp < now:
                     del self.hook_keys[k_]
-            for it in items:
+            self._purge_tool_maps()
+            for idx, it in enumerate(items):
                 if not isinstance(it, dict):
                     res(None, "bad", "item")
                     continue
@@ -1495,6 +1763,13 @@ class Service:
                 if claimed_client and claimed_client != client:
                     self._audit("hook.client_mismatch", actor, "forced", claimed=claimed_client, client=client)
                 sid = self._sid(it)
+                if typ == "tool_map":
+                    if k in tool_map_keys:
+                        res(k, "dup")
+                        continue
+                    tool_map_keys.add(k)
+                    deferred.append((idx, k, hk, client, sid, it))
+                    continue
                 if sid:
                     owner = self.sessions.get((client, sid))
                     if owner is not None and owner.token_id != actor.token_id:
@@ -1523,9 +1798,10 @@ class Service:
                                 st = "masked"
                 elif typ == "end":
                     if sid:
-                        reason = it.get("reason") if isinstance(it.get("reason"), str) and self._REASON.match(it["reason"]) else "other"
+                        reason = it.get("reason") if isinstance(it.get("reason"), str) and self._REASON.fullmatch(it["reason"]) else "other"
                         if self._upsert_session(actor, client, sid, ended_at=now, end_reason=reason) is not None:
                             self._clear_session_task(client, sid)
+                            ended_here.add(sid)
                 elif typ == "commit":
                     r = self._hook_commit(actor, repo, it.get("sha"), it.get("title"))
                     if r == "bad":
@@ -1536,6 +1812,13 @@ class Service:
                         self._upsert_session(actor, client, sid)
                 self.hook_keys[hk] = now + timedelta(days=8)
                 res(k, st)
+            for i, k, hk, client, sid, it in deferred:
+                st_, err_, n_ = self._hook_tool_map(actor, client, sid, it, ended_here=ended_here)
+                if st_ != "ok":
+                    res(k, st_, err_, at=i)
+                    continue
+                self.hook_keys[hk] = now + timedelta(days=8)
+                res(k, "ok", at=i, n=n_)
             return {"results": results}
 
     def _clear_session_task(self, client: str, sid: str) -> None:

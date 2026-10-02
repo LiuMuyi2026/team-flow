@@ -8,6 +8,7 @@
 - 两端的 hook 组：已有 teamflow 的 handler 就原地更新，没有才追加一组到事件数组末尾；绝不删除、挪动别人的
   handler 和组（详见 _merge_event）。Codex 的信任键里带着组序号和 handler 序号
   （codex-rs/hooks/src/lib.rs hook_key），挪动位置会让我们和别人的 hook 都要重新信任；
+- Claude Code 比 Codex 多一个 PostToolUse（D40，见 CLAUDE_ONLY_SPECS），Codex 仍是 4 个；
 - 无头：<home>/.config/teamflow/claude-headless-settings.json 与 claude-mcp.json。
 
 --home 必须能指向临时目录；测试绝不写真实 HOME。改已有文件前先备份。--dry-run 只打印 teamflow 相关键的
@@ -33,6 +34,19 @@ HOOK_SPECS = (
     ("Stop", "stop", 5, 5),
     ("SessionEnd", "session-end", None, 2),
 )
+# Claude Code 独有的 hook（D40）：(事件名, 子命令, timeout 秒, matcher)。
+# PostToolUse 把每次 teamflow 工具调用对到会话：hook 输入的 tool_use_id 等于 tools/call 的
+# _meta["claudecode/toolUseId"]（spike/results/S3.md 结论 3）。
+# - matcher：cc_hooks.md「Matcher patterns」——含字母、数字、_ - 空格 , | 以外字符的按 JavaScript 正则、
+#   不锚定地匹配 tool_name，要整串匹配就自己加 ^ $；「Match MCP tools」——MCP 工具名是 mcp__<server>__<tool>，
+#   匹配一个 server 的全部工具写 `mcp__<server>__.*`（只含字母、数字、下划线的 `mcp__teamflow` 会被当成精确
+#   字符串，一个都匹配不上）。再加 ^ 只认开头：名字中间恰好含 mcp__teamflow__ 的别家工具（如插件打包的
+#   mcp__plugin_<插件>_<server>__…）不会命中；保留 .* 后缀，即使按整串匹配也成立。hook 里再按前缀核一遍。
+# - 不设 async：cc_hooks.md「Run hooks in the background」——`claude -p` 收尾时会杀掉还在跑的 async hook
+#   （outcome cancelled），最后一次工具调用的映射就丢了；async 也不受 timeout 约束。改为同步 + 2 秒超时：
+#   hook 只写本地 spool，p95 在几十毫秒（spike/bench_hooks.py 的 tool 行），只在 teamflow 的工具调用后触发。
+TOOL_MATCHER = "^mcp__teamflow__.*"
+CLAUDE_ONLY_SPECS = (("PostToolUse", "tool", 2, TOOL_MATCHER),)
 CODEX_HOOKS_DESC = "teamflow（由 teamflow setup 生成，请勿手改）"
 MCP_ALLOW = "mcp__teamflow__*"
 
@@ -92,6 +106,10 @@ def claude_hook_groups(bin_path: str, cred: str) -> dict:
         if event == "SessionStart":
             grp = {"matcher": SESSION_START_MATCHER, "hooks": [h]}
         out[event] = grp
+    for event, sub, ctimeout, matcher in CLAUDE_ONLY_SPECS:
+        h = {"type": "command", "command": bin_path, "args": ["hook", sub, "--client", "claude", "--cred", cred],
+             "timeout": ctimeout}
+        out[event] = {"matcher": matcher, "hooks": [h]}
     return out
 
 
@@ -135,9 +153,10 @@ def _handlers(g):
     return hs if isinstance(hs, list) else None
 
 
-# 两端只有这两个事件看组的 matcher（codex-rs/hooks/src/events/common.rs matcher_pattern_for_event；
-# cc_hooks.md「Matcher patterns」：UserPromptSubmit、Stop 没有 matcher）
-MATCHER_EVENTS = ("SessionStart", "SessionEnd")
+# 我们装的事件里，这几个看组的 matcher（codex-rs/hooks/src/events/common.rs matcher_pattern_for_event；
+# cc_hooks.md「Matcher patterns」：UserPromptSubmit、Stop 没有 matcher，PostToolUse 按 tool_name 匹配）。
+# PostToolUse 只装在 Claude Code。
+MATCHER_EVENTS = ("SessionStart", "SessionEnd", "PostToolUse")
 
 # 删掉 teamflow handler 之后组变空时，留一个 {"hooks": []} 占位，后面组的序号就不变。两端都确认过空组合法：
 # - Codex：codex-rs/config/src/hook_config.rs 的 MatcherGroup.hooks 是 #[serde(default)] Vec，discovery.rs 对空组
@@ -545,7 +564,8 @@ def run(ns) -> int:
     for w in warnings:
         sys.stdout.write("注意：%s\n" % redact.redact_text(w))
     if "codex" in clients:
-        sys.stdout.write("下一步：在 Codex 里打开 /hooks，信任 4 条 teamflow hook（命令串变了就要重新信任）。\n")
+        sys.stdout.write("下一步：在 Codex 里打开 /hooks，信任 %d 条 teamflow hook（命令串变了就要重新信任）。\n"
+                         % len(HOOK_SPECS))
     if not ns.dry_run:
         sys.stdout.write("然后运行 teamflow doctor --home %s 检查。\n" % shlex.quote(paths.home))
     return 0

@@ -54,7 +54,7 @@ def agent_actor(request: Request) -> Actor:
     if sess:
         s = svc_of(request).resolve_session(actor.handle, actor.client, actor.token_id, sess, source="header", via="rest")
         if s is not None:
-            return Actor(actor.handle, "agent", actor.client, actor.token_id, "rest", s.external_id, "exact")
+            return Actor(actor.handle, "agent", actor.client, actor.token_id, "rest", s.external_id, "exact", session_src="header")
     return actor
 
 
@@ -335,6 +335,13 @@ def dev_item(request: Request, oid: str) -> dict[str, Any]:
     不会算作本人已看到，也就不会放给本人的 agent。"""
     dev_human(request)
     return svc_of(request).page_view(oid)
+
+
+@router.get("/api/v1/dev/home")
+def dev_home(request: Request) -> dict[str, Any]:
+    """模拟手机首页（7.1）的结构化数据。「大家在做什么」里精确归属到会话的任务带会话短标签。"""
+    actor = dev_human(request)
+    return svc_of(request).home(actor.handle)
 
 
 @router.post("/api/v1/dev/tasks/{tid}:{action}")

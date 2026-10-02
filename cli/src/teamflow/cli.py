@@ -8,7 +8,8 @@ import os
 import sys
 
 FAST = ("hook", "mcp-headers", "flush")
-HOOK_EVENTS = ("session-start", "prompt", "stop", "session-end")
+# tool：PostToolUse，只装在 Claude Code（D40）；--client codex 时直接退出 0
+HOOK_EVENTS = ("session-start", "prompt", "stop", "session-end", "tool")
 
 
 def _parse_fast(args, valued=("--client", "--cred", "--ws"), flags=("--refresh",)):

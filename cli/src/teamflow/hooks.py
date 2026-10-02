@@ -1,11 +1,14 @@
-"""四个 hook 的执行体：session-start、prompt、stop、session-end。
+"""hook 的执行体：两端共有的 session-start、prompt、stop、session-end，加上 Claude Code 独有的 tool。
 
 规则（plan 6.4）：
 - 永远 fail-open：任何异常都不输出、exit 0，错误写进状态目录的 log。
 - 输出只由 inbox.py 的常量模板生成；Claude Code 用固定形状 JSON，Codex 用纯文本（首行是哨兵）。
 - prompt 完全忽略 prompt 字段、永不联网、永不拉起子进程（缓存由 Stop 每回合拉起的 flush --refresh 刷新）；
   stop / session-end 只写本地 spool，再拉起分离的 flush。
-- 不上传 transcript_path、prompt、last_assistant_message、工具入参。
+- tool（PostToolUse，D40）只装在 Claude Code：只认 mcp__teamflow__ 开头的工具，往 spool 写一条
+  (session_id, tool_use_id, 工具名) 的映射，不联网、不拉起进程、不输出；由下一次 Stop / SessionEnd 拉起的 flush 上报。
+  --client codex 直接退出（Codex 的 tools/call 自带 _meta 会话，不装这个 hook）。
+- 不上传 transcript_path、prompt、last_assistant_message、工具入参和工具结果（tool_input、tool_response）。
 """
 
 import os
@@ -19,6 +22,7 @@ EVENT_NAMES = {
     "prompt": "UserPromptSubmit",
     "stop": "Stop",
     "session-end": "SessionEnd",
+    "tool": "PostToolUse",
 }
 SOURCES = ("startup", "resume", "clear", "compact", "fork")
 END_REASONS = ("clear", "resume", "logout", "prompt_input_exit", "other")
@@ -28,6 +32,16 @@ CACHE_MAX_AGE = 24 * 3600
 PROMPT_MIN_INTERVAL = 600
 SESSION_STATE_TTL = 7 * 24 * 3600
 _SID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:")
+# PostToolUse：只认我们自己 server 的工具（mcp__<server>__<tool>，cc_hooks.md「Match MCP tools」）。
+# 工具名是服务端的常量（6.2，snake_case）。tool_use_id 形如 toolu_012HDfH2mEGmyGFoKMDw5GJw（S3 证据）；
+# Bedrock、Vertex 是 toolu_bdrk_…、toolu_vrtx_…。规则与服务端校验 _meta["claudecode/toolUseId"] 的一致
+# （server/teamflow_server/service.py TOOL_USE_RE：toolu_ 加 8–80 个字母、数字、下划线）：服务端本来就匹配不上的
+# 不写进 spool，免得上报时逐条 422 进 dead-letter。
+TOOL_PREFIX = "mcp__teamflow__"
+TOOL_NAME_MAX = 64
+TOOL_USE_PREFIX = "toolu_"
+_TOOL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
+_TUID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 
 
 # ---------------------------------------------------------------- 小工具
@@ -57,6 +71,25 @@ def read_stdin() -> dict:
 def valid_sid(x):
     if isinstance(x, str) and 0 < len(x) <= 128 and all(c in _SID_CHARS for c in x):
         return x
+    return None
+
+
+def valid_tool_use_id(x):
+    if not isinstance(x, str) or not x.startswith(TOOL_USE_PREFIX):
+        return None
+    rest = x[len(TOOL_USE_PREFIX):]
+    if 8 <= len(rest) <= 80 and all(c in _TUID_CHARS for c in rest):
+        return x
+    return None
+
+
+def teamflow_tool(name):
+    """mcp__teamflow__claim_task → claim_task；不是我们的工具或名字不合格返回 None。"""
+    if not isinstance(name, str) or not name.startswith(TOOL_PREFIX):
+        return None
+    t = name[len(TOOL_PREFIX):]
+    if 0 < len(t) <= TOOL_NAME_MAX and "a" <= t[0] <= "z" and all(c in _TOOL_CHARS for c in t):
+        return t
     return None
 
 
@@ -383,10 +416,50 @@ def session_end(payload: dict, client: str, cred: str) -> None:
     _spawn_flush(client, cred, slug, refresh=False)
 
 
-HANDLERS = {"session-start": session_start, "prompt": prompt, "stop": stop, "session-end": session_end}
+# ---------------------------------------------------------------- tool（PostToolUse，只装在 Claude Code）
+
+
+def tool(payload: dict, client: str, cred: str) -> None:
+    """把这次 teamflow 工具调用对到会话（D40）。
+
+    hook 输入（cc_hooks.md「PostToolUse input」）：session_id、tool_name、tool_use_id，另有 tool_input、
+    tool_response、transcript_path 等。只用前三个和 cwd：tool_input / tool_response 在 read_stdin 里就丢掉了，
+    不读、不记日志、不上传。tool_use_id 等于同一次 tools/call 的 _meta["claudecode/toolUseId"]
+    （spike/results/S3.md 结论 3），服务端据此把成员级的调用补成会话级。
+
+    只写 spool：不联网、不拉起进程、不写会话状态（并行的工具调用会并发触发 PostToolUse，写状态会互相覆盖）、
+    不输出。幂等键 hash(client, session_id, tool_use_id)（spool.idem_key，事件位固定为 tool_map，和别的记录分开）：
+    同一次调用重放只记一条。
+    """
+    name = teamflow_tool(payload.get("tool_name"))
+    if name is None:
+        if isinstance(payload.get("tool_name"), str) and payload["tool_name"].startswith(TOOL_PREFIX):
+            common.log("tool: bad tool name")
+        return  # 不是 teamflow 的工具：matcher 正常时到不了这里，什么都不做
+    sid = valid_sid(payload.get("session_id"))
+    tuid = valid_tool_use_id(payload.get("tool_use_id"))
+    if not sid or not tuid:
+        common.log("tool: missing or bad %s" % ("session_id" if not sid else "tool_use_id"))
+        return
+    from teamflow import spool
+
+    creds = common.load_creds(cred)
+    slug, _ = _pick_ws(creds, load_state(client, sid), _cwd(payload))
+    key = spool.idem_key(client, sid, "tool_map", tuid)
+    item = {"type": "tool_map", "key": key, "session_id": sid, "tool_use_id": tuid, "tool": name}
+    spool.write(
+        {"key": key, "kind": "heartbeat", "created": time.time(), "attempts": 0, "next_try": 0,
+         "cred": cred, "ws": slug, "client": client, "item": item}
+    )
+
+
+HANDLERS = {"session-start": session_start, "prompt": prompt, "stop": stop, "session-end": session_end, "tool": tool}
+CLAUDE_ONLY = ("tool",)
 
 
 def run(event: str, client: str, cred: str) -> int:
+    if event in CLAUDE_ONLY and client != "claude":
+        return 0  # Codex 不装 PostToolUse：连 stdin 都不读
     try:
         payload = read_stdin()
         HANDLERS[event](payload, client, cred)

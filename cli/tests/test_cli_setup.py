@@ -44,13 +44,16 @@ def test_claude_settings_hooks_exec_form(env, home):
     cred = os.path.join(home, ".config", "teamflow", "credentials.json")
     s = json.load(open(os.path.join(home, ".claude", "settings.json")))
     hooks = s["hooks"]
-    assert set(hooks) == {"SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"}
+    # Claude Code 5 个：比 Codex 多一个 PostToolUse（D40）
+    assert set(hooks) == {"SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "PostToolUse"}
     expect = {"SessionStart": ("session-start", 5), "UserPromptSubmit": ("prompt", 2), "Stop": ("stop", 5),
-              "SessionEnd": ("session-end", None)}
+              "SessionEnd": ("session-end", None), "PostToolUse": ("tool", 2)}
     for event, (sub, timeout) in expect.items():
         grp = hooks[event][-1]
         if event == "SessionStart":
             assert grp["matcher"] == "startup|resume|clear|compact|fork"
+        elif event == "PostToolUse":
+            assert grp["matcher"] == "^mcp__teamflow__.*"
         else:
             assert "matcher" not in grp
         (h,) = grp["hooks"]
@@ -58,6 +61,9 @@ def test_claude_settings_hooks_exec_form(env, home):
         assert h["command"] == BIN  # exec form：command 只是可执行文件
         assert h["args"] == ["hook", sub, "--client", "claude", "--cred", cred]
         assert h.get("timeout") == timeout
+        # 一律同步：cc_hooks.md「Run hooks in the background」——claude -p 收尾时会杀掉还在跑的 async hook
+        assert "async" not in h and "asyncRewake" not in h
+        assert set(h) <= {"type", "command", "args", "timeout"}
     assert "mcp__teamflow__*" in s["permissions"]["allow"]
     assert "Read(~/.config/teamflow/**)" in s["permissions"]["deny"]
     assert "Bash(teamflow mcp-headers:*)" in s["permissions"]["deny"]
@@ -93,6 +99,71 @@ def test_codex_config_toml(env, home):
     assert shlex.split(t["http_headers_helper"]) == [BIN, "mcp-headers", "--client", "codex", "--cred", cred]
     assert t["startup_timeout_sec"] == 10 and t["tool_timeout_sec"] == 30
     assert set(t) == {"url", "http_headers_helper", "startup_timeout_sec", "tool_timeout_sec"}
+
+
+# cc_hooks.md「Matcher patterns」：只含字母、数字、_、-、空格、逗号、| 的 matcher 按精确字符串（或 |、, 分隔的列表）比较，
+# 其余按 JavaScript 正则 RegExp.prototype.test（不锚定）匹配 tool_name。下面的样例对 JS 和 Python 的 re.search 等价。
+_CC_EXACT_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_- ,|")
+
+
+def _cc_matches(matcher, tool_name):
+    import re
+
+    if matcher in (None, "", "*"):
+        return True
+    if set(matcher) <= _CC_EXACT_CHARS:
+        return tool_name in [x.strip() for x in re.split(r"[|,]", matcher)]
+    return re.search(matcher, tool_name) is not None
+
+
+def test_post_tool_use_matcher_semantics():
+    from teamflow import setup_cmd
+
+    m = setup_cmd.TOOL_MATCHER
+    assert not set(m) <= _CC_EXACT_CHARS  # 走正则路径；`mcp__teamflow` 这种会被当成精确字符串，什么都匹配不上
+    assert not _cc_matches("mcp__teamflow", "mcp__teamflow__inbox")
+    for name in ("mcp__teamflow__inbox", "mcp__teamflow__claim_task", "mcp__teamflow__update_task",
+                 "mcp__teamflow__report_blocker", "mcp__teamflow__get_item"):
+        assert _cc_matches(m, name), name
+    for name in ("Bash", "Read", "mcp__memory__create_entities", "mcp__teamflow-cloud__inbox", "mcp__teamflowx__inbox",
+                 "mcp__plugin_x-mcp__teamflow__inbox", "xmcp__teamflow__inbox", "mcp__plugin_tf_teamflow__inbox"):
+        assert not _cc_matches(m, name), name
+    # 按整串匹配（假如某版本改成锚定）也照样命中
+    import re
+
+    assert re.fullmatch(m, "mcp__teamflow__claim_task")
+
+
+def test_codex_has_no_post_tool_use(env, home):
+    assert _setup(env, home).returncode == 0
+    hj = json.load(open(os.path.join(home, ".codex", "hooks.json")))
+    assert set(hj["hooks"]) == {"SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"}
+    blob = json.dumps(hj)
+    assert "hook tool" not in blob and "PostToolUse" not in blob
+    p = _setup(env, home)
+    assert "信任 4 条 teamflow hook" in p.stdout.decode()
+
+
+def test_post_tool_use_merges_with_user_groups(env, home):
+    """用户自己的 PostToolUse 组原样保留、位置不变；我们的组追加到末尾，重跑原地更新（D43）。"""
+    os.makedirs(os.path.join(home, ".claude"))
+    lint = {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "/usr/local/bin/lint", "args": ["--fix"]}]}
+    audit = {"matcher": "mcp__.*", "hooks": [{"type": "command", "command": "/usr/local/bin/audit", "async": True}]}
+    with open(os.path.join(home, ".claude", "settings.json"), "w") as f:
+        json.dump({"hooks": {"PostToolUse": [lint, audit]}}, f)
+    assert _setup(env, home).returncode == 0
+    arr = json.load(open(os.path.join(home, ".claude", "settings.json")))["hooks"]["PostToolUse"]
+    assert arr[0] == lint and arr[1] == audit and len(arr) == 3
+    assert arr[2]["matcher"] == "^mcp__teamflow__.*" and arr[2]["hooks"][0]["args"][:2] == ["hook", "tool"]
+    later = {"hooks": [{"type": "command", "command": "/usr/local/bin/later"}]}  # 之后别人又在我们后面加了一组
+    s = json.load(open(os.path.join(home, ".claude", "settings.json")))
+    s["hooks"]["PostToolUse"].append(later)
+    json.dump(s, open(os.path.join(home, ".claude", "settings.json"), "w"))
+    assert env.run(["setup", "--home", home, "--bin", "/new/place/teamflow"]).returncode == 0
+    arr2 = json.load(open(os.path.join(home, ".claude", "settings.json")))["hooks"]["PostToolUse"]
+    assert len(arr2) == 4 and arr2[:2] == [lint, audit] and arr2[3] == later
+    assert arr2[2]["hooks"][0]["command"] == "/new/place/teamflow"  # 原地更新，序号不变
+    assert arr2[2]["matcher"] == "^mcp__teamflow__.*"
 
 
 def test_codex_hooks_json_appended_at_end(env, home):
@@ -291,6 +362,12 @@ def test_headless_files_and_claude_flags(env, home):
     hs = json.load(open(os.path.join(cfg, "claude-headless-settings.json")))
     assert hs["permissions"]["allow"] == ["mcp__teamflow__*"]
     assert hs["hooks"]["SessionStart"][0]["hooks"][0]["command"] == BIN
+    # 无头 settings 也带 PostToolUse，和用户级 settings 里的同一组
+    user = json.load(open(os.path.join(home, ".claude", "settings.json")))
+    assert set(hs["hooks"]) == set(user["hooks"]) and len(hs["hooks"]) == 5
+    for event, arr in hs["hooks"].items():
+        assert arr == [user["hooks"][event][-1]], event
+    assert hs["hooks"]["PostToolUse"][0]["matcher"] == "^mcp__teamflow__.*"
     mj = json.load(open(os.path.join(cfg, "claude-mcp.json")))
     assert mj["mcpServers"]["teamflow"]["type"] == "http"
     p = env.run(["claude-flags", "--home", home])
@@ -361,6 +438,13 @@ def test_doctor_after_setup(env, home, tmp_path):
     assert p.returncode == 0
     assert "通过  Codex Stop hook" in out and "通过  Claude Code Stop hook" in out
     assert "通过  Claude Code 沙箱依赖：bwrap、socat 都在" in out
+    # Claude Code 查 5 个 handler，Codex 查 4 个
+    import re
+
+    assert len(re.findall(r"^通过  Claude Code \w+ hook$", out, re.M)) == 5
+    assert len(re.findall(r"^通过  Codex \w+ hook$", out, re.M)) == 4
+    assert "通过  Claude Code PostToolUse hook" in out and "Codex PostToolUse" not in out
+    assert "确认 4 条 teamflow hook 都是 Trusted" in out
     assert "\033[" not in out  # 不是终端就不加颜色
 
 
@@ -394,6 +478,41 @@ def test_doctor_flags_command_mismatch_and_duplicates(env, home, tmp_path):
     assert "失败  Codex SessionEnd hook" in out and "有 2 组 teamflow hook" in out
     assert "失败  Claude Code Stop hook 命令串" in out
     assert "通过  Codex SessionStart hook" in out
+
+
+def test_doctor_post_tool_use_checks(env, home, tmp_path):
+    """PostToolUse：缺了（旧版 setup 只装 4 个）、matcher 不对、被改成 async，doctor 都标失败；重跑 setup 修好。"""
+    _setup(env, home)
+    sp = os.path.join(home, ".claude", "settings.json")
+    good = json.load(open(sp))
+
+    def doctor_with(mutate):
+        s = json.loads(json.dumps(good))
+        mutate(s)
+        json.dump(s, open(sp, "w"))
+        p = _doctor(env, home, tmp_path)
+        return p.returncode, p.stdout.decode()
+
+    rc, out = doctor_with(lambda s: s["hooks"].pop("PostToolUse"))
+    assert rc == 1 and "失败  Claude Code PostToolUse hook\n      修复：没有 teamflow 的 hook" in out
+    assert "通过  Codex Stop hook" in out
+
+    def wildcard(s):  # 被挪进一个匹配所有工具的组：每次工具调用都冷启动一次
+        s["hooks"]["PostToolUse"] = [{"matcher": "*", "hooks": [{"type": "command", "command": "/usr/bin/x"},
+                                                              s["hooks"]["PostToolUse"][0]["hooks"][0]]}]
+    rc, out = doctor_with(wildcard)
+    assert rc == 1 and "失败  Claude Code PostToolUse hook matcher" in out
+
+    rc, out = doctor_with(lambda s: s["hooks"]["PostToolUse"][0]["hooks"][0].update({"async": True}))
+    assert rc == 1 and "失败  Claude Code PostToolUse hook async" in out and "不能在后台运行" in out
+
+    rc, out = doctor_with(lambda s: s["hooks"]["PostToolUse"][0]["hooks"][0].update({"asyncRewake": True}))
+    assert rc == 1 and "失败  Claude Code PostToolUse hook asyncRewake" in out
+
+    assert _setup(env, home).returncode == 0  # 重跑 setup：handler 整条换回同步的
+    assert json.load(open(sp))["hooks"]["PostToolUse"] == good["hooks"]["PostToolUse"]
+    p = _doctor(env, home, tmp_path)
+    assert p.returncode == 0, p.stdout.decode()
 
 
 def test_doctor_sandbox_deps_missing_on_linux(env, home, tmp_path):

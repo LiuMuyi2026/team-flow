@@ -152,6 +152,25 @@ def test_mixed_group_with_other_matcher_warns_and_keeps_matcher(env, tmp_path):
     assert g["matcher"] == "startup" and len(g["hooks"]) == 2  # 没改别人的 matcher，也没拆组
 
 
+def test_claude_post_tool_use_mixed_group_with_other_matcher_warns(env, tmp_path):
+    """Claude Code 的 PostToolUse 也看组的 matcher：和别人混在 matcher 不同的组里时不改别人的 matcher，只警告。"""
+    home = env.home
+    _setup(env, home)
+    path = _paths(home)["claude"]
+    s = _load(path)
+    tf = s["hooks"]["PostToolUse"][0]["hooks"][0]
+    s["hooks"]["PostToolUse"] = [{"matcher": "mcp__.*", "hooks": [_foreign("claude", "x"), tf]}]
+    _save(path, s)
+    out = _setup(env, home, NEW_BIN)
+    assert "注意：Claude Code settings.json 的 PostToolUse：teamflow 的 hook 和别的 hook 在同一组（第 1 组）" in out
+    assert "matcher 是 \"mcp__.*\"，teamflow 需要 \"^mcp__teamflow__.*\"" in out
+    g = _load(path)["hooks"]["PostToolUse"][0]
+    assert g["matcher"] == "mcp__.*" and len(g["hooks"]) == 2
+    assert g["hooks"][1]["command"] == NEW_BIN and _bytes(g["hooks"][0]) == _bytes(_foreign("claude", "x"))
+    # Codex 一侧没有 PostToolUse
+    assert "PostToolUse" not in _load(_paths(home)["codex"])["hooks"]
+
+
 def test_duplicate_teamflow_groups_keep_first_and_placeholder(env, tmp_path):
     home = env.home
     _setup(env, home)

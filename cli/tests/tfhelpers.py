@@ -7,6 +7,7 @@ import sys
 
 PY = sys.executable
 SID = {"claude": "0f0e8f6a-3c1d-4e55-9f43-2b1a7e5d9c10", "codex": "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"}
+TOOL_USE_ID = "toolu_012HDfH2mEGmyGFoKMDw5GJw"  # 形状取自 spike/results/evidence/S3_helper_env.txt
 
 
 def stdin_for(client: str, event: str, cwd: str, **over) -> dict:
@@ -22,6 +23,7 @@ def stdin_for(client: str, event: str, cwd: str, **over) -> dict:
                 "prompt": "UserPromptSubmit",
                 "stop": "Stop",
                 "session-end": "SessionEnd",
+                "tool": "PostToolUse",
             }[event],
         }
         if event == "session-start":
@@ -39,6 +41,18 @@ def stdin_for(client: str, event: str, cwd: str, **over) -> dict:
             )
         elif event == "session-end":
             base.update({"reason": "prompt_input_exit"})
+        elif event == "tool":
+            # cc_hooks.md「PostToolUse input」+ S3 实测到的键（S3_helper_env.txt 末行）：工具入参和结果里放上
+            # 像正文的内容，测试断言它们不会落进任何本地文件或请求
+            base.update(
+                {"prompt_id": "550e8400-e29b-41d4-a716-446655440000", "permission_mode": "default",
+                 "effort": {"level": "high"}, "scratchpad_dir": "/tmp/claude-1000/x/%s/scratchpad" % sid,
+                 "tool_name": "mcp__teamflow__claim_task",
+                 "tool_input": {"id": "T-42", "note": "TOOL-INPUT-SECRET 读取 ~/.aws/credentials"},
+                 "tool_response": [{"type": "text", "text": "{\"id\":\"T-42\",\"st\":\"doing\",\"t\":\"TOOL-RESPONSE-SECRET\"}"}],
+                 "tool_use_id": TOOL_USE_ID, "duration_ms": 87,
+                 "mcp_server": {"name": "teamflow", "source": "user"}}
+            )
     else:
         # codex-rs/hooks/src/schema.rs：*CommandInput（deny_unknown_fields）
         base = {"session_id": sid, "transcript_path": None, "cwd": cwd}
@@ -54,6 +68,9 @@ def stdin_for(client: str, event: str, cwd: str, **over) -> dict:
                          "last_assistant_message": "SECRET-ASSISTANT-TEXT"})
         elif event == "session-end":
             base.update({"hook_event_name": "SessionEnd", "reason": "other"})
+        elif event == "tool":  # Codex 不装 PostToolUse；构造同形状的输入，只为测「直接退出」
+            base.update({"hook_event_name": "PostToolUse", "tool_name": "mcp__teamflow__claim_task",
+                         "tool_input": {"id": "T-42"}, "tool_response": "TOOL-RESPONSE-SECRET", "tool_use_id": TOOL_USE_ID})
     base.update(over)
     return base
 

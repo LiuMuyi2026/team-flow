@@ -1,0 +1,41 @@
+# D40 验证：PostToolUse 映射的真实 Claude Code 端到端（2026-10-02，claude 2.1.287，服务端 8198，独立 venv 非 editable 安装的 teamflow）。
+# 准备：teamflow setup --home <临时 HOME> --clients claude --api-url http://127.0.0.1:8198；doctor：5 个 hook 全部"通过"。
+# 命令：env -i <白名单，故意保留外层 CLAUDE_CODE_SESSION_ID=1a6941c0-…> HOME=$H CLAUDE_CONFIG_DIR=$H/.claude claude -p "$P" --settings <见下> \
+#   --mcp-config $H/.config/teamflow/claude-mcp.json --strict-mcp-config --no-session-persistence --session-id <uuid> \
+#   --output-format stream-json --verbose --include-hook-events < /dev/null
+# 提示词：1) 调 inbox 说出 me；2) 用 claim_task 认领 T-53（alice 的 agent 发布的待认领任务，alice 的 agent 可以直接认领）。
+# 服务端用验证用启动器起（同一个 teamflow_server.app:app，只多一个 SIGUSR1：把事件、会话的归属字段落盘，不含 token）。
+# 观察用的额外 Stop hook（只在 --settings 里，与 teamflow 的 Stop 并行）：sleep 4 让 teamflow Stop 拉起的 flush 先上传，
+#   再落盘一次、用 bob 的 token 取 /api/v1/status，在 SessionEnd 清掉 current_task 之前抓到它。plain 那次不加。
+## setup 写的 PostToolUse 组（<V> 是临时目录）
+  [{"matcher": "^mcp__teamflow__.*", "hooks": [{"type": "command", "command": "<V>/venv/bin/teamflow", "args": ["hook", "tool", "--client", "claude", "--cred", "<V>/…/credentials.json"], "timeout": 2}]}]
+## 运行 default（默认运行时，2026-07-28 modern），--session-id e2ed0001-0000-4000-8000-000000000001
+  stream：PostToolUse:mcp__teamflow__inbox exit 0 out=""；PostToolUse:mcp__teamflow__claim_task exit 0 out=""；中间的 ToolSearch 没有触发
+  CLI 日志：mcp-headers client=claude session_env=yes (not sent)   ← helper 里是外层会话 ID，不发
+  服务端 hooks/session-start   sess=e2ed0001-0000-4000-8000-000000000001（SessionStart 登记的会话）
+  stream tool_use.id          inbox=toolu_01USu3FBKR8oJHxCQXiW1mSp  claim_task=toolu_01DoV87SjWX82PQ8YpE3FHwz
+  服务端 tools/call 日志       inbox tool_use_id=toolu_01USu3FBKR8oJHxCQXiW1mSp  claim_task tool_use_id=toolu_01DoV87SjWX82PQ8YpE3FHwz（两两相等）
+  spool/sent                  hash(claude, e2ed0001-…, 上面两个 tool_use_id) 两条 tool_map 都已上报；dead-letter 0
+  Stop 后、SessionEnd 前（hooks/batch 15:01:32.110 之后）：
+    ev16 task.claimed T-53  attribution=exact session=e2ed0001-… session_src=tool_map tool_use=toolu_01DoV87SjWX82PQ8YpE3FHwz
+    ev17 task.started T-53  attribution=exact session=e2ed0001-… session_src=tool_map tool_use=toolu_01DoV87SjWX82PQ8YpE3FHwz
+    agent_session e2ed0001-…  current_task=T-53 current_task_ev=17 ended_at=None
+    tool_maps：只存 claim_task 那条；inbox 是读工具，不产生事件，映射收下不存
+    bob 看 /api/v1/status：alice sess=[{"client":"claude_code","s":"e2ed0001","task":"T-53"}]
+  会话结束后（hooks/batch 15:01:37.175 上报 end）：ev16、ev17 仍是 exact、session=e2ed0001-…；会话 ended，current_task 清空；bob 的 sess=[]
+## 运行 v1（MCP_SDK_GENERATION=v1，协议 2025-11-25 legacy），--session-id e2ed0002-0000-4000-8000-000000000002
+  stream：PostToolUse 两次都 exit 0 out=""；CLI 日志同上（not sent）
+  服务端 initialize pv=2025-11-25 gen=legacy；hooks/session-start sess=e2ed0002-0000-4000-8000-000000000002
+  stream tool_use.id = 服务端 tool_use_id：inbox=toolu_01Crvsmiqv3k2N5dE7tmtf6E  claim_task=toolu_01CMiZAFGmLL5AEhyYdSuhh3
+  Stop 后、SessionEnd 前：
+    ev16 task.claimed、ev17 task.started T-53  attribution=exact session=e2ed0002-… session_src=tool_map tool_use=toolu_01CMiZAFGmLL5AEhyYdSuhh3
+    agent_session e2ed0002-…  current_task=T-53 current_task_ev=17 ended_at=None
+    bob 看 /api/v1/status：alice sess=[{"client":"claude_code","s":"e2ed0002","task":"T-53"}]
+  会话结束后：事件仍是 exact、session=e2ed0002-…；会话 ended、current_task 清空；spool/sent 4 条，dead-letter 0
+## 对照 plain（默认运行时，不加观察 hook），--session-id e2ed0003-0000-4000-8000-000000000003
+  hooks/batch 15:02:53.873（Stop 的 flush：tool_map ×2 + turn_end）→ 15:02:53.951（SessionEnd 的 flush：end）
+  ev16、ev17 exact、session=e2ed0003-…、session_src=tool_map；current_task_ev=17（设过，随 end 清空）；dead-letter 0
+## 结论
+  三次运行里，inbox、claim_task 两次调用都触发 PostToolUse，hook 无输出、exit 0；spool 的 tool_use_id = _meta["claudecode/toolUseId"]。
+  claim_task 产生的两条事件从成员级补成 exact，actor_session_id = SessionStart 登记的会话（嵌套会话自己的，不是外层继承来的 1a6941c0-…）；
+  回合结束到会话结束之间，该会话的 current_task = T-53。inbox 是读工具，没有事件可补，映射只确认收下。

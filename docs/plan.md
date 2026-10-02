@@ -1,6 +1,6 @@
 # Team Flow 规划（研究后终版）
 
-日期：2026-10-02 · 状态：研究后规划；已按 M0 结果修订（见附录「M0 修订记录」），M0 还差成员电脑补测和 Day 0 三项 · 读者：要拍板的人、要实现的人
+日期：2026-10-02 · 状态：研究后规划；已按 M0 结果修订（见附录「M0 修订记录」），M0 留下的两条待定项 D40、D48 已于 2026-10-02 拍板，M0 还差成员电脑补测和 Day 0 三项 · 读者：要拍板的人、要实现的人
 
 
 ## 0. 一页结论
@@ -20,7 +20,7 @@
 - 远程 MCP，一个 URL 兼容 2025-06-18 和 2026-07-28 两代协议；
 - hooks 上报接口。
 
-每台成员电脑执行一次 `teamflow setup`，就给 Claude Code 和 Codex 写好同一组 4 个用户级 command hook 和 MCP 配置。鉴权、人确认、"看见"闸门、清洗、扫描、限流全部在服务端完成。服务端只给 hook 返回结构化数据，注入给模型的文字由 CLI 用内置模板生成。
+每台成员电脑执行一次 `teamflow setup`，就给 Claude Code 和 Codex 写好同一组 4 个用户级 command hook 和 MCP 配置；Claude Code 另加第 5 个 hook（PostToolUse），把每次 Team Flow 工具调用对到具体会话（D40）。鉴权、人确认、"看见"闸门、清洗、扫描、限流全部在服务端完成。服务端只给 hook 返回结构化数据，注入给模型的文字由 CLI 用内置模板生成。
 
 **先做什么**
 1. **Day 0（现在开始，与 M0 并行）**：
@@ -43,7 +43,7 @@
 
 **需要你拍板的事**（括号里是推荐默认）
 1. **技术标识和域名**（`teamflow`、`teamflow.wellbeingfoundation.org.cn`、token 前缀 `tf_pat_cn_`，M1 开工前冻结）。hook 命令串会进入 Codex 的信任哈希，以后改名等于全员重新信任一次。基金会要先书面确认：现有备案主体和网站类型允许挂内部工具子域名。
-   - 冻结命令串时还要一并定两件 M0 留下的事（第 13 节标"待定"）：要不要加第 5 个 hook（PostToolUse，D40，推荐不加）；UserPromptSubmit 的延迟目标（D48，推荐放宽到 p95 不超过 50ms）。
+   - M0 留下的两件事已于 2026-10-02 拍板：Claude Code 加第 5 个 hook（PostToolUse，D40）；UserPromptSubmit 的延迟目标放宽到 p95 不超过 50ms（D48）。冻结清单因此是 Claude Code 5 条命令串、Codex 4 条（D27）。
 2. **微信通道**（MVP 用公众平台接口测试号，挂在 owner 本人的微信下）。
    - appsecret 只放在服务器的 `/etc/teamflow/env`，由 owner 和 1 名备份人保管；
    - 尽快确定以后做产品的运营主体，用它注册认证服务号；
@@ -75,7 +75,7 @@
 | G2 | 看困难 | 困难是独立实体，按卡住的时长排序，例如「B-7 测试库连不上 · 李的 Codex 提出 · 已卡 3 小时 · 需要 张」 |
 | G3 | 请求协作 | 非免打扰时段，从事件发生到微信送达的 p90 不超过 3 分钟（含 2 分钟去抖）；接受只能由本人在手机上完成 |
 | G4 | 发布待认领 | 并发认领只有一人成功，失败的一方会被告知"已被谁于几点认领" |
-| G5 | Claude Code 与 Codex 同等 | 同一组工具、同一条 hook 命令、同一个注入模板；做不到对等的 4 处在 6.1 列明 |
+| G5 | Claude Code 与 Codex 同等 | 同一组工具、同一条 hook 命令、同一个注入模板；Claude Code 多一个只做会话映射的 PostToolUse（D40）；做不到对等的 4 处在 6.1 列明 |
 | G6 | 状态自动产生 | 会话、提交由 hooks 自动上报；每人每天手动操作不超过 3 次 |
 | G7 | 默认安全 | 第 8 节的硬规则全部由服务端强制执行，注入回归语料 100% 通过 |
 | G8 | 产品化不推翻 | workspace、account 与 member 分离、actor 四元组、只追加的 event、content 可抹除、对外链接带 workspace |
@@ -120,6 +120,7 @@
 **Claude Code**
 1. SessionStart 只支持 command 和 mcp_tool 两种 handler，而且启动时 mcp_tool 会被跳过，所以启动注入必须用本地 command hook。
 2. 环境变量 `CLAUDE_CODE_SESSION_ID` 会注入 Bash、hook 和 stdio MCP 子进程，值等于 hook 的 `session_id`。远程 HTTP MCP 请求里没有文档化的会话 ID。headersHelper 只在建立连接时运行，文档只列了 3 个环境变量。
+   - M0 实测（S3）：tools/call 的 `_meta["claudecode/toolUseId"]`（未文档化）等于同一次调用 PostToolUse hook 输入的 `tool_use_id`，v1 和 v2 运行时都成立。D40 据此把 Claude Code 的 MCP 调用对到会话。
 3. hooks 的几个关键行为：
    - exec form（`args`）不经过 shell；
    - additionalContext 会被包成 system reminder，上限 10,000 字符；
@@ -262,7 +263,7 @@ sequenceDiagram
 | 数据 | 去向 | 是否出境 | 控制 |
 |---|---|---|---|
 | 任务、困难、评论、进度 | 北京 Postgres | 否 | 清洗、扫描、长度上限 |
-| 会话元数据（标识类字段、本人的提交标题） | 北京 | 否 | 字段走正则白名单；不传 prompt、transcript、工具入参 |
+| 会话元数据（标识类字段、本人的提交标题、Claude Code 工具调用的 `tool_use_id`） | 北京 | 否 | 字段走正则白名单；不传 prompt、transcript、工具入参和工具结果 |
 | 返回给 agent 的内容（handle、ID、标题、已接受的正文、他人的 `{h, doing}`） | 成员电脑，再到 Anthropic / OpenAI | **是** | 只用 handle；禁止放用户数据；告知书写明 |
 | 模板消息 | 微信（境内） | 否 | 只放编号、人名、客户端；人写的标题取前 16 字，去掉 4 位以上的数字 |
 | 备份 | COS 上海 | 否 | 公钥加密，不复制到香港 |
@@ -285,7 +286,7 @@ sequenceDiagram
 
 - **通用请求头**：`Authorization: Bearer tf_pat_cn_…`；所有 POST 带 `Idempotency-Key`；`X-Teamflow-Client`。
   - `X-Teamflow-Session` **只由 hook 在 `POST /hooks/session-start` 发**，值取 hook 输入的 `session_id`。MCP 请求和兜底命令都不带：Claude Code 的 headersHelper 拿不到本会话的 ID，嵌套运行时拿到的是父会话的（M0 S3 不通过，D39）。
-  - 服务端收到任何自称的会话（这个头、Codex 的 `_meta`）都要过 `resolve_session`（规则见 6.5"防冒用"）；不成立就按成员级记账，并写审计。
+  - 服务端收到任何自称的会话（这个头、Codex 的 `_meta`、Claude Code 的 PostToolUse 映射）都要过 `resolve_session`（规则见 6.5"防冒用"）；不成立就按成员级记账，并写审计。
 - **读**：`GET /api/v1/me/inbox`、`/me/delta?cursor=`（带 ETag）、`/tasks`、`/tasks/{id}`、`/blockers/{id}`、`/status`、`/helpers?project=`。
 - **agent 和人都能用的命令**：
   - `POST /tasks`
@@ -296,7 +297,7 @@ sequenceDiagram
   - `POST /blockers`：返回 201 `{id, st, need_state, suggest}`。
 - **hooks**：
   - `POST /api/v1/hooks/session-start`：同步，返回结构化数据，不返回成段文字；
-  - `POST /api/v1/hooks/batch`：最多 100 条、请求体不超过 64KB，逐条返回状态。CLI 按条数和编码后的字节数（不超过 60KB）切批；仍然 413 时对半拆开重发，只有单条就超限的才进 dead-letter（M0 第三轮）。
+  - `POST /api/v1/hooks/batch`：最多 100 条、请求体不超过 64KB，逐条返回状态。CLI 按条数和编码后的字节数（不超过 60KB）切批；仍然 413 时对半拆开重发，只有单条就超限的才进 dead-letter（M0 第三轮）。条目除 `turn_end`、`commit`、`end` 等之外，还有 Claude Code 的 `tool_map`：`{"type":"tool_map","key","session_id","tool_use_id","tool"}`，`tool` 是去掉 `mcp__teamflow__` 前缀的工具名（6.4、6.5，D40）。
 - **只认手机微信 H5 会话**：
   - 鉴权方式：cookie 加 CSRF，校验 Origin，UA 必须含 MicroMessenger 且不含 WindowsWechat / MacWechat；
   - 不符合的一律返回 403 `human_only`；
@@ -319,7 +320,7 @@ sequenceDiagram
 
 ## 5. 数据模型与状态机
 
-### 5.1 MVP 表（17 张）
+### 5.1 MVP 表（18 张）
 
 ```text
 workspace        id, slug uniq, name, region='cn', tz, next_task_no, next_blocker_no,
@@ -335,7 +336,7 @@ api_token        id, ws, member_id, client(claude_code|codex|cli|cloud), machine
 auth_code        id, kind(device|invite|break_glass|rebind|pc_login), device_code_hash uniq, user_code_hash?,
                  ws, member_id?, req_ip, req_region, req_ua, machine_label, expires_at, approved_at, used_at
 agent_session    id, ws, member_id, token_id, client, external_id, machine_id, repo, branch, cwd_name,
-                 project_id?, current_task_id?, interactive bool, attribution(exact|member), last_seen_at, ended_at?
+                 project_id?, current_task_id?, current_task_event_id?, interactive bool, attribution(exact|member), last_seen_at, ended_at?
                  uniq(ws,client,external_id); idx(current_task_id) where not null; idx(ws,repo,last_seen_at)
 task             id, ws, no, project_id?, parent_id?, title varchar(120), body text(≤4000),
                  status(open|in_progress|done|canceled), assignee_member_id?, assign_state(none|pending|accepted),
@@ -351,9 +352,11 @@ blocker          id, ws, no, project_id?, task_id?, title, detail(≤2000), trie
 content          id, ws, author_member_id, author_kind, author_session_id?, body(≤2000), sanitizer_ver,
                  flags jsonb, redacted_at?, redacted_by?, redact_reason?
 event            id bigint identity, ws, type, task_id?, blocker_id?, project_id?, actor_kind, actor_member_id?,
-                 actor_session_id?, token_id?, via(web|wechat|mcp|cli|hook|system), content_id?, data jsonb, created_at
+                 actor_session_id?, token_id?, tool_use_id?, via(web|wechat|mcp|cli|hook|system), content_id?, data jsonb, created_at
                  idx(ws,id), idx(task_id,id), idx(blocker_id,id), idx(ws,project_id,type,created_at);
+                 idx(token_id,tool_use_id) where tool_use_id is not null;
                  uniq(ws,(data->>'repo'),(data->>'sha')) where type='commit'
+tool_map         ws, token_id, tool_use_id, session_id, tool, created_at; pk(token_id,tool_use_id)   -- Claude Code 的 PostToolUse 映射（D40）
 notification     id, ws, member_id, kind, subject, event_id?, dedupe_key, status(queued|sent|merged|skipped|failed),
                  send_after, attempts, sent_at, error; uniq(member_id,dedupe_key)
 idempotency      ws, token_id, key, fingerprint, state(in_flight|done), status_code, response, expires_at; pk(token_id,key)
@@ -372,6 +375,12 @@ workday_calendar region, date, is_workday, note; pk(region,date)    -- 按国务
   - `blocker.raised/asked/helped/resolved/reopened/edited`
   - `acceptance.forwarded`
   - turn_end、会话结束等心跳不进 event，只覆盖写 agent_session。
+- **Claude Code 调用的会话是事后补齐的**（D40），event 照样只追加、不回填：
+  - Claude Code 的 MCP 调用写入时 `actor_session_id` 为空，记下 `token_id` 和 `tool_use_id`（取自 `_meta["claudecode/toolUseId"]`，要整串匹配 `^toolu_[A-Za-z0-9_]{8,80}$`，不合格就不记；CLI 的 hook 用同一条规则，不合格的不写进 spool）。少见的映射先到的情况，调用到达时就按映射判 exact（会话照样过 `resolve_session`）；
+  - PostToolUse 映射送达后写进 tool_map，会话要过 `resolve_session`；同一个 (token_id, tool_use_id) 只认先到的；读工具的映射收下但不存；
+  - 读的时候，event 的会话取 `coalesce(actor_session_id, tool_map.session_id)`，按 (token_id, tool_use_id) 联查；agent_session.current_task_id 照常覆盖写，同时记下是哪条事件设的（`current_task_event_id`），迟到的映射不能用更早的事件盖掉更新的指向；
+  - M0 内存原型没有表，直接把联查的结果写在内存里的事件对象上（`session`、`attribution`、`session_src=tool_map`），效果等价；M1 落库按上面做，`teamflow_app` 对 event 仍只有 INSERT 和 SELECT；
+  - 映射只认调用后 24 小时内送达的。实现细节见 `server/README.md`「Claude Code 的 PostToolUse 映射」。
 - **工作日计算**：所有"工作日""工作小时"都走 `is_workday(ws, date)` 和 `work_hours_between()` 两个函数。成员开了"今天休假"（on_leave_until）时不提醒，也不算超时。
 - **parent_id 只允许一层**：父任务必须没有父任务、在同一个 workspace、未删除。父任务关闭时不级联，子任务上显示"上级任务已关闭"。
 
@@ -385,7 +394,7 @@ workday_calendar region, date, is_workday, note; pk(region,date)    -- 按国务
 | 正文、困难详情、tried | 原样 | 信封 | 本人有有效 acceptance 且版本一致才给，否则 `withheld:"needs_accept"` | 同左 |
 | 评论、进度、交接说明、拒绝或取消原因、resolution | 原样 | 信封 | 本人对该对象有 acceptance 时给，放信封 | 只给 `event_id ≤ through_event_id` 的；其余返回 `{withheld:"peer_agent_text", by, n, url}` |
 | 提交标题 | 信封（source=git） | 同左 | 只给计数 | 只给计数 |
-| 他人会话 | — | — | 只给 `{h, client, task}` | 同左 |
+| 他人会话 | — | — | 只给 `{h, client, task}`，会话精确归属时另给会话短标签 `s`（见 6.5"任务显示"） | 同左 |
 
 `can_see_content(member, obj)` 的定义：本人是作者时直接为真；否则要有 acceptance，且其 content_version **和 content_sha256** 都等于对象当前的值。只「转发」过、没接受过正文的 acceptance（两者为空）不算。start、get_item、闸门都调用这一个函数。
 
@@ -447,13 +456,14 @@ stateDiagram-v2
 - 进行中、已完成、已取消：对应各自的状态。
 
 附加标记：「有困难」、「2 个工作日没有进度」、「agent 已离线」（任务在进行中，但所有指向它的会话都已离线）。
-- Claude Code 的 MCP 调用只到成员级（D39），它认领的任务没有会话指向。这时按"负责人 × claimed_client 名下 hooks 登记的会话都已离线"判断。
+- 两端都按会话判断：Codex 认领时靠 `_meta` 直接精确到会话（D44）；Claude Code 认领时先是成员级，回合结束 PostToolUse 映射送达后补成会话级，同时设置会话的 current_task（D40）。
+- 还没有会话指向的（Claude Code 回合还没结束、映射对不上或失效、bare 模式没有 hook），退回按"负责人 × claimed_client 名下 hooks 登记的会话都已离线"判断。
 
 | 命令 | H（手机） | A（本人 agent） | 守卫与副作用 |
 |---|---|---|---|
 | 发布 | 任何成员 | 可以 | 指派自己：直接 accepted。指派他人：pending，并通知对方，计入扇出 |
 | 认领（待认领） | 任何成员；同时写 acceptance；表单带 v、sha、through，版本不一致返回 409（5.1、D50） | 只能认领本人或本人 agent 发布的，置 accepted；别人发布的返回 `needs_human` 并推送微信 | `WHERE status='open' AND assignee IS NULL`；0 行时返回"已被 李 于 10:21 认领" |
-| 开始 | 负责人 | 负责人的 agent | 要求 accepted 且 `can_see_content`；精确归属时设置会话的 current_task（目前只有 Codex 的 MCP 调用能精确归属，Claude Code 只到成员级，D39） |
+| 开始 | 负责人 | 负责人的 agent | 要求 accepted 且 `can_see_content`；精确归属时设置会话的 current_task：Codex 在调用时设置（D44）；Claude Code 在 PostToolUse 映射送达、调用补成 exact 时补设，任务已不在该成员手里进行中、或会话已指向更新的任务时不设（D40） |
 | 取消认领 | 负责人，可选"放回待认领" | 负责人的 agent，必须写交接说明，负责人不变 | 回到 open |
 | 完成 | 负责人 | 负责人的 agent，必须附说明 | `WHERE assign_state='accepted'`；发布人不是本人时通知发布人；对已完成的任务再调完成返回 200，只加一条进度（兜底命令重放也安全，D52） |
 | 编辑 | steward | 只能编辑本人 agent 发布、且还没有他人 acceptance 的；改标题要过 5.1 的标题规则 | content_version 加 1，content_sha256 重算；已被他人接受的回到 pending，通知对方重新确认 |
@@ -523,11 +533,11 @@ stateDiagram-v2
 | hooks 位置 | `~/.claude/settings.json` | `~/.codex/hooks.json`：已有 teamflow 组就原地替换（重复的去掉），没有才追加到末尾；在 `/hooks` 里信任一次 | 只装用户级（#17532）。Codex 的信任键带组序号，组一挪位置，我们的和被挪动的别人的组都要重新信任（D43） |
 | 执行方式 | exec form，不经过 shell | 会话 shell 加 `-c`，没有时退回 `$SHELL -lc` | **不对等①**：Codex 可能混入 profile 的输出。走到 `$SHELL -lc` 退回路径时，每个 hook 多约 150ms（M0 第一轮实测），UserPromptSubmit 超标；profile 有输出时 Stop 每轮都被判失败（S2 发现 2、S4 发现 2） |
 | 输出格式 | 固定形状的 JSON `hookSpecificOutput.additionalContext`，CLI 手写最小 JSON | 纯文本，第一行是全角哨兵 `【teamflow` | 两端同一模板。Codex 把首个非空白字符是 `{` 或 `[` 的 stdout 当 JSON 解析，失败就判这次 hook 失败、不注入，所以哨兵不能用半角 `[`（D38）；doctor 检查 profile 输出必须为空 |
-| 会话 ID | hook 输入的 `session_id`。Bash、hook、stdio MCP 子进程里的 `CLAUDE_CODE_SESSION_ID` 与它相同；headersHelper 里没有 | hook 输入的 `session_id`，与 tools/call 的 `_meta["x-codex-turn-metadata"].session_id` 同源（都是 `sess.session_id()`）；`thread_id` 只记作子线程，`turn_id` 只记录 | D44 |
-| MCP 调用归属 | 成员 + 客户端（S3 不通过：helper 拿不到本会话 ID，嵌套时拿到的是父会话的）；要不要用 PostToolUse 补成会话级，**待定**（D40） | `_meta` 的 session_id 匹配 hooks 登记的会话，过 `resolve_session` 后精确到会话 | **不对等②**（D39） |
+| 会话 ID | hook 输入的 `session_id`。Bash、hook、stdio MCP 子进程里的 `CLAUDE_CODE_SESSION_ID` 与它相同；headersHelper 里没有。PostToolUse 输入的 `tool_use_id` 等于 tools/call 的 `_meta["claudecode/toolUseId"]`（S3） | hook 输入的 `session_id`，与 tools/call 的 `_meta["x-codex-turn-metadata"].session_id` 同源（都是 `sess.session_id()`）；`thread_id` 只记作子线程，`turn_id` 只记录 | D44 |
+| MCP 调用归属 | 调用到达时是成员 + 客户端（S3 不通过：helper 拿不到本会话 ID，嵌套时拿到的是父会话的）。PostToolUse 在本地记下 `(session_id, tool_use_id)`，回合结束随 Stop 的上报送达，服务端按 `tool_use_id` 对上调用、过 `resolve_session` 后补成 exact。映射送达之前、或对不上时是成员级 | `_meta` 的 session_id 匹配 hooks 登记的会话，过 `resolve_session` 后精确到会话 | **不对等②**：Codex 调用时就精确，Claude Code 回合结束后才补齐，而且依赖未文档化的 `claudecode/` 键，失效时退回成员级（D39、D40） |
 | 凭据保护 | 默认加固：sandbox.credentials，加上 Read、Grep、Bash 的 deny 规则。Linux 和 WSL2 上沙箱依赖 bubblewrap 和 socat，缺了 Claude Code 只警告一句就不带沙箱运行，`sandbox.credentials` 形同虚设 | 没有对等手段 | **不对等③**，作为残余风险接受（8.1）。doctor 缺依赖时标失败；沙箱真正生效时，agent 从 Bash 跑兜底命令读不到凭据（D46） |
-| 4 个 hook | SessionStart、UserPromptSubmit、Stop、SessionEnd | 同左 | 同一条命令。Claude Code 要不要加第 5 个（PostToolUse），**待定**（D40） |
-| 无头运行 | 普通 `claude -p`：4 个 hook 都执行。bare 模式加 `$(teamflow claude-flags)`：只有 MCP 和 allow 规则，hooks 一条都不执行 | `codex exec` | 见 6.8、D41 |
+| hook 数量 | 5 个：SessionStart、UserPromptSubmit、Stop、SessionEnd，加 PostToolUse（`teamflow hook tool`，matcher `^mcp__teamflow__.*` 只匹配 Team Flow 的工具，同步、timeout 2 秒，见 6.4） | 4 个：前 4 个 | 前 4 个两端同一条命令。PostToolUse 只装 Claude Code，只在本地记会话映射，不联网、不输出；Codex 的 tools/call 在 `_meta` 里自带 session_id，不需要（D40） |
+| 无头运行 | 普通 `claude -p`：5 个 hook 都执行。bare 模式加 `$(teamflow claude-flags)`：只有 MCP 和 allow 规则，hooks 一条都不执行，MCP 调用留在成员级 | `codex exec` | 见 6.8、D41 |
 | 空闲唤醒 | M2 用 asyncRewake | 没有 | **不对等④**，两端都用桌面通知补偿 |
 | 版本基线 | ≥ v2.1.286（cc_headless 所述 bare 行为完整的版本） | ≥ 0.148（二手来源，需 M0 实测） | doctor 检查 |
 
@@ -590,7 +600,7 @@ M0 之后的说明：
 
 ### 6.4 hooks 配方
 
-**命令串一旦发布就永远不改**，行为变化只放在 CLI 包里。冻结之前还要定两件事：要不要加第 5 个 hook（D40）；UserPromptSubmit 的延迟目标和退路（D48），因为可执行文件的路径和参数会进 Codex 的信任哈希。
+**命令串一旦发布就永远不改**，行为变化只放在 CLI 包里。冻结前要定的两件事已于 2026-10-02 定下：Claude Code 加第 5 个 hook PostToolUse（D40）；UserPromptSubmit 的目标是 p95 不超过 50ms，不改启动方式（D48）。冻结清单是 Claude Code 5 条命令串、Codex 4 条（D27）。
 
 `~/.claude/settings.json`（由 setup 合并写入，先备份）：
 
@@ -611,12 +621,19 @@ M0 之后的说明：
     "Stop": [{ "hooks": [
       { "type": "command", "command": "/Users/zs/.local/bin/teamflow", "args": ["hook","stop","--client","claude","--cred","/Users/zs/.config/teamflow/credentials.json"], "timeout": 5 }]}],
     "SessionEnd": [{ "hooks": [
-      { "type": "command", "command": "/Users/zs/.local/bin/teamflow", "args": ["hook","session-end","--client","claude","--cred","/Users/zs/.config/teamflow/credentials.json"] }]}]
+      { "type": "command", "command": "/Users/zs/.local/bin/teamflow", "args": ["hook","session-end","--client","claude","--cred","/Users/zs/.config/teamflow/credentials.json"] }]}],
+    "PostToolUse": [{ "matcher": "^mcp__teamflow__.*", "hooks": [
+      { "type": "command", "command": "/Users/zs/.local/bin/teamflow", "args": ["hook","tool","--client","claude","--cred","/Users/zs/.config/teamflow/credentials.json"], "timeout": 2 }]}]
   }
 }
 ```
 
-`~/.codex/hooks.json`（顶层只能有 `description` 和 `hooks` 两个键。每个事件数组里，已有 teamflow 组就原地替换、重复的去掉，没有才追加到末尾；绝不删除、挪动别人的 handler 和组，见 6.8 setup 第 4 步和 D43）：
+PostToolUse 组只写在 Claude Code 一侧（D40），定义在 `cli/src/teamflow/setup_cmd.py` 的 `CLAUDE_ONLY_SPECS`（验证阶段 2026-10-02 回填）：
+- **子命令** `tool`：`teamflow hook tool --client claude --cred <abs>`，与前 4 条一起冻结（D27）。`--client codex` 时连 stdin 都不读，直接 exit 0。
+- **matcher** `^mcp__teamflow__.*`：PostToolUse 按 `tool_name` 匹配；含字母、数字、`_ - , |` 以外字符的 matcher 按 JavaScript 正则、不锚定地匹配（cc_hooks.md「Matcher patterns」）。匹配一个 MCP server 的全部工具必须写 `mcp__<server>__.*`，只写 `mcp__teamflow` 会被当成精确字符串，一个都匹配不上（「Match MCP tools」）；前面加 `^`，名字中间恰好含 `mcp__teamflow__` 的别家工具不会命中。hook 里再按 `mcp__teamflow__` 前缀核一遍。实测（`spike/results/evidence/S3_posttooluse_e2e.txt`）：inbox、claim_task 都触发，ToolSearch 不触发。
+- **同步、`"timeout": 2`，不设 `async`**：`claude -p` 收尾时会杀掉还在跑的 async hook，最后一次调用的映射就丢了；async hook 也不受 timeout 约束（cc_hooks.md「Run hooks in the background」）。同步的代价是每次 Team Flow 工具调用后多等一次 hook，M0 验证阶段实测 p95 在 24.6–31.7ms（正常、慢 3 秒、不可达三种服务端，11.2 S4）。doctor 发现 teamflow 的 handler 被设成 `async` 或 `asyncRewake` 时标失败。
+
+`~/.codex/hooks.json`（顶层只能有 `description` 和 `hooks` 两个键。每个事件数组里，已有 teamflow 组就原地替换、重复的去掉，没有才追加到末尾；绝不删除、挪动别人的 handler 和组，见 6.8 setup 第 4 步和 D43。只有 4 个事件，不装 PostToolUse，D40）：
 
 ```json
 { "description": "teamflow（由 teamflow setup 生成，请勿手改）",
@@ -631,17 +648,18 @@ M0 之后的说明：
 | 事件 | 做什么 | 是否联网 | 目标 p95 |
 |---|---|---|---|
 | SessionStart | 读 stdin 里的 session_id、source、cwd；git 的 remote（去掉凭据）、branch、HEAD 都设 300ms 超时；检测能否打开 `/dev/tty`，记为 interactive；调 `session-start`（HTTP 超时 1s），失败就用 24 小时内的缓存，并标"缓存于 HH:MM"；用模板渲染输出 | 是 | 不超过 1.2s |
-| UserPromptSubmit | **完全忽略 prompt；不联网，也不拉起任何子进程**（D47）。只读本地缓存（24 小时内有效）：有新的"需要我"条目，并且距上次输出至少 10 分钟，才输出不超过 200 字的增量；Claude Code 的输出用手写的最小 JSON，不导入 json。缓存由 Stop 每回合拉起的 `flush --refresh` 和 SessionStart 刷新，所以增量最多比上一回合结束时晚一回合 | 否 | 不超过 30ms；M0 实测两端都贴着这条线，**待定**，推荐放宽到不超过 50ms（D48） |
+| UserPromptSubmit | **完全忽略 prompt；不联网，也不拉起任何子进程**（D47）。只读本地缓存（24 小时内有效）：有新的"需要我"条目，并且距上次输出至少 10 分钟，才输出不超过 200 字的增量；Claude Code 的输出用手写的最小 JSON，不导入 json。缓存由 Stop 每回合拉起的 `flush --refresh` 和 SessionStart 刷新，所以增量最多比上一回合结束时晚一回合 | 否 | 不超过 50ms（D48，2026-10-02 定；原目标 30ms，M0 实测两端都贴着那条线） |
 | Stop | 写 spool：turn_end，以及新提交（`git rev-list <上次 HEAD>..HEAD --author=<本人邮箱>`，最多 5 条）。其他作者的提交只计数。然后拉起分离的 `flush --refresh`：上传 spool，顺带刷新 UserPromptSubmit 读的缓存 | 否 | 不超过 100ms |
 | SessionEnd | 写 spool：`end{reason}`，拉起分离的 flush | 否 | 不超过 100ms |
+| PostToolUse（只装 Claude Code，D40） | 只在 Team Flow 的工具调用成功后触发（matcher `^mcp__teamflow__.*`）。从 hook 输入取 `session_id`、`tool_use_id` 和工具名，往 spool 写一条 `{"type":"tool_map","key":hash(client, session, tool_use_id),"session_id","tool_use_id","tool"}`，`tool` 去掉 `mcp__teamflow__` 前缀。**不取用 `tool_input`、`tool_response`（读 stdin 时就丢掉）；不联网，不拉起任何子进程，不输出任何内容**；由本回合 Stop（或 SessionEnd）拉起的 flush 随其他条目一起上报。工具返回 isError 时 Claude Code 触发的是 PostToolUseFailure（cc_hooks.md），不装，这类调用留在成员级 | 否 | 不超过 100ms（与 Stop 同线；同步执行、timeout 2 秒；M0 实测 p95 24.6–31.7ms，拉起子进程 0 次） |
 
 **实现规则**
-1. **分离进程**：`Popen([...], stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, close_fds=True, start_new_session=True)`。不这样做，子进程会继承输出管道，两端都要等网络请求结束，hook 才算返回。只有 Stop 和 SessionEnd 拉起分离进程（每次 1 个）；UserPromptSubmit 不拉起（M0 修复前它在缓存过期时拉起 refresh，那条路径 p95 约 69ms）。
+1. **分离进程**：`Popen([...], stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, close_fds=True, start_new_session=True)`。不这样做，子进程会继承输出管道，两端都要等网络请求结束，hook 才算返回。只有 Stop 和 SessionEnd 拉起分离进程（每次 1 个）；UserPromptSubmit 和 PostToolUse 不拉起（M0 修复前 UserPromptSubmit 在缓存过期时拉起 refresh，那条路径 p95 约 69ms）。
 2. **永远 fail-open**：出错时不输出任何内容，exit 0；错误写进 `~/.local/state/teamflow/log`。
-3. **spool**：用 O_EXCL 锁文件（可移植）；每条记录带幂等键 `hash(client, session, event, turn)`。flush 遇到 5xx 或网络错误时退避重试（5 秒到 5 分钟）；遇到 4xx 移进 dead-letter，不再重试。心跳类记录 24 小时后丢弃，提交类记录保留 7 天，服务端这类幂等键也保留 8 天。
+3. **spool**：用 O_EXCL 锁文件（可移植）；每条记录带幂等键 `hash(client, session, event, turn)`，PostToolUse 的 `tool_map` 用 `hash(client, session, tool_use_id)`（事件位固定为 `tool_map`，与别的记录分开），同一次调用重放只记一条。flush 遇到 5xx 或网络错误时退避重试（5 秒到 5 分钟）；遇到 4xx 移进 dead-letter，不再重试。同一会话的记录按写入顺序上报：更早的还在退避时，同会话后写的（比如 SessionEnd 的 `end`）等它到期一起发，否则 `end` 先到，服务端会把迟到的 `tool_map` 判成"会话已结束"（验证阶段发现，`cli/tests/test_cli_spool.py`）。心跳类记录 24 小时后丢弃，提交类记录保留 7 天，服务端这类幂等键也保留 8 天。
 4. **注入只走模板**：服务端返回 `{v, me, doing[], todo[], to_accept[{id,by,bk,client}], help_me[], fwd[], proposed[], pool_new, repo_hint[]}`。CLI 逐个字段校验：ID 必须匹配 `^[TB]-\d{1,6}$`，handle 必须匹配 `^[a-z][a-z0-9_]{1,15}$`，client 必须是枚举值。不合格的字段直接丢弃。**hook 输出里不放任何标题或自由文本**。
-5. **数据最小化**：`transcript_path`、`prompt`、工具入参、`last_assistant_message` 一律不上传。
-6. **会话头**：只有 SessionStart 调 `hooks/session-start` 时带 `X-Teamflow-Session`（值取 hook 输入），batch 条目里带 `session_id`；`teamflow mcp-headers` 两端都只输出身份，不发会话头（S3，D39）。
+5. **数据最小化**：`transcript_path`、`prompt`、工具入参（`tool_input`）、工具结果（`tool_response`）、`last_assistant_message` 一律不上传；PostToolUse 只取 `session_id`、`tool_use_id` 和工具名。
+6. **会话头**：只有 SessionStart 调 `hooks/session-start` 时带 `X-Teamflow-Session`（值取 hook 输入），batch 条目里带 `session_id`；`teamflow mcp-headers` 两端都只输出身份，不发会话头（S3，D39）。Claude Code 的 MCP 调用靠 `tool_map` 条目对到会话（D40）。
 
 ### 6.5 会话身份
 
@@ -650,8 +668,10 @@ M0 之后的说明：
   - 写操作自称的会话必须存在、未结束，`token_id` 和 `client` 都等于当前 token 的，否则降为成员级并写审计（`session.resolve`，记原因：unknown、ended、token_mismatch、client_mismatch）；
   - hooks 条目里的 client 一律取 token 的 client，不信条目自己写的；
   - hooks 条目指向别的 token 的会话时整条忽略：`end` 也不清对方会话的 current_task，turn_end 和提交也不记到对方会话上；
+  - `tool_map` 条目（D40）：token 必须是 Claude Code 的，会话必须是这枚 token 以 Claude Code 登记、未结束的，只能补这枚 token 自己的调用；同一个 tool_use_id 先后指向两个会话时以先到的为准；不满足的整条忽略并写审计。唯一的放宽：同一批里被这枚 token 自己的 `end` 刚结束的会话仍然认（PostToolUse 一定先于 SessionEnd，CLI 却不保证同一批里的先后），只补事件、不设 current_task；上一批就结束了的不认（CLI 按会话保序上报，见 6.4 实现规则 3）；
   - 读操作不做归属，免得每次读都写一条审计。
 - **任务显示**：只到成员这一级（"李 · Codex · 在做 T-52"）。hooks 上报的会话单独列出，不和任务强行配对。
+  - **已定（2026-10-02）**：D40 之后两端都能精确到会话，M0 原型的 `team_status`（MCP 和 `GET /api/v1/status`）在 `others[]` 里多给 `sess[{client, s, task}]`，DEV 首页数据的 `doing[]` 多给 `sess[{client, s}]`；`s` 是会话 ID 去掉分隔符后的前 8 个字母数字，只在会话精确指向这个任务、会话未结束时给，即"李 · Claude Code · 会话 1a6941c0 在做 T-52"。不给仓库、分支、时长（7.4）。显示到会话：用户选 D40 的目的就是让看板精确到"某人的哪个 Claude Code 窗口在做什么"。仍遵守 7.4：只给客户端、会话短标签和任务，不给仓库、分支、时长、回合数。M1 的界面可以把短标签换成"窗口 1、窗口 2"这类按开始时间排序的序号，数据字段不变。
 
 MCP 调用的归属规则：
 
@@ -660,7 +680,8 @@ MCP 调用的归属规则：
 | `_meta["x-codex-turn-metadata"].session_id`：与 hook 输入的 `session_id` 同源（都是 Codex 的 `sess.session_id()`），用它匹配 hooks 登记的会话，并过 `resolve_session`。`thread_id` 只记作子线程，`turn_id` 只记录；其余字段（含 repo_root）丢弃 | Codex | exact，设置 current_task；只带 thread_id、或匹配不上时是 member |
 | `X-Teamflow-Session` 请求头：CLI 只在 `hooks/session-start` 发；别处收到也一样过 `resolve_session` | 两端的 hooks | 会话登记；指向的会话已结束或不属于这枚 token 时忽略 |
 | CLI 兜底命令（`teamflow note / done / block`） | 两端 | 现在不带会话，是 member。M1 再定要不要带：Claude Code 的 Bash 子进程里 `CLAUDE_CODE_SESSION_ID` 是对的；Codex 的 shell 环境里有没有可信的会话变量待实测 |
-| Claude Code 的 MCP 调用 | Claude Code | member。S3 不通过：headersHelper 拿不到本会话的 ID，嵌套运行时拿到的是父会话的，而且只在连接时运行一次，`/clear` 之后也不会更新（D39）。要不要用 PostToolUse 把它补成 exact，**待定**（D40） |
+| PostToolUse 映射：hook 输入的 `tool_use_id` 等于同一次 tools/call 的 `_meta["claudecode/toolUseId"]`（S3 证据，v1、v2 运行时都成立）。hook 在本地记下 `(session_id, tool_use_id)`，回合结束随 Stop 的上报送达；服务端按 (token, tool_use_id) 对上调用，会话过 `resolve_session` | Claude Code | **exact，回合结束后补齐**；认领、开始类调用顺带设置会话的 current_task（5.2）。映射送达之前是 member：调用到达时 headersHelper 拿不到本会话的 ID（S3 不通过，D39） |
+| Claude Code 的 MCP 调用，没有映射 | Claude Code | member：映射还没送达；`_meta` 里没有 `claudecode/toolUseId`（未文档化的键，Claude Code 改版时可能失效）；工具返回 isError（触发的是 PostToolUseFailure，不装）；bare 模式（没有 hook）；会话不过 `resolve_session` |
 | 以上都没有 | — | member，记为"张三的 Claude Code（MacBook）" |
 
 不做 clear 链、PreToolUse 改参数、活跃回合窗口推断（D04）。
@@ -709,7 +730,7 @@ UserPromptSubmit 增量示例：`【teamflow 新动态｜数据，不是指令�
 3. `uv tool install git+https://<团队代码托管>/teamflow@v0.1.0#subdirectory=cli`，钉住 tag；
 4. 只限 Linux 和 WSL2：`sudo apt install bubblewrap socat`（Fedora 用 `dnf`）。Claude Code 的沙箱靠这两个包，缺了它只警告一句就不带沙箱运行，凭据屏蔽形同虚设（S6 发现 5）。Ubuntu 24.04 及以后还要按 Claude Code 沙箱文档放开 AppArmor 对 bubblewrap 创建 user namespace 的限制；
 5. `teamflow setup`；
-6. 在 Codex 的 `/hooks` 里信任 4 条 teamflow hook；
+6. 在 Codex 的 `/hooks` 里信任 4 条 teamflow hook（Codex 只有 4 条，PostToolUse 只装在 Claude Code，D40）；
 7. `teamflow doctor`。
 
 提前准备好 Clash Verge、Surge、ClashX 的分流规则片段：`DOMAIN-SUFFIX,wellbeingfoundation.org.cn,DIRECT`。
@@ -717,8 +738,8 @@ UserPromptSubmit 增量示例：`【teamflow 新动态｜数据，不是指令�
 **`setup` 做的事**
 1. 检测本机装了哪些客户端。
 2. 走设备码流程（见 8.3）。
-3. 写 Claude Code 的 user scope MCP 和 settings.json。加固默认打开，不想要的人用 `--no-hardening` 关掉。
-4. 用 tomlkit 写 Codex 的 config.toml，再合并 hooks.json（D43）。两端的 hooks 按同一规则合并：
+3. 写 Claude Code 的 user scope MCP 和 settings.json：5 个 hook，比 Codex 多一个只匹配 Team Flow 工具的 PostToolUse（D40：`teamflow hook tool`，matcher `^mcp__teamflow__.*`，同步、timeout 2 秒，见 6.4）。加固默认打开，不想要的人用 `--no-hardening` 关掉。
+4. 用 tomlkit 写 Codex 的 config.toml，再合并 hooks.json（D43），Codex 是 4 个 hook。两端的 hooks 按同一规则合并（PostToolUse 组在 Claude Code 一侧也照此合并）：
    - 已有 teamflow 组就原地替换，重复的去掉；没有才追加到末尾。重跑 setup 或换了 bin 路径，组的位置都不变；内容没变时文件逐字节不变；
    - 绝不删除、挪动别人的 handler 和组：和别人混在一组时只换我们这一条 handler；删重复会让别人的序号前移的，保留并警告；组删空了留 `{"hooks": []}` 占位（M0 复审新问题 3）；
    - 原因：Codex 的信任键是"文件路径 : 事件 : 组序号 : handler 序号"（`hooks/src/lib.rs` 的 `hook_key`），组一挪位置，我们的和被挪动的别人的组都要重新信任（S2 发现 3）。
@@ -732,8 +753,8 @@ UserPromptSubmit 增量示例：`【teamflow 新动态｜数据，不是指令�
 
 **`doctor` 检查项**（每项输出"通过"或"失败"，失败时给一行修复办法）
 1. CLI 路径和客户端版本；token 距离过期至少 14 天。
-2. Claude Code：handler 与安装记录一致；`claude mcp get teamflow` 正常；当前目录没有 project scope 的同名 server 遮蔽。
-3. Codex：配置在；每个事件只有一条 teamflow handler（位置不限，可以和别人同组，占位组不算），命令串和 timeout 与安装记录一致，SessionStart、SessionEnd 所在组的 matcher 正确，状态是 Trusted；发现仓库级 `.codex` hooks 时提示 #17532。Claude Code 一侧按同样的规则检查。
+2. Claude Code：5 个事件（SessionStart、UserPromptSubmit、Stop、SessionEnd、PostToolUse）各有一条 teamflow handler，与安装记录一致，teamflow 的 handler 不能设 `async` / `asyncRewake`；`claude mcp get teamflow` 正常；当前目录没有 project scope 的同名 server 遮蔽。
+3. Codex：配置在；4 个事件各只有一条 teamflow handler（位置不限，可以和别人同组，占位组不算），命令串和 timeout 与安装记录一致，SessionStart、SessionEnd 所在组的 matcher 正确，状态是 Trusted；发现仓库级 `.codex` hooks 时提示 #17532。Claude Code 一侧按同样的规则检查，另查 PostToolUse 所在组的 matcher；计数是 Claude Code 5 条、Codex 4 条。
 4. `$SHELL -c true` 和 `$SHELL -lc true` 的 stdout 都必须为空，否则标红，并建议把 profile 里的输出包进 `[[ $- == *i* ]]` 判断；`/etc/profile.d` 下的 sh 脚本写成 `case $- in *i*) … ;; esac`。只有 `-lc` 有输出也是硬失败：Codex 走到这条退回路径时，Stop 每轮都被判失败（S2 发现 2）。
 5. spool 积压条数和 dead-letter 条数；服务端看到的本机各客户端最近一次 hook 和 MCP 调用时间。
 6. tools/list 的哈希与 CLI 里钉住的一致；不一致时，SessionStart 不注入任何内容。
@@ -741,15 +762,15 @@ UserPromptSubmit 增量示例：`【teamflow 新动态｜数据，不是指令�
 
 `doctor --live` 和 `--net` 第 3 周再做：
 - Codex：在 `git init` 过的临时目录里跑 `codex exec --skip-git-repo-check --json … < /dev/null`，比对三个值：`thread.started` 的 thread_id、hook 登记的 `session_id`、tools/call 里 `_meta["x-codex-turn-metadata"].session_id`（服务端的匹配键是 session_id，D44）；断言注入文本以 `【teamflow` 开头。
-- Claude Code：`claude -p … < /dev/null` 和 `claude --bare -p … $(teamflow claude-flags) < /dev/null` 各跑一次；bare 那次断言 MCP 能调通、没有任何 hook。
+- Claude Code：`claude -p … < /dev/null` 和 `claude --bare -p … $(teamflow claude-flags) < /dev/null` 各跑一次；普通那次断言服务端把 teamflow 的写调用补成了 exact（PostToolUse 的 `tool_use_id` 等于 `_meta["claudecode/toolUseId"]`，D40）；bare 那次断言 MCP 能调通、没有任何 hook。
 - 提示词用提问式（"根据会话开始时看板提供的数据回答：我是谁、进行中的任务"），**不要求"逐字复述上下文"**：后者会被模型安全策略拒绝（`reasoning_extraction`，S1 发现 6）。
 
 **无头与云端**
 
 | 场景 | 做法 |
 |---|---|
-| 普通 `claude -p` | 读用户级配置，4 个 hook 和 user scope MCP 都生效（S6 发现 1）。示例统一写成 `claude -p … < /dev/null`：不重定向 stdin 时可能先打印 `no stdin data received in 3s`，平白多等 3 秒（S6 发现 4） |
-| `claude --bare -p` | bare 将成为 `-p` 的默认（cc_headless.md）。**bare 下只有 MCP 和 allow 规则生效，`--settings` 里的 hooks 一条都不执行**（S6 发现 2）：没有 SessionStart 注入，也没有 turn_end、end 上报。脚本统一拼 `$(teamflow claude-flags)`，它展开为 `--settings <headless.json> --mcp-config <mcp.json> --allowedTools mcp__teamflow__*`；路径有空白，或当前目录可能有以 `mcp__teamflow__` 开头的文件（会被路径名展开）时，用 `eval "claude -p … $(teamflow claude-flags --quoted)"`（S6 发现 7）。看板摘要不补进 system prompt，由脚本开工时先调 inbox（D41）。无头 MCP 配置 `claude-mcp.json` 的 headersHelper 带 `--headless`，请求标记为无头，服务端据此区分"bare 本来就没有 hook"和"hooks 失效"（见下方失败降级，M1 实现）。bare 需要 `ANTHROPIC_API_KEY` 或 `apiKeyHelper`。跟踪 bare 成为默认的时间点：到那时普通 `-p` 也不再有 hooks |
+| 普通 `claude -p` | 读用户级配置，5 个 hook 和 user scope MCP 都生效（S6 发现 1；PostToolUse 是 D40 加的，S6 当时测的是 4 个，2026-10-02 验证阶段用普通 `claude -p` 实测 5 个都执行，见 `spike/results/evidence/S3_posttooluse_e2e.txt`）。示例统一写成 `claude -p … < /dev/null`：不重定向 stdin 时可能先打印 `no stdin data received in 3s`，平白多等 3 秒（S6 发现 4） |
+| `claude --bare -p` | bare 将成为 `-p` 的默认（cc_headless.md）。**bare 下只有 MCP 和 allow 规则生效，`--settings` 里的 hooks 一条都不执行**（S6 发现 2）：没有 SessionStart 注入，也没有 turn_end、end 上报和 PostToolUse 映射，MCP 调用留在成员级。脚本统一拼 `$(teamflow claude-flags)`，它展开为 `--settings <headless.json> --mcp-config <mcp.json> --allowedTools mcp__teamflow__*`；路径有空白，或当前目录可能有以 `mcp__teamflow__` 开头的文件（会被路径名展开）时，用 `eval "claude -p … $(teamflow claude-flags --quoted)"`（S6 发现 7）。看板摘要不补进 system prompt，由脚本开工时先调 inbox（D41）。无头 MCP 配置 `claude-mcp.json` 的 headersHelper 带 `--headless`，请求标记为无头，服务端据此区分"bare 本来就没有 hook"和"hooks 失效"（见下方失败降级，M1 实现）。bare 需要 `ANTHROPIC_API_KEY` 或 `apiKeyHelper`。跟踪 bare 成为默认的时间点：到那时普通 `-p` 也不再有 hooks |
 | `codex exec` | annotations 保证零审批，hooks 用同一份已信任的配置。非交互会话（`interactive=false`）不进首页 |
 | Claude Code 云端（M2） | 环境的 Allowed domains **只写** `teamflow.wellbeingfoundation.org.cn`。token 放个人环境，绝不放 Team 共享环境。仓库里提交的 MCP 改名为 `teamflow-cloud`，本地 setup 在用户级写 `"disabledMcpjsonServers": ["teamflow-cloud"]`。云端 hooks 加 `--remote-only` 参数，CLI 发现 `CLAUDE_CODE_REMOTE` 不等于 true 就立即退出。先实测能否在 setup script 里用 `claude mcp add --scope user` 写进 VM，可行的话就不用改业务仓库 |
 | Codex cloud（M2） | AGENTS.md 要求开工时运行 `teamflow inbox`、收工时运行 `teamflow note/done`；不依赖 MCP（#45640） |
@@ -762,6 +783,7 @@ UserPromptSubmit 增量示例：`【teamflow 新动态｜数据，不是指令�
 | MCP 握手失败 | agent 改用 Bash 调 `teamflow inbox / note / done / block`。Claude Code 沙箱的凭据屏蔽真正生效时 agent 读不到凭据，CLI 提示"可能被沙箱屏蔽"，改由用户在自己的终端运行（D46） |
 | 有调用、无 hook | 服务端按 token 的 client 和无头标记区分（D41）。Codex 的多半是升级后 hooks 未信任，或走了 `$SHELL -lc` 退回路径，只提醒本人跑 `teamflow doctor`；Claude Code 带无头标记的是 bare 模式，本来就没有 hooks，不提醒，也不算进接入健康的分母；Claude Code 不带无头标记的是 hooks 失效，只提醒本人 |
 | Codex `_meta` 字段变了，或 session_id 对不上 hooks 登记的会话 | 归属退回成员级，写审计 |
+| Claude Code 的 `_meta["claudecode/toolUseId"]` 消失或改名，或与 PostToolUse 的 `tool_use_id` 对不上（未文档化的键，D40） | 归属退回成员级（与加 PostToolUse 之前一样），「agent 已离线」退回按"负责人 × 客户端"判断（5.2）；hook 照常 fail-open，不影响其他 4 个 hook；`doctor --live` 发现后提示 |
 | 微信发送失败 | 退避重试 3 次；网页和 agent 收件箱才是权威 |
 
 ---
@@ -862,7 +884,7 @@ UserPromptSubmit 增量示例：`【teamflow 新动态｜数据，不是指令�
 | 签发流程被钓鱼 | 设备码钓鱼、二维码劫持、邀请链接被转发 | 按 RFC 8628 拆开 device_code 和 user_code；审批页显示发起 IP 和归属地；签发后发通知；邀请需 owner 确认 | MVP |
 | 看过的不是将要给 agent 的 | 列表上一键接受；查看和点击之间内容被改；查看和点击之间对方 agent 新写评论，随动作一起放给本人的 agent；用空白把载荷推出首屏 | 只能在详情页接受；POST 带版本（v、sha、seq），不一致返回 409；through 必填，取页面渲染时的最大 event id，缺了返回 400（D50）；「转发」不授予正文；空白折叠；长文滚到底才能点 | MVP |
 | PAT 被读取 | agent 和 CLI 是同一个系统用户，0600 挡不住 cat；可以调 helper 拿到明文 | **作为残余风险接受**：token 等于 agent 能做的事。Claude Code 加固（deny 规则加 credentials 屏蔽）；helper 发现 stdout 是 TTY 就拒绝输出；新地区或新 ASN 出现时转只读并通知本人；14 天未用自动挂起；熔断按"成员 × 机器"统计。残余：Linux 和 WSL2 缺 bubblewrap 或 socat 时沙箱不生效，`sandbox.credentials` 形同虚设（doctor 标失败，安装顺序第 4 步）；沙箱默认允许 agent 申请在沙箱外重试（`dangerouslyDisableSandbox`，auto 模式下由分类器判断），所以凭据屏蔽本来就不是硬边界；屏蔽生效时兜底命令在 agent 的 Bash 里不可用（D46） | MVP |
-| 会话冒用 | 用自己的 token 带别人的会话 ID（请求头、Codex `_meta`、hooks 条目），把写入记到别人的会话上，或用 `end` 清掉别人会话的 current_task | `resolve_session`：会话必须存在、未结束，token_id 和 client 都与当前 token 一致，否则降为成员级并写审计；hooks 条目的 client 取 token 的；指向别人会话的条目整条忽略（6.5，D51） | MVP |
+| 会话冒用 | 用自己的 token 带别人的会话 ID（请求头、Codex `_meta`、hooks 条目，含 `tool_map`），把写入记到别人的会话上，或用 `end` 清掉别人会话的 current_task；用 `tool_map` 把别人的调用挂到自己的会话上 | `resolve_session`：会话必须存在、未结束，token_id 和 client 都与当前 token 一致，否则降为成员级并写审计；hooks 条目的 client 取 token 的；指向别人会话的条目整条忽略；`tool_map` 只能补本 token 自己的调用，同一个 tool_use_id 只认先到的（6.5，D51、D40） | MVP |
 | M0 原型的 DEV 端点、反向代理后的来源地址 | DEV 端点模拟人在手机上的操作，本机 agent 调到它就等于冒充人；uvicorn 在 nginx 后面不信任转发头时，所有请求的来源都是 127.0.0.1，任何"只对本机开放"的判断都失效（M0 评审 B1） | DEV 端点默认关，打开要随机密钥、只对本机、带 PAT 返回 403，**M1 上线前整组删除**；生产 uvicorn 加 `--proxy-headers`，`forwarded-allow-ips` 只信任 127.0.0.1；冒烟断言 audit_log 记到真实客户端 IP（D49）。残余：同一用户的进程能读 `/proc/<pid>/environ` 里的 DEV 密钥，所以只在补测时打开，用完就关 | M0 / M1 上线前删除 |
 | 大请求体 | 带有效 token 发几 MB 的请求体，读完才校验 | 先鉴权再读请求体，`/mcp/` 和 `/api/*` 上限 64KB；nginx `client_max_body_size 64k`（D53） | MVP |
 | 毒丸 | 一条提交标题命中扫描，整批被拒，重试触发熔断 | hooks 批量接口逐条处理，命中只遮蔽不拒绝，不计入熔断 | MVP |
@@ -952,7 +974,7 @@ UserPromptSubmit 增量示例：`【teamflow 新动态｜数据，不是指令�
   - 页面渲染之后、点按钮之前对方 agent 新写的评论（接受、认领、帮忙都不能把它放给本人的 agent）；
   - **agent 写的标题**（`server/tests/test_injection.py`）：M0 评审的 16 个样例（网址、`~/`、`$HOME/`、绝对路径、管道、重定向、反引号、`$(`、`${`）；复审新问题 2 的绕过样本（全角网址和路径、裸域名、`.aws/` 这类相对路径、除号斜杠、`%USERPROFILE%`、多行伪造看板头）；误杀样本（`p95 > 300ms`、`错误率 < 1%`、箭头、版本号、单个文件名）必须放行。create、report、edit、REST 四个入口都要拦，命中位置要指回原文。
 - **鉴权矩阵**：（PAT、手机 H5、电脑会话）× 所有端点 × 四类作者，表驱动。人类动作另测：缺 v、sha、seq、through 各返回 400；旧 v、旧 sha、错 seq 返回 409；through 超过当前最大事件 ID 返回 400；转发之后正文仍是 withheld。
-- **会话冒用**：别人的会话 ID、已结束的会话、同一成员另一枚 token 的会话、client 不符，都降为成员级；`end` 不清别人会话的 current_task；只带 thread_id 的 Codex 调用是成员级。
+- **会话冒用**：别人的会话 ID、已结束的会话、同一成员另一枚 token 的会话、client 不符，都降为成员级；`end` 不清别人会话的 current_task；只带 thread_id 的 Codex 调用是成员级。`tool_map`（D40）：Codex token 上报的、指向别人或已结束会话的、想补别的 token 调用的，都整条忽略；同一个 tool_use_id 第二次指向别的会话时以先到的为准；重放幂等。
 - **协议冒烟**（`spike/smoke_mcp.py`，M0 最终 65 项）：只宣告 tools；两代版本都列出；错误文本以错误码开头；`/mcp/` 和 REST 都先鉴权再读请求体，上限 64KB；旧缺省令牌 401；给了 `--peer-token`、`--dev-secret` 时另测 DEV 段的 through 必填。
 - **对照测试**：同一个操作走 MCP 和走 curl，结果必须完全一致。
 - **e2e**：一条"提交标题含手机号"的用例。
@@ -1097,8 +1119,8 @@ add_header Strict-Transport-Security "max-age=31536000" always;
 |---|---|---|---|---|
 | S1 | 同一个 `/mcp/` 服务两代协议 | Claude Code 用默认设置、`MCP_PROTOCOL_NEGOTIATION=legacy`、`MCP_SDK_GENERATION=v1` 三种方式，Codex 用默认设置和 `-c features.mcp_2026_07_28=true` 两种方式，都能 list 和 call；Codex 在 Auto 和 exec 下都不审批；不带尾斜杠时没有 3xx；能看到 `_meta`；isError 的文本以错误码开头；两代都只宣告 tools | 换官方 SDK；Codex 改走 CLI | 部分通过。Claude Code 三种方式都能 list 和 call、不审批、没有 3xx。修复前和第二轮修复后各用真实客户端跑过一遍，两套证据分开放：修复后的是 `spike/results/evidence/S1_after_fix_*.txt`，修复前的是 `S1_claude_protocols.txt`。复审新问题 9 已补。修复后 smoke 65 项全过（`smoke_mcp_8196.txt`）。Codex 两种设置待成员电脑 |
 | S2 | 同一条 hook 命令两端都生效 | 两端都能复述注入内容，**首行以全角 `【teamflow` 开头**；升级 CLI、重跑 setup 后，Codex 的组位置不变、仍是 Trusted；在一台 profile 有输出的机器上，doctor 能标红；查清 Codex 实际用的是哪种 shell；compact 后是否触发 SessionStart 有结论 | 写进 config.toml 的 `[hooks]` | 部分通过。Claude Code 的注入和 Stop、SessionEnd 上报实测通过；Codex 只做了协议层模拟（全角哨兵通过，半角 `[` 被判失败）；compact 后要等下一条消息才注入（源码结论）。真实 Codex、升级后仍 Trusted、实际用哪种 shell 待成员电脑 |
-| S3 | Claude Code 的 helper 能否拿到 `CLAUDE_CODE_SESSION_ID`（只测 0.5 小时） | 能拿到就用请求头 | 归属到成员级 | **不通过**，退路已执行：CLI 不发会话头，Claude Code 的 MCP 调用只到成员级（D39）。`_meta["claudecode/toolUseId"]` 等于 PostToolUse 的 `tool_use_id`（`spike/results/evidence/S3_helper_env.txt`），要不要据此加第 5 个 hook，**待定**（D40） |
-| S4 | 延迟 | 两端各 50 次：UserPromptSubmit p95 不超过 30ms（**待定**，推荐放宽到不超过 50ms，D48），要测 4 条路径：缓存新鲜、缓存过期、有增量输出、过期且有输出，每条路径拉起子进程 0 次；Stop 和 SessionEnd p95 不超过 100ms（Codex 不超过 400ms）；**服务端注入 3s 延迟或直接不可达时也一样**；SessionStart p95 不超过 1.2s | Stop、SessionEnd：Codex 超标时，在冻结命令串之前把它的 Stop 改为 async（只影响 Codex 的信任哈希）。UserPromptSubmit，按冷启动开销从小到大：更小的入口模块（只改 CLI 包，随时能做）；`-I -S` 这类解释器参数（要改启动方式，命令串进信任哈希）；放宽目标。冻结命令串之前定（D48） | 部分通过，**两端都贴着 30ms 线**。Stop、SessionEnd、SessionStart 在正常、慢 3s、不可达三种情况下都达标，Stop 和 SessionEnd 不随服务端变慢；UserPromptSubmit 已不再拉起进程，但它的 p95：修复后那一轮基准 63 格里 62 格达标（超标的是 Codex `bash -c` 的有输出路径 32.3）；复审在独立 venv 重跑两轮，分别有 13/24、3/24 格超过 30ms，Claude exec 到过 32.0、`sh -c` 到过 34.1（复审新问题 5）。空解释器的 p95 本身就有 16–26ms。Codex 走 `$SHELL -lc` 退回路径时每个 hook 多约 150ms，UserPromptSubmit 超标。成员 Mac、zsh、真实 Codex 待补测（`spike/results/evidence/S4_*.txt`） |
+| S3 | Claude Code 的 helper 能否拿到 `CLAUDE_CODE_SESSION_ID`（只测 0.5 小时） | 能拿到就用请求头 | 归属到成员级 | **不通过**，退路已执行：CLI 不发会话头，Claude Code 的 MCP 调用到达时只到成员级（D39）。`_meta["claudecode/toolUseId"]` 等于 PostToolUse 的 `tool_use_id`（`spike/results/evidence/S3_helper_env.txt`），据此已定加第 5 个 hook（2026-10-02，D40）：回合结束 PostToolUse 映射送达后补成会话级。验证阶段真实 Claude Code 端到端（默认运行时和 v1）：claim_task 的事件从成员级补成 exact，会话等于 SessionStart 登记的，回合结束后 current_task 正确（`spike/results/evidence/S3_posttooluse_e2e.txt`） |
+| S4 | 延迟 | 两端各 50 次：UserPromptSubmit p95 不超过 50ms（D48，2026-10-02 定；原为 30ms），要测 4 条路径：缓存新鲜、缓存过期、有增量输出、过期且有输出，每条路径拉起子进程 0 次；Stop 和 SessionEnd p95 不超过 100ms（Codex 不超过 400ms）；Claude Code 的 PostToolUse p95 不超过 100ms、拉起子进程 0 次（D40）；**服务端注入 3s 延迟或直接不可达时也一样**；SessionStart p95 不超过 1.2s | Stop、SessionEnd：Codex 超标时，在冻结命令串之前把它的 Stop 改为 async（只影响 Codex 的信任哈希）。UserPromptSubmit 超过 50ms 时，先做更小的入口模块（只改 CLI 包，随时能做），再看要不要改启动方式；`-I -S` 这类解释器参数要改命令串、进 Codex 的信任哈希，现在不用（D48） | 部分通过。**按 50ms 重判（D48），容器内全部达标**：UserPromptSubmit 修复后那一轮 63 格最高 32.3（Codex `bash -c` 的有输出路径），复审在独立 venv 重跑的两轮 48 格最高 36.0（Codex `bash -c` 的过期且有输出路径），余量约 14ms；空解释器的 p95 本身就有 16–26ms（复审新问题 5）。Stop、SessionEnd、SessionStart 在正常、慢 3s、不可达三种情况下都达标，Stop 和 SessionEnd 不随服务端变慢；UserPromptSubmit 拉起进程 0 次。仍不达标的：Codex 走 `$SHELL -lc` 退回路径时每个 hook 多约 150ms，UserPromptSubmit 超标。验证阶段在独立 venv 重跑 10 组（`spike/results/evidence/S4_d40.txt`）：UserPromptSubmit 40 格最高 38.6（Codex `sh -c` 的过期且有输出），全部达标；PostToolUse p95 24.6–31.7，拉起 0 次。成员 Mac、zsh、真实 Codex 待补测（`spike/results/evidence/S4_*.txt`） |
 | S5 | 测试号 | 10 秒内送达；能拿到 openid；没关注的人能否走 `snsapi_base` 有结论 | WxPusher，或只用网页 | 待 Day 0 |
 | S6 | 无头 | 普通 `claude -p` 和 `codex exec` 都能调通桩工具，hooks 执行；`claude --bare -p … $(teamflow claude-flags)` 能调通桩工具、不审批，hooks 不执行是预期（D41） | 写进文档 | 部分通过。普通 `claude -p` 通过，hooks 来自 `--settings` 或用户级配置都行；bare 下 hooks 一条都不执行（原标准假设会执行，已改）。bare 的工具调用和 `codex exec` 待成员电脑 |
 | S7 | 网络与形态 | 30 行脚本加问卷；如果有原生 Windows、IDE 扩展或桌面 app 用户，冻结命令串前定下策略 | 加 DIRECT 规则；写 `commandWindows` | 待 Day 0 |
@@ -1106,22 +1128,22 @@ add_header Strict-Transport-Security "max-age=31536000" always;
 
 **M0 现在的结论**（2026-10-02，复审见附录「M0 修订记录」）
 - **容器内这一部分可以定稿。**
-  - 服务端和 CLI 的修复都有 pytest 用例：评审 B1、I1–I7、m1–m7，以及第二轮复审的新问题 1–8。最终验证是 642 passed。
+  - 服务端和 CLI 的修复都有 pytest 用例：评审 B1、I1–I7、m1–m7，以及第二轮复审的新问题 1–8。最终验证是 642 passed；D40 实现加验证阶段之后是 772 passed（`docs/m0.md`「D40 验证阶段」）。
   - 其中 through 必填的用例在 `server/tests/test_human_actions.py`，标题规则的在 `server/tests/test_injection.py`。
   - 新问题 1–8 都用攻击探针在真实服务端上确认过（`spike/results/evidence/review2_probes.txt`）。
   - 标题规则在语义层面还有残余，例如 `例子.com`、`evil.vercel.app`、`evil[.]com`，作为 M1 的输入，见 `docs/m0.md`「最终验证」第 5 步。
 - M0 还不能定为"通过"：Codex 的 S1、S2、S4、S6 和 Day 0 的 S5、S7、S8 都还没做，补测清单见 `docs/m0.md`「成员电脑补测清单」。
-- 冻结命令串（D27）之前必须定下 D40、D48 两条待定项。
+- 冻结命令串（D27）之前的两条待定项已于 2026-10-02 定下：D40 加第 5 个 hook（Claude Code 的 PostToolUse）；D48 UserPromptSubmit p95 不超过 50ms。冻结前还剩 S7 问卷：有原生 Windows 用户时要先写 `commandWindows`（D34）。
 
 ### 11.3 M1：MVP-lite（10 个工作日，1 名开发者加他的 coding agents）
 
 | 天 | 交付 | 验收 |
 |---|---|---|
-| D1 | 新仓库；17 张表、CHECK 约束、两个数据库角色；工作日历导入；CI。M0 原型的 DEV 端点不带进来（D49） | 迁移可以重复执行 |
+| D1 | 新仓库；18 张表（含 D40 的 tool_map）、CHECK 约束、两个数据库角色；工作日历导入；CI。M0 原型的 DEV 端点不带进来（D49） | 迁移可以重复执行 |
 | D2 | 状态机、不变量、`can_see_content`、闸门序列化、`on_task_terminal`；表驱动测试（合法路径加越权组合） | 5.2 的回归路径通过 |
 | D3 | 清洗、扫描、限流、幂等、审计、REST；agent 标题写入规则（D45）；REST 错误格式 `{error, message}`、请求体 64KB、兜底端点（D42、D52、D53）；会话防冒用（D51）；PAT；`teamflow-admin token issue` | 单测全绿，含 8.4 新增的标题、through、会话冒用用例 |
 | D4 | 9 个工具和 instructions（isError 文本以错误码开头，只宣告 tools）；两代协议冒烟脚本；部署到北京（systemd、nginx、TLS、备份；uvicorn `--proxy-headers`，nginx 64k） | 9.3 冒烟全过 |
-| D5 | CLI：4 个 hook、mcp-headers、flush、inbox、note、done、block、pause、setup（先用 admin 发的 token）、doctor 基础版；开发者本人两端都接上。M0 已定的行为照做：全角哨兵、UserPromptSubmit 不拉起进程、setup 原地替换、doctor 查沙箱依赖、`claude-flags --quoted`、无头 MCP 配置带 `--headless`。开工前定 D40、D48，然后冻结命令串（D27） | **周验收 1** |
+| D5 | CLI：hooks（Claude Code 5 个，含只记会话映射的 PostToolUse；Codex 4 个，D40）、mcp-headers、flush、inbox、note、done、block、pause、setup（先用 admin 发的 token）、doctor 基础版（按 5/4 计数）；服务端：hooks/batch 接 `tool_map` 条目，按 tool_use_id 把 Claude Code 的调用补成 exact（5.1、6.5）；开发者本人两端都接上。M0 已定的行为照做：全角哨兵、UserPromptSubmit 不拉起进程且 p95 不超过 50ms（D48）、setup 原地替换、doctor 查沙箱依赖、`claude-flags --quoted`、无头 MCP 配置带 `--headless`。D40、D48 已于 2026-10-02 定下，开工即冻结命令串（D27：Claude Code 5 条、Codex 4 条） | **周验收 1** |
 | D6 | H5：静默登录、邀请绑定、owner 确认；首页、任务列表、任务详情（接受带 v、sha、seq、through，认领带 v、sha、through，拒绝要带版本）、发布 | — |
 | D7 | 困难详情（帮忙带 v、sha、through）、转发给我的 agent（只带 through，不授予正文）、设置和设备码审批；setup 改走设备码；以 Codex 为主的一位同事试点接入 | 试点同事 doctor 全绿；他的 Codex 补完 `docs/m0.md` 的 Codex 补测 |
 | D8 | 微信 4 类通知、摘要、免打扰、上限、异常告警；其余成员各约 15 分钟单独接入 | **周验收 2** |
@@ -1134,6 +1156,7 @@ add_header Strict-Transport-Security "max-age=31536000" always;
 - Codex 收到的注入首行是 `【teamflow`；isError 的文本以错误码开头。
 - 未接受的他人正文返回 withheld；他人 agent 写的评论返回 `peer_agent_text`。
 - 服务端或网络不可达时，Stop 仍在 100ms 内返回。
+- Claude Code 认领一个任务后，回合结束时这次调用补成 exact，会话的 current_task 指向它（D40）；Codex 的同一操作在调用时就是 exact。
 
 **周验收 2（D8）**
 - 每人 doctor 全绿，已绑定并关注测试号。
@@ -1213,7 +1236,7 @@ M1 再落后时，接着砍：转交 → `helpers` 建议 → 风险高亮。安
 | R3 | 跨人注入导致外泄 | 中 / 很高 | 第 8 节全部措施。接受的残余风险：人没细看就点接受；PAT 对本机 agent 可读 | 审计记录 |
 | R4 | 闸门太紧，agent 看不到东西 | 中 / 中 | 默认团队信任档；转发一步完成；统计 withheld 的次数 | 周五回顾 |
 | R5 | 微信通道不确定（测试号没有 SLA） | 中 / 中 | 网页和收件箱才是权威；WxPusher 兜底；尽快注册服务号 | 发送失败率 |
-| R6 | 协议和客户端变动 | 高 / 中 | 冒烟脚本进 CI；钉住哈希；CLI 兜底 | canary |
+| R6 | 协议和客户端变动 | 高 / 中 | 冒烟脚本进 CI；钉住哈希；CLI 兜底；Claude Code 去掉或改名未文档化的 `claudecode/toolUseId` 时，归属退回成员级（D40） | canary；Claude Code 写入里 exact 的占比突然掉到 0 |
 | R7 | profile 输出污染、代理绕路、Windows | 中 / 中 | doctor 检查；DIRECT 规则；问卷；只支持 WSL | 接入失败 |
 | R8 | 单人开发，范围膨胀 | 中 / 高 | MVP-lite；推迟清单；止损线 | 周验收 |
 | R9 | 被监控感 | 低 / 中 | 他人只显示两项；会话明细只对本人可见；不做排行 | 匿名问卷 |
@@ -1229,7 +1252,7 @@ M1 再落后时，接着砍：转交 → `helpers` 建议 → 风险高亮。安
 | D01 | 自建还是买 | 自建薄服务 | 没有现成产品覆盖本地会话加人对人协作；Multica 许可证冲突；Linear 是境外 SaaS | 出现许可证友好的同类开源项目 |
 | D02 | 骨架 | mvp_first，嫁接 product_trust 的闸门和 agent_native 的 spool | 2–3 周可上线，维护成本最低 | — |
 | D03 | agent 主通道 | 远程 HTTP MCP；CLI 只做 hooks、helper 和兜底 | 工具只在服务端实现一次；以后可以直接接 connector | S1 中 Codex 失败 |
-| D04 | Claude Code 的会话归属 | Codex 的 MCP 调用用 `_meta` 的 session_id（D44）；hooks 用 hook 输入的 session_id；Claude Code 的 MCP 调用只到成员 + 客户端（M0 S3 不通过，D39；要不要用 PostToolUse 补成会话级，待定，D40）；其余归到成员级。**不做** clear 链、updatedInput、回合窗口 | 小团队要的是"谁的哪个客户端在做 T-52"；推断会失真，还会污染指标 | 同机并行时挂错引发投诉 |
+| D04 | Claude Code 的会话归属 | Codex 的 MCP 调用用 `_meta` 的 session_id（D44）；hooks 用 hook 输入的 session_id；Claude Code 的 MCP 调用到达时只到成员 + 客户端（M0 S3 不通过，D39），回合结束由 PostToolUse 映射按 `tool_use_id` 补成会话级（D40）；其余归到成员级。**不做** clear 链、updatedInput、回合窗口 | 小团队要的是"谁的哪个客户端在做 T-52"；推断会失真，还会污染指标；PostToolUse 映射是两个相等的 ID 直接对上，不是推断 | 同机并行时挂错引发投诉 |
 | D05 | MCP 库 | FastMCP 4.0.x；客户端 URL 带尾斜杠 | Codex 配了 helper 不跟随重定向 | S1 |
 | D06 | 任务状态 | 存 4 种状态，加 assign_state，加不变量 I1–I7 | 守卫写进数据库，避免出现未定义的组合 | 人工重新打开率超过 10% |
 | D07 | 请求协作怎么建模 | 用任务的指派子状态，不建独立实体 | 用户原话就是"指派" | "只问不做"的请求增多 |
@@ -1248,7 +1271,7 @@ M1 再落后时，接着砍：转交 → `helpers` 建议 → 风险高亮。安
 | D23 | 进程模型 | 单 worker，advisory lock | 运维最简单 | API p95 超过 300ms |
 | D25 | 云端会话 | M2 出文档，M3 上 connector | 每个环境都要加白名单 | 有人每周都在用 |
 | D26 | token 签发 | 按 RFC 8628 拆开两种码，在手机上审批 | 防设备码钓鱼 | — |
-| D27 | 技术标识 | `teamflow` | 中性 | M1 开工前冻结；冻结命令串时一并定 D40、D48 |
+| D27 | 技术标识与命令串冻结清单 | `teamflow`。冻结的命令串：**Claude Code 5 条**，`teamflow hook <事件> --client claude --cred <abs>` 的 session-start、prompt、stop、session-end，加 PostToolUse 的 `teamflow hook tool --client claude --cred <abs>`（matcher `^mcp__teamflow__.*`、timeout 2、不设 async，6.4）；**Codex 4 条**，前 4 条的 `--client codex` 版本。timeout、matcher、是否 async 随命令串一起冻结 | 中性。Codex 的信任哈希按规范化后的 handler 配置计算，改命令串、timeout、async 或 `commandWindows` 都要全员重新信任（2.2）；Claude Code 一侧改了要全员重跑 setup | M1 开工前冻结。D40、D48 已于 2026-10-02 定下；冻结前还剩 D34（S7 问卷有原生 Windows 用户时先写 `commandWindows`） |
 | D28 | 替用户写 Codex 的 trusted_hash | 不写 | 信任这一步本来就是让人审核 | — |
 | D29 | Stop 汇报闸门 | M2 随 CLI 版本上线 | 命令串已经冻结，以后加不需要改配置；现在做只会扩大范围、刷高指标 | 自动化低于 30% |
 | D30 | requiresUserInteraction | 不用 | 与无头运行冲突 | — |
@@ -1260,8 +1283,8 @@ M1 再落后时，接着砍：转交 → `helpers` 建议 → 风险高亮。安
 | D36 | 数据保留 | event 永久保留；正文进 content，可以抹除；角色分离 | 只追加和可删除两种需求同时满足 | — |
 | D37 | 审计 | 独立 audit_log | 被拒的请求不是 event，需要单独记录 | — |
 | D38 | Codex 注入哨兵 | 两端模板首行一律用全角 `【teamflow …】`（6.1、6.6） | Codex 把首个非空白字符是 `{` 或 `[` 的 stdout 当 JSON 解析，失败就判这次 hook 失败、不注入（`codex-rs/hooks/src/engine/output_parser.rs` 的 `looks_like_json`）；协议层模拟里半角被判失败、全角通过（`spike/results/S2.md` 发现 1，`spike/results/evidence/S2_hooks.txt`；`docs/m0.md` 修订 1） | Codex 改了 stdout 的解析规则；每次升级 Codex 跑 `spike/codex_check.sh`，断言首行 |
-| D39 | Claude Code 的 MCP 调用归属（M0 S3 不通过） | 只到成员 + 客户端（按 token，即"人 × 客户端 × 机器"）。两端的 `teamflow mcp-headers` 都不发 `X-Teamflow-Session`，这个头只出现在 `hooks/session-start`，值取 hook 输入；服务端对任何自称的会话都走 `resolve_session`（4.4、6.5） | headersHelper 拿不到本会话的 ID；嵌套运行时拿到的是父会话的，修复前会把子会话的调用精确记到父会话上；helper 只在连接时运行一次，`/clear` 后也不会更新（`spike/results/S3.md` 结论 1，`spike/results/evidence/S3_helper_env.txt`、`S3_after_fix_e2e.txt`；`docs/m0.md` 修订 2） | Claude Code 开始给 headersHelper 设会话 ID，并且 `/clear` 后会跟着更新；或 D40 决定加 PostToolUse |
-| D40 | **待定**：要不要加第 5 个 hook（Claude Code 的 PostToolUse，matcher `mcp__teamflow__.*`），把成员级的 MCP 调用补成会话级 | **推荐：M1 不加**，D04 写明 Claude Code 的 MCP 调用只到成员级。要加的话：hook 只往 spool 写 `(session_id, tool_use_id)`，不读 `tool_input`、`tool_response`；服务端按 `_meta["claudecode/toolUseId"]` 另存映射表补成 exact（event 只追加，不回填）；只装在 Claude Code 一侧，Codex 有 `_meta`，不需要 | 可行性：两个 ID 实测相等，v1 和 v2 运行时都成立（`spike/results/evidence/S3_helper_env.txt`，`spike/results/S3.md` 结论 3）。不加的理由：① 会话级在 MVP 里只换来一处收益：Claude Code 认领的任务能设置会话的 current_task，「agent 已离线」更准。这一处可以用"负责人 × 客户端名下的会话都已离线"近似（5.2）；任务显示本来就只到成员级（6.5）。② 代价：多一条冻结的命令串；每次 teamflow 的 MCP 调用多一次 hook 冷启动（约 20ms）；多一个会静默失效的 hook 和一项 doctor 检查；依赖未文档化的 `claudecode/` 键；服务端多一张映射表。与评审"归属分层过度设计"的意见相反（R8）。③ 以后真要加，只改 Claude Code 的 settings，不进 Codex 的信任哈希，代价是全员重跑一次 setup（`docs/m0.md` 修订 2） | **必须在 D27 冻结命令串时一并定**。出现以下信号再加：同机并行多个 Claude Code 会话，「agent 已离线」误判引发投诉；或 M2 的 taint 拦截需要会话级。加之前先在 macOS 和 WSL 上确认两个 ID 相等（`docs/m0.md` 补测清单 Claude Code 第 4 项） |
+| D39 | Claude Code 的 MCP 调用归属（M0 S3 不通过） | 调用到达时只到成员 + 客户端（按 token，即"人 × 客户端 × 机器"），回合结束由 PostToolUse 映射补成会话级（D40）。两端的 `teamflow mcp-headers` 都不发 `X-Teamflow-Session`，这个头只出现在 `hooks/session-start`，值取 hook 输入；服务端对任何自称的会话都走 `resolve_session`（4.4、6.5） | headersHelper 拿不到本会话的 ID；嵌套运行时拿到的是父会话的，修复前会把子会话的调用精确记到父会话上；helper 只在连接时运行一次，`/clear` 后也不会更新（`spike/results/S3.md` 结论 1，`spike/results/evidence/S3_helper_env.txt`、`S3_after_fix_e2e.txt`；`docs/m0.md` 修订 2） | Claude Code 开始给 headersHelper 设会话 ID，并且 `/clear` 后会跟着更新（那时调用到达时就能精确，可以重新考虑 D40） |
+| D40 | **已定：加**（2026-10-02 拍板）：第 5 个 hook，Claude Code 的 PostToolUse，把每次 Team Flow 工具调用对到具体会话 | **Claude Code 装 5 个 hook，Codex 仍 4 个。** 新增的 PostToolUse：matcher 只匹配 Team Flow 的工具；hook 只在本地 spool 记一条 `{"type":"tool_map","key":hash(client, session, tool_use_id),"session_id","tool_use_id","tool"}`（`session_id`、`tool_use_id` 取自 hook 输入，`tool` 去掉 `mcp__teamflow__` 前缀），不取用 `tool_input`、`tool_response`，不联网、不拉起进程、不输出，永远 fail-open；回合结束随 Stop 拉起的 flush 经 `POST /api/v1/hooks/batch` 一起送达。服务端按 (token, tool_use_id) 对上 tools/call 的 `_meta["claudecode/toolUseId"]`，会话过 `resolve_session`，把成员级的调用补成 exact，认领、开始类调用顺带设置会话的 current_task；event 只追加、不回填，映射另存 tool_map 表，读时联查（5.1、6.5）。Codex 不装：它的 tools/call 在 `_meta` 里自带 session_id（D44）。子命令 `tool`，matcher `^mcp__teamflow__.*`，同步、timeout 2 秒、不设 async（`claude -p` 收尾会杀掉 async hook，最后一次调用的映射会丢），验证阶段回填（6.4）；M0 内存原型把补齐的会话直接写在内存里的事件对象上，等价于读时联查的结果，M1 落库按 5.1 做 | 依据：S3 实测 PostToolUse 输入的 `tool_use_id` 与同一次调用的 `_meta["claudecode/toolUseId"]` 相等，v1 和 v2 运行时都成立（`spike/results/evidence/S3_helper_env.txt`，`spike/results/S3.md` 结论 3）。收益：Claude Code 认领的任务也精确到会话，「agent 已离线」两端都按会话判断（5.2）；同机并行多个 Claude Code 会话时不会挂错；M2 的 taint 拦截可以按会话做。代价：① 多一条冻结的命令串（只在 Claude Code 一侧，不进 Codex 的信任哈希）；② 每次 Team Flow 工具调用多一次本地写（一次 hook 冷启动加写一条 spool，不联网）；③ 多一个会静默失效的 hook 和一项 doctor 检查；④ 依赖未文档化的 `claudecode/` 键，失效时退回成员级（6.8 失败降级、R6）；⑤ 服务端多一张映射表；⑥ 补齐要等回合结束，之前是成员级。覆盖不到、留在成员级的：工具返回 isError 时 Claude Code 触发的是 PostToolUseFailure（不装）；bare 模式没有 hook。M0 时的推荐是不加（收益只有一处、与评审"归属分层过度设计"的意见相反），2026-10-02 用户拍板加 | Claude Code 去掉或改名 `claudecode/toolUseId`，或它与 `tool_use_id` 不再相等（`doctor --live`；R6 的观察信号）；或 Claude Code 开始给 headersHelper 设可信的会话 ID、`/clear` 后跟着更新（D39），那时可以改为调用时就精确，去掉这个 hook 要全员重跑 setup。M1 上线前在 macOS 和 WSL 上各确认一次两个 ID 相等（`docs/m0.md` 补测清单 Claude Code 第 4 项） |
 | D41 | bare 模式与无头脚本 | bare 下只有 MCP 和 allow 规则，hooks 一条都不执行，按预期处理：`claude-flags` 不加 `--append-system-prompt-file` 补注入，无头脚本开工时先调 inbox；无头 MCP 配置 `claude-mcp.json` 的 headersHelper 带 `--headless`，服务端据此把这类调用排除在"有调用、无 hook"提醒和接入健康的分母之外（M1 实现）；示例统一写 `claude -p … < /dev/null`；路径有空白或可能被通配时用 `eval` 加 `claude-flags --quoted`；`doctor --live` 的提示词用提问式 | 实测 bare 下 `--settings` 里的 hooks 也不执行（`spike/results/S6.md` 发现 2，`spike/results/evidence/S6_headless.txt`；`docs/m0.md` 修订 3）。不补注入：无头脚本自己会调 inbox；补注入要多一个渲染到文件的子命令，摘要还是 flag 展开那一刻的缓存，system prompt 的位置也比 system reminder 高。不加标记，bare 和 hooks 失效在服务端看起来一样，提醒和接入健康都会误报。不重定向 stdin 平白多等 3 秒（S6 发现 4）；不加引号会被路径名展开（S6 发现 7）；"逐字复述上下文"会被模型安全策略拒绝（`spike/results/S1.md` 发现 6；`docs/m0.md` 修订 15） | bare 成为 `-p` 的默认时（cc_headless.md；到那时普通 `-p` 也没有 hooks）；或无头脚本普遍不先调 inbox |
 | D42 | 错误文本与 REST 错误格式 | MCP：isError 的 content 文本固定为 `<code>：<说明>`，structuredContent 保留 `{err, msg, …}`。REST：所有错误统一为 `{"error": "<code>", "message": "…", …}`，包括 401、请求体校验失败和路由级 404/405。CLI 兜底命令的错误输出也以错误码开头 | 修复前错误码只在 structuredContent 里，模型看不到 `needs_human`，instructions 里按错误码下的指令对不上（`spike/results/S1.md` 发现 3）；修复后嵌套 `claude -p` 拿到的原文以 `needs_human：` 开头（`spike/results/evidence/E2E_run1.txt`）；REST 统一之后，CLI 和其他调用方只按 `error` 分支（`docs/m0.md` 修订 4、13） | 冻结 tools/list 和 instructions 哈希之前定稿；Codex 补测看它交给模型的是 content 还是 structuredContent（`docs/m0.md` 补测清单 Codex 第 4 项），据此决定 content 里要不要保留那份 JSON |
 | D43 | setup 怎么合并 hooks | 已有 teamflow 组就原地替换（重复的去掉），没有才追加到末尾。绝不删除、挪动别人的 handler 和组：混在一组时只换我们这一条，删空的组留 `{"hooks": []}` 占位。doctor 按 teamflow handler 计数：每个事件只有一条，命令串和 timeout 一致，SessionStart、SessionEnd 所在组的 matcher 正确，Trusted；允许和别人同组、允许占位组，不再要求在末尾。Claude Code 2.1.287 实测接受占位组（`spike/results/evidence/review2_probes.txt`）；Codex 只有源码依据，待成员电脑 | Codex 的信任键带组序号（`hooks/src/lib.rs` 的 `hook_key`），原来"先删再追加到末尾"会让我们的组和被挪动的别人的组都要重新信任（`spike/results/S2.md` 发现 3；`docs/m0.md` 修订 5；复审新问题 3）。测试：`cli/tests/test_cli_setup.py::test_rerun_keeps_every_group_position`、`cli/tests/test_cli_setup_merge.py`、`cli/tests/test_codex_check_static.py` | Codex 的信任键不再带序号；或成员觉得 setup 留下的占位组、警告难以理解 |
@@ -1269,7 +1292,7 @@ M1 再落后时，接着砍：转交 → `helpers` 建议 → 风险高亮。安
 | D45 | agent 写的标题：写入规则的最终定义 | agent 来源的标题（create_task、report_blocker、update_task 和对应的 REST）在清洗之后、NFKC 骨架上检查：**单行**；拒绝**网址和裸域名**、**路径**（`~/`、`$VAR/`、`%VAR%`、绝对路径、点目录）、**管道和重定向**、反引号、**命令替换**；**比较符**、箭头、版本号、单个文件名**放行**。命中返回 422 `invalid`，附 `rule`、`pos`。人写的标题只折成单行。细节以 `server/teamflow_server/sanitize.py` 的 `unsafe_title` 为准（5.1） | 团队档下，标题是唯一不经接受就跨人送到 agent 的自由文本（M0 评审 I6；`docs/m0.md` 修订 7）。只做 NFC、允许换行时，全角网址、裸域名、相对路径、除号斜杠、`%USERPROFILE%`、多行伪造看板头都能绕过，`p95 > 300ms` 反被误杀（复审新问题 2）。样例和误杀样例在 `server/tests/test_injection.py` | 出现新的绕过样本（加进 `UNSAFE_TITLES` 再改规则）；或误杀让 agent 常常写不出标题（审计 `title.rejected` 每周超过 10 次且多为正常标题），那时考虑改为放行、在信封里标风险 |
 | D46 | 沙箱依赖，以及沙箱与兜底命令的冲突 | 依赖：Linux 和 WSL2 的安装顺序加 `bubblewrap socat`；doctor 缺依赖标失败；不替用户打开 `failIfUnavailable`。冲突：**接受**。沙箱屏蔽凭据真正生效时，agent 在 Bash 里跑兜底命令读不到凭据，CLI 提示后由用户在自己的终端运行；不把 teamflow 加进 `excludedCommands`，也不给兜底命令另找凭据来源 | 缺依赖时 Claude Code 只警告一句就不带沙箱运行（`spike/results/S6.md` 发现 5，`spike/results/evidence/S6_headless.txt`）。兜底命令只在 MCP 不可用时用，频率低；把 teamflow 排除出沙箱或另放凭据，等于给 agent 一条在沙箱外拿到 token 的路，抵消加固（S6 发现 6；`docs/m0.md` 修订 8；M0 评审 m5）。`failIfUnavailable` 会让缺依赖的机器上 Claude Code 直接起不来 | Linux 成员在沙箱里实测 `teamflow inbox` 的结果（`docs/m0.md` 补测清单 Claude Code 第 5 项）；或 MCP 握手失败每周超过 2 次，兜底命令确实常用 |
 | D47 | UserPromptSubmit 拉不拉起进程 | 不联网，也不拉起任何子进程；只读本地缓存（24 小时内有效）；缓存由 Stop 每回合拉起的 `flush --refresh` 和 SessionStart 刷新；Claude Code 的输出用手写的最小 JSON | 修复前"缓存过期"路径要拉起 refresh，p95 约 69ms；修复后 4 条路径拉起子进程 0 次，p95 在 18.6–32.3ms（`docs/m0.md` S4 表，`spike/results/evidence/S4_normal.txt`、`S4_slow.txt`、`S4_down.txt`；M0 评审 I3；`docs/m0.md` 修订 9）。代价：增量最多比上一回合结束时晚一回合 | 有人抱怨"接受之后 agent 下一轮还不知道"；或 M2 做 asyncRewake 时 |
-| D48 | **待定**：UserPromptSubmit 的延迟目标与退路 | **推荐：目标放宽到 p95 不超过 50ms**，Stop、SessionEnd、SessionStart 的目标不变；保留"更小的入口模块"这项优化（只改 CLI 包、不动命令串，随时能做）；不用 `-I -S` | 两端都贴着 30ms 线：修复后 63 格 62 格达标，复审独立重跑两轮分别有 13/24、3/24 格超标，空解释器的 p95 本身就有 16–26ms，成员 Mac 上 Python 冷启动更慢（`spike/results/S4.md` 发现 1，`spike/results/evidence/S4_*.txt`；`docs/m0.md` 修订 16；复审新问题 5）。50ms 人感知不到；Claude Code 对 UserPromptSubmit 的默认超时是 30 秒（cc_hooks.md），我们配的是 2 秒，是 50ms 的 40 倍。`-I -S` 要改启动方式，命令串一变就进 Codex 的信任哈希，只为省几毫秒不值得 | **必须在 D27 冻结命令串之前定**（可执行文件的路径和参数进 Codex 的信任哈希）。成员 Mac、zsh、真实 Codex 的基准 p95 超过 50ms 时（`docs/m0.md`「zsh 与成员 Mac 的基准」），先做更小的入口模块，再看要不要改启动方式 |
+| D48 | **已定：UserPromptSubmit p95 ≤ 50ms**（2026-10-02 拍板） | UserPromptSubmit 的目标从 p95 不超过 30ms 放宽到不超过 50ms；Stop、SessionEnd、SessionStart 的目标不变；保留"更小的入口模块"这项优化（只改 CLI 包、不动命令串，随时能做）；不用 `-I -S`。同步改了 6.4 hook 表、11.2 S4 的通过标准和 `docs/m0.md` 的 S4 结论 | 30ms 时两端都贴着线：修复后 63 格 62 格达标，复审独立重跑两轮分别有 13/24、3/24 格超标，空解释器的 p95 本身就有 16–26ms，成员 Mac 上 Python 冷启动更慢（`spike/results/S4.md` 发现 1，`spike/results/evidence/S4_*.txt`；`docs/m0.md` 修订 16；复审新问题 5）。按 50ms 重判，容器内这几轮全部达标，最高 36.0，余量约 14ms。50ms 人感知不到；Claude Code 对 UserPromptSubmit 的默认超时是 30 秒（cc_hooks.md），我们配的是 2 秒，是 50ms 的 40 倍。`-I -S` 要改启动方式，命令串一变就进 Codex 的信任哈希，只为省几毫秒不值得 | 成员 Mac、zsh、真实 Codex 的基准 p95 超过 50ms 时（`docs/m0.md`「zsh 与成员 Mac 的基准」），先做更小的入口模块，再看要不要改启动方式（命令串冻结之后再改，Codex 要全员重新信任） |
 | D49 | M0 的 DEV 端点与生产的来源地址 | DEV 端点默认关；打开要 `TEAMFLOW_DEV_ENDPOINTS=1` 加随机的 `TEAMFLOW_DEV_SECRET`，只对本机，带 PAT 返回 403；开发令牌没有缺省值；**M1 上线前整组删除**。生产 uvicorn 加 `--proxy-headers`，`forwarded-allow-ips` 只信任 127.0.0.1 | DEV 端点模拟人在手机上的操作，谁能调到它谁就能冒充人；在 nginx 后不信任转发头时，所有请求的来源都是 127.0.0.1，"只对本机开放"的判断失效（M0 评审 B1，复审确认已修；`docs/m0.md` 修订 10）。公开的 dev token 让本机任何进程都能以成员的 agent 身份写入（复审新问题 8） | M1 上线前删除；之后 e2e 要模拟人类动作时改用 admin 夹具 |
 | D50 | 人类动作绑定版本与 through | 接受带 v、sha、seq、through；认领、帮忙带 v、sha、through；转发带 through。缺字段返回 400；版本不一致返回 409；through 不能超过当前最大事件 ID（400），只增不减。`can_see_content` 同时比对 content_version 和 content_sha256。「转发」绝不授予或升级正文可见性 | through 缺省取"本次动作的事件 ID"时，页面渲染之后、点按钮之前对方 agent 写的评论会放给本人的 agent（复审新问题 1）；H3 本来就要求 through，`docs/m0.md` 修订 11 漏列了。带错 sha 的接受在真实服务端返回 409（`spike/results/evidence/E2E_run2_dev.txt`；M0 评审 I1）。测试：`server/tests/test_human_actions.py` | 详情页评论太多，人来不及看完就点，"through 等于看过"不再成立；或 M2 上 SSE 后页面实时更新，through 要跟着刷新 |
 | D51 | 会话防冒用 | `resolve_session` 统一判定：写操作自称的会话必须存在、未结束，token_id 和 client 都等于当前 token 的，否则降为成员级并写审计；hooks 条目的 client 取 token 的；指向别的 token 会话的条目整条忽略，`end` 不清对方的 current_task；读操作不做归属（6.5） | M0 评审 I2 列出的冒用方式（带别人 Codex 的 session_id、借同一成员另一枚 token 的会话、已结束的会话仍带头、用 `end` 清别人的 current_task）复审时都已降为成员级或整条忽略（`docs/m0.md` 修订 12）。测试：`server/tests/test_sessions.py`、`server/tests/test_auth.py` | 同一台机器同一客户端出现多枚 token；或审计里 `session.resolve` 降级每周超过 20 次 |
@@ -1461,9 +1484,9 @@ v1 由三套方案评审合成（mvp_first 39 分、agent_native 32 分、produc
 - 11.3 的 D1、D3、D4、D5、D6、D7 和周验收 1 按上面的决策调整。
 - 6.7 推送分层、第 10 节和其他与 M0 无关的内容没有动。
 
-**待定的两件事**（都要在 D27 冻结命令串之前定）
-1. D40：要不要加第 5 个 hook（PostToolUse），把 Claude Code 的 MCP 调用精确对到会话。推荐不加。
-2. D48：UserPromptSubmit 的延迟目标。推荐放宽到 p95 不超过 50ms，同时保留"更小的入口模块"这项优化。
+**当时待定的两件事**（都要在 D27 冻结命令串之前定；2026-10-02 已拍板，见文末「D40、D48 拍板」）
+1. ~~D40：要不要加第 5 个 hook（PostToolUse），把 Claude Code 的 MCP 调用精确对到会话。推荐不加。~~ 已定：加。
+2. ~~D48：UserPromptSubmit 的延迟目标。推荐放宽到 p95 不超过 50ms，同时保留"更小的入口模块"这项优化。~~ 已定：p95 不超过 50ms。
 
 **最终验证时的事实性补充**（2026-10-02，第二轮修复之后）
 
@@ -1476,3 +1499,32 @@ v1 由三套方案评审合成（mvp_first 39 分、agent_native 32 分、produc
 | 复审新问题 9 | S1 的修复后证据是三种方式的真实客户端运行，和修复前的分开放；smoke 最终 65 项 | 11.2 S1、8.4 协议冒烟 | D53（改证据） |
 | 第三轮探针 | 清洗去掉所有格式控制符（Cf）和蒙古文变体选择符 | 8.3 清洗 | D45 不变 |
 | 第三轮探针 | CLI 按字节切批，413 时对半拆开 | 4.4 hooks、D53 | D53 |
+
+### D40、D48 拍板（2026-10-02）
+
+用户拍板两件事：
+1. **D40 已定：加**。Claude Code 装 5 个 hook，新增的 PostToolUse 只匹配 Team Flow 的工具，只在本地记 `session_id` 和 `tool_use_id`，回合结束随 Stop 的上报一起送达，服务端把成员级的调用补成 exact。Codex 仍是 4 个（它在 `_meta` 里自带 session_id）。PostToolUse 的子命令名、matcher、timeout、是否 async 当时写的是"见 cli 实现"，已由验证阶段回填，见下方「D40、D48 验证阶段回填」。
+2. **D48 已定：UserPromptSubmit p95 不超过 50ms**。按 50ms 重判，M0 容器内的基准全部达标。
+
+按 AGENTS.md，先改第 13 节，再改正文：
+
+| 决策 | 改动的小节 |
+|---|---|
+| D40 | 头部状态行；第 0 节核心架构和"需要你拍板的事"第 1 条；1.1 G5；2.2 Claude Code 第 2 条；4.2 数据出境表；4.4 通用请求头和 hooks；5.1 表（17 张改 18 张：新增 tool_map，event 加 tool_use_id）和关键约定；5.2「agent 已离线」和开始；6.1 会话 ID、MCP 调用归属、hook 数量、无头运行；6.4 开头、settings.json 示例加 PostToolUse 组、Codex hooks.json 说明、hook 表加一行、实现规则 1/3/5/6；6.5 防冒用和归属表；6.8 安装顺序第 6 步、setup 第 3/4 步、doctor 第 2/3 条（按 5/4 计数）、`doctor --live`、无头表、失败降级；8.1 会话冒用；8.4 会话冒用；11.2 S3、S4 通过标准、M0 现在的结论；11.3 D1、D5、周验收 1；12 R6；13 D04、D27、D39、D40 |
+| D48 | 第 0 节"需要你拍板的事"第 1 条；6.4 开头和 hook 表的目标；11.2 S4 的通过标准、退路和 M0 结果（按 50ms 重判）；11.3 D5；13 D48 |
+
+`docs/m0.md` 同步：状态表 S3、S4 和"M0 现在的结论"里 D40、D48 划掉并写明决定日期；S4 按 50ms 重判；修订建议第 2、16 条和取代表标注已定；补测清单 Claude Code 第 3、4 项和 zsh 基准改按新决定。
+
+### D40、D48 验证阶段回填（2026-10-02）
+
+没有新增决策，只把"见 cli 实现""由验证阶段回填"的地方填上，并把正文和代码对齐（验证记录见 `docs/m0.md`「D40 验证阶段」）：
+
+| 内容 | 改动的小节 |
+|---|---|
+| PostToolUse 的子命令 `tool`、matcher `^mcp__teamflow__.*`、`"timeout": 2`、同步不设 async，以及取舍理由；doctor 发现 teamflow 的 handler 设了 `async` / `asyncRewake` 标失败 | 6.1 hook 数量；6.4 settings.json 示例、示例下方说明、hook 表；6.8 setup 第 3 步、doctor 第 2 条；D27；D40 |
+| PostToolUse 的实测 p95 24.6–31.7ms；UserPromptSubmit 按 50ms 重跑 40 格全部达标 | 6.4 hook 表；11.2 S4 |
+| 真实 Claude Code 端到端：调用补成 exact、会话等于 SessionStart 登记的、current_task 正确；普通 `claude -p` 下 5 个 hook 都执行 | 11.2 S3；6.8 无头表 |
+| M0 内存原型把补齐结果直接写在内存事件上，等价于读时联查；M1 落库仍是 event 只追加、tool_map 另存；agent_session 加 `current_task_event_id`；`toolUseId` 要整串匹配 | 5.1 表与关键约定；D40 |
+| 同一批里被这枚 token 自己的 `end` 刚结束的会话，tool_map 仍认（只补事件、不设 current_task） | 6.5 防冒用 |
+| 验证中发现并修掉：spool 同一会话按写入顺序上报（否则 `end` 先到，迟到的 tool_map 被判"会话已结束"） | 6.4 实现规则 3 |
+| 已定（2026-10-02）：`team_status` 和首页显示到会话（会话短标签 `s`），理由同 D40；仍不显示仓库、分支、时长 | 5.1 闸门表"他人会话"、6.5 任务显示 |
