@@ -8,13 +8,17 @@
 - T-53 待认领，alice 的 Claude Code 发布：alice 的 agent 可以直接认领。
 - T-54 bob 已完成。
 - B-7 bob 的 Codex 报告的困难，bob 在手机上确认了点名 alice；上面有 bob 的 Codex 写的一条评论（对 alice 是 peer_agent，待转发）。
+
+TEAMFLOW_DEV_TOKENS 里出现、但上面没有的 handle（比如本地试用时您自己的 handle 和模拟的队友）也登记成成员，
+名字就用 handle；他们一开始没有任何任务。
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 
-from .service import Actor, Service
+from . import config
+from .service import HANDLE_RE, Actor, Service
 
 
 def seed(svc: Service) -> None:
@@ -84,5 +88,9 @@ def seed(svc: Service) -> None:
         svc.human_ask(bob_h, "B-7")
         at(minutes=40)
         svc.comment(bob_cx, "B-7", "已确认是安全组规则的问题，需要有控制台权限的人加一条入站规则。")
+
+        for h in config.token_handles():
+            if h not in svc.members and HANDLE_RE.fullmatch(h):
+                svc.add_member(h, h)
     finally:
         svc.clock = real_clock

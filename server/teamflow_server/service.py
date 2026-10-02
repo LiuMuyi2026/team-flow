@@ -31,7 +31,10 @@ CLIENT_NAMES = {"claude_code": "Claude Code", "codex": "Codex", "cli": "命令�
 
 LIMITS = {"title": 120, "body": 4000, "note": 500, "comment": 2000, "detail": 2000, "tried": 1000}
 
-TEXT_EVENT_TYPES = {"note", "comment", "task.released", "task.canceled", "task.done", "blocker.resolved"}
+TEXT_EVENT_TYPES = {"note", "comment", "task.released", "task.canceled", "task.done", "task.declined", "blocker.resolved"}
+
+# 网页详情页（for_human）给每条动态带的结构化字段：只放 handle、枚举、编号，不放自由文本
+HUMAN_EVENT_DATA = ("to", "need", "reason", "v", "through")
 
 # MCP 工具名（与 mcp_server.TOOL_ORDER 一致，测试里断言）。tool_map 条目的 tool 字段只认这些。
 TOOL_NAMES = ("inbox", "list_tasks", "get_item", "team_status", "create_task", "claim_task", "update_task", "report_blocker", "comment")
@@ -526,9 +529,15 @@ class Service:
         """除我之外接受过正文的人（只转发过动态的不算）。"""
         return [a for (h, s), a in self.acceptances.items() if s == obj_id and h != me and a.accepted]
 
-    def _events_view(self, viewer: str, obj: Task | Blocker, limit: int) -> list[dict[str, Any]]:
+    def _events_view(self, viewer: str, obj: Task | Blocker, limit: int | None, *, for_human: bool = False) -> list[dict[str, Any]]:
+        """动态列表。agent 看到的（for_human=False）按闸门过滤：最近 limit 条，看不到的文字折成 withheld。
+
+        for_human=True 是网页详情页（plan 5.1"人在网页上看到的，就是同一个函数加上 for_human=True 的输出"、
+        7.1"全部评论"）：全部动态、全部文字（同一版清洗），每条文字另标 agent=本人的 agent 现在能不能读到，
+        页面据此提示"转发后，您的 Claude Code / Codex 才能读到这些评论"。"""
         evs = [e for e in self.events if e.subject == obj.id and e.type != "commit"]
-        evs = evs[-limit:] if limit > 0 else []
+        if not for_human:
+            evs = evs[-limit:] if limit and limit > 0 else []
         out: list[dict[str, Any]] = []
         held: dict[str, int] = {}
         for e in evs:
@@ -540,6 +549,16 @@ class Service:
                 "client": e.client,
                 "at": mdhm(e.at),
             }
+            if for_human:
+                item["ts"] = e.at.astimezone(TZ).isoformat(timespec="seconds")
+                data = {k: e.data[k] for k in HUMAN_EVENT_DATA if k in e.data}
+                if data:
+                    item["data"] = data
+                if e.text is not None:
+                    item["t"] = clean(e.text)
+                    item["agent"] = self._text_visible(viewer, e, obj)
+                out.append({k: v for k, v in item.items() if v is not None})
+                continue
             if e.text is not None:
                 if self._text_visible(viewer, e, obj):
                     item["t"] = clean(e.text)
@@ -576,6 +595,16 @@ class Service:
         with self.lock:
             return len(self._relevant_events(actor.handle, self.cursors.get(actor.token_id or actor.handle, 0)))
 
+    def _unforwarded(self, me: str, obj_id: str) -> list[Event]:
+        """某个对象上他人 agent 写的、超出我 through_event_id 的文字（"待您转发"）。"""
+        acc = self.acceptances.get((me, obj_id))
+        through = acc.through_event_id if acc else 0
+        return [
+            e
+            for e in self.events
+            if e.subject == obj_id and e.text is not None and e.actor != me and e.actor_kind == "agent" and e.id > through
+        ]
+
     def _fwd(self, me: str) -> list[dict[str, Any]]:
         """待您转发：与我有关的对象上，他人 agent 写的、超出我 through_event_id 的文字条数。"""
         rows: list[dict[str, Any]] = []
@@ -583,13 +612,7 @@ class Service:
         for obj in objs:
             if not (self._related(obj.id, me) or (me, obj.id) in self.acceptances):
                 continue
-            acc = self.acceptances.get((me, obj.id))
-            through = acc.through_event_id if acc else 0
-            pending = [
-                e
-                for e in self.events
-                if e.subject == obj.id and e.text is not None and e.actor != me and e.actor_kind == "agent" and e.id > through
-            ]
+            pending = self._unforwarded(me, obj.id)
             if pending:
                 rows.append({"id": obj.id, "n": len(pending), "by": pending[-1].actor})
         return rows
@@ -688,8 +711,16 @@ class Service:
             nxt = str(offset + limit) if offset + limit < len(rows) else None
             return {"rows": out_rows, "next": nxt}
 
-    def get_item(self, actor: Actor, raw_id: str, events: int = 5) -> dict[str, Any]:
+    def get_item(self, actor: Actor, raw_id: str, events: int = 5, *, for_human: bool = False) -> dict[str, Any]:
+        """详情。agent 拿到的按"看见"闸门过滤；for_human=True 是网页详情页（只有人的会话能要）：
+
+        - 正文、困难详情、tried 一律给（同一版清洗），本人要先看过才能决定接受或认领；
+        - 动态是全部动态、全部文字，每条文字标 agent=本人的 agent 现在能不能读到；
+        - 另给 page（表单要原样带回的 v、sha、seq、through）和 agent（本人的 agent 现在能看到什么）。
+        """
         me = actor.handle
+        if for_human and actor.kind != "human":
+            raise DomainError("human_only", "网页详情只给本人看，agent 请用 get_item。")
         events = max(0, min(int(events if events is not None else 5), 10))
         with self.lock:
             obj = self._obj(raw_id)
@@ -706,11 +737,13 @@ class Service:
                 )
                 if obj.assign_state == "pending":
                     out["assign"] = {"seq": obj.assign_seq, "by": obj.assigned_by}
+                    if for_human:  # "赵的 Claude Code 请您协作"：页面要知道是人还是哪个 agent 指派的
+                        out["assign"].update(bk=obj.assigned_by_kind, client=obj.assigned_by_client)
                 if obj.parent:
                     out["parent"] = obj.parent
                 if obj.project:
                     out["project"] = obj.project
-                if self.can_see_content(me, obj):
+                if for_human or self.can_see_content(me, obj):
                     if obj.body:
                         out["content"] = self.envelope(obj.body, obj.created_by, obj.created_by_kind, obj.created_by_client, me)
                 elif obj.body:
@@ -732,7 +765,7 @@ class Service:
                 )
                 if obj.task_closed:
                     out["task_closed"] = True
-                if self.can_see_content(me, obj):
+                if for_human or self.can_see_content(me, obj):
                     c: dict[str, Any] = {}
                     if obj.detail:
                         c["detail"] = self.envelope(obj.detail, obj.raised_by, obj.raised_by_kind, obj.raised_by_client, me)
@@ -742,9 +775,42 @@ class Service:
                         out["content"] = c
                 elif obj.detail or obj.tried:
                     out["withheld"] = "needs_accept"
-            out["ev"] = self._events_view(me, obj, events)
+            out["ev"] = self._events_view(me, obj, events, for_human=for_human)
             out["url"] = self.url(obj.id)
+            if for_human:
+                out.update(self._human_extras(me, obj))
             return {k: v for k, v in out.items() if v is not None}
+
+    def _human_extras(self, me: str, obj: Task | Blocker) -> dict[str, Any]:
+        """网页详情页另给的两块：page（表单原样带回的值）和 agent（本人的 agent 现在能看到什么）。"""
+        acc = self.acceptances.get((me, obj.id))
+        has_text = bool(obj.body) if isinstance(obj, Task) else bool(obj.detail or obj.tried)
+        if self.can_see_content(me, obj):
+            content = "visible" if has_text else "none"
+        else:
+            content = "needs_accept" if has_text else "none"
+        extra: dict[str, Any] = {
+            "page": self.page_view(obj.id),
+            "agent": {
+                "content": content,
+                "through": acc.through_event_id if acc else 0,
+                "unforwarded": len(self._unforwarded(me, obj.id)),
+            },
+            "created": (obj.created_at).astimezone(TZ).isoformat(timespec="seconds"),
+        }
+        if isinstance(obj, Task) and obj.urgent:
+            extra["urgent"] = True
+        return extra
+
+    def titles(self, viewer: str, ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """一批对象的标题信封（网页首页用：home 只放 ID，标题按同一个函数另取）。不存在的 ID 跳过。"""
+        with self.lock:
+            out: dict[str, dict[str, Any]] = {}
+            for oid in ids:
+                obj = self.tasks.get(oid) or self.blockers.get(oid)
+                if obj is not None:
+                    out[oid] = self._title_env(obj, viewer)
+            return out
 
     def team_status(self, actor: Actor, project: str | None = None) -> dict[str, Any]:
         me = actor.handle
@@ -925,12 +991,13 @@ class Service:
             self.dedupe[dkey] = (now + timedelta(minutes=10), result)
             return result
 
-    def _taken_error(self, t: Task) -> DomainError:
+    def _taken_error(self, t: Task, actor: Actor | None = None) -> DomainError:
         who = t.assignee or "?"
         at = hm(t.claimed_at or t.started_at or t.last_activity_at)
+        how = "可以在「待认领」里换一个。" if actor is not None and actor.kind == "human" else "可以用 list_tasks(view=pool) 换一个待认领任务。"
         return DomainError(
             "taken",
-            f"{t.id} 已被 {who} 于 {at} 认领。可以用 list_tasks(view=pool) 换一个待认领任务。",
+            f"{t.id} 已被 {who} 于 {at} 认领。{how}",
             id=t.id,
             by=who,
             at=at,
@@ -1073,7 +1140,7 @@ class Service:
             if status is not None and status != t.status:
                 if status == "done":
                     if not is_assignee:
-                        raise self._not_owner(t, "完成")
+                        raise self._not_owner(t, "完成", actor)
                     if t.status not in ("open", "in_progress"):
                         raise DomainError("invalid", f"{t.id} 当前是 {t.label}，不能标记完成。", id=t.id)
                     if actor.kind == "agent" and not note_c:
@@ -1088,7 +1155,7 @@ class Service:
                     self._on_terminal(t)
                 elif status == "open":
                     if not (is_assignee and t.status == "in_progress"):
-                        raise self._not_owner(t, "取消认领")
+                        raise self._not_owner(t, "取消认领", actor)
                     if actor.kind == "agent" and not note_c:
                         raise DomainError("invalid", "取消认领要写交接说明（note）：做到哪了、下一步是什么。", id=t.id)
                     t.status = "open"
@@ -1097,7 +1164,7 @@ class Service:
                     self._clear_current(t.id)
                 elif status == "in_progress":
                     if not is_assignee or t.status != "open":
-                        raise self._not_owner(t, "开始")
+                        raise self._not_owner(t, "开始", actor)
                     self._start(actor, t)
                 elif status == "canceled":
                     if t.created_by != me:
@@ -1122,12 +1189,15 @@ class Service:
             new = len(self._relevant_events(me, self.cursors.get(actor.token_id or me, 0)))
             return {"id": t.id, "st": t.label, "new": new}
 
-    def _not_owner(self, t: Task, what: str) -> DomainError:
+    def _not_owner(self, t: Task, what: str, actor: Actor | None = None) -> DomainError:
+        human = actor is not None and actor.kind == "human"
         if t.assign_state == "pending":
             return DomainError("needs_accept", f"{t.id} 还在等 {t.assignee} 本人接受，接受前不能{what}。", id=t.id)
         if t.assignee is None:
-            return DomainError("invalid", f"{t.id} 还没人认领，先用 claim_task 认领。", id=t.id)
-        return DomainError("not_allowed", f"{t.id} 的负责人是 {t.assignee}，您的 agent 不能{what}它；当前状态 {t.label}。", id=t.id, who=t.assignee)
+            how = "先点「认领」" if human else "先用 claim_task 认领"
+            return DomainError("invalid", f"{t.id} 还没人认领，{how}。", id=t.id)
+        who = "您" if human else "您的 agent"
+        return DomainError("not_allowed", f"{t.id} 的负责人是 {t.assignee}，{who}不能{what}它；当前状态 {t.label}。", id=t.id, who=t.assignee)
 
     def _clear_current(self, tid: str) -> None:
         for s in self.sessions.values():
@@ -1334,7 +1404,7 @@ class Service:
             through_c = self._check_through(through)
             self._version_conflict(t, v, sha)  # type: ignore[arg-type]
             if not self._cas_claim(t, actor):
-                raise self._taken_error(t)
+                raise self._taken_error(t, actor)
             self._emit("task.claimed", t.id, actor)
             self._write_acceptance(actor, t, through_c)
             self._check_task(t)
@@ -1378,6 +1448,67 @@ class Service:
             self._notify(b.raised_by, "task_reply", b.id, f"{actor.handle} 来帮忙看 {b.id} 了", actor, f"helped:{b.id}")
             self._touch(b)
             return {"id": b.id, "helper": b.helper}
+
+    def human_decline(self, actor: Actor, raw_id: str, *, seq: int | None, reason: str | None) -> dict[str, Any]:
+        """被指派人在手机上点「拒绝」（plan 5.3）：seq 必填（I4：WHERE assign_seq=:seq），原因必填。
+
+        负责人改回 steward（发布人），状态 accepted（"待开始"）；steward 已停用时退回待认领。通知指派人「li 没接 T-52」。
+        原因按评论类文字处理（清洗、2000 字、扫描），对指派人的 agent 来说和评论一样要转发后才给。"""
+        self._require_human(actor)
+        self._need_page_fields(seq=seq)
+        if not isinstance(reason, str) or not reason.strip():
+            raise DomainError("invalid", "拒绝要写一句原因，对方好另做安排。")
+        with self.lock:
+            t = self._task(raw_id)
+            reason_c = self._text("comment", reason, required=True)
+            me = actor.handle
+            if t.assignee != me or t.assign_state != "pending" or t.status not in ("open", "in_progress"):
+                raise DomainError("conflict", f"{t.id} 当前不是待您接受的状态（{t.label}）。", id=t.id)
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq != t.assign_seq:
+                raise DomainError("conflict", "内容刚被修改，请重新查看。", id=t.id, v=t.content_version, seq=t.assign_seq)
+            notify_to = t.assigned_by or t.steward
+            back = self.members.get(t.steward)
+            if back is not None and back.active and back.handle != me:
+                t.assignee, t.assign_state = back.handle, "accepted"
+                t.assigned_by, t.assigned_by_kind, t.assigned_by_client = back.handle, "human", None
+            else:
+                t.assignee, t.assign_state = None, "none"
+                t.assigned_by, t.assigned_by_kind, t.assigned_by_client = None, None, None
+            self._emit("task.declined", t.id, actor, text=reason_c, to=t.assignee, seq=seq)
+            self._notify(notify_to, "task_reply", t.id, f"{me} 没接 {t.id}", actor, f"declined:{t.id}:{seq}")
+            self._touch(t)
+            self._check_task(t)
+            return {"id": t.id, "st": t.label, "who": t.assignee}
+
+    def human_release(self, actor: Actor, raw_id: str, *, note: str | None = None, to_pool: bool = False) -> dict[str, Any]:
+        """负责人在手机上点「取消认领」（plan 5.2）。
+
+        - 不放回待认领：和 agent 的取消认领同一条规则（update_task(status=open)），只限进行中，负责人不变；
+        - 放回待认领（to_pool）：进行中或待开始都可以，负责人清空、assign_seq 加 1（旧表单作废），回到待认领。"""
+        self._require_human(actor)
+        me = actor.handle
+        with self.lock:
+            t = self._task(raw_id)
+            mine = t.assignee == me and t.assign_state == "accepted" and t.status in ("open", "in_progress")
+            if not mine:
+                if t.assignee == me and t.assign_state == "pending":
+                    raise DomainError("needs_accept", f"{t.id} 还在等您接受；不想做请点「拒绝」。", id=t.id)
+                raise DomainError("not_allowed", f"{t.id} 不在您手里（{t.label}），不能取消认领。", id=t.id, who=t.assignee)
+            if not to_pool:
+                if t.status == "open":
+                    raise DomainError("invalid", f"{t.id} 还没开始；不做了的话，请选「放回待认领」。", id=t.id)
+                return self.update_task(actor, t.id, status="open", note=note)
+            note_c = self._text("note", note)
+            t.status = "open"
+            t.assignee, t.assign_state = None, "none"
+            t.assign_seq += 1
+            t.assigned_by, t.assigned_by_kind, t.assigned_by_client = None, None, None
+            t.claimed_client, t.claimed_at = None, None
+            self._emit("task.released", t.id, actor, text=note_c, reason="to_pool")
+            self._clear_current(t.id)
+            self._touch(t)
+            self._check_task(t)
+            return {"id": t.id, "st": t.label}
 
     def human_ask(self, actor: Actor, raw_id: str) -> dict[str, Any]:
         """主人确认 agent 提议的点名：proposed → asked，并通知被点名的人。"""

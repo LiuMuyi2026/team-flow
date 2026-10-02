@@ -37,6 +37,9 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("TEAMFLOW_DEV_ENDPOINTS", "1")
     monkeypatch.setenv("TEAMFLOW_DEV_SECRET", DEV_SECRET)
     monkeypatch.delenv("TEAMFLOW_ALLOWED_ORIGINS", raising=False)
+    # 本地登录码（只存哈希）和 server.json 写进临时目录，不碰仓库里的 .local/
+    monkeypatch.setenv("TEAMFLOW_STATE", str(tmp_path / "state"))
+    monkeypatch.delenv("TEAMFLOW_PUBLIC_URL", raising=False)
     yield
 
 

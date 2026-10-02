@@ -43,12 +43,12 @@ class Report:
         self._p("提示  %s：%s" % (name, detail))
 
 
-def _version(cmd):
+def _version(cmd, env=None):
     exe = shutil.which(cmd)
     if not exe:
         return None
     try:
-        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5)
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5, env=env)
         return (out.stdout or out.stderr).strip().splitlines()[0] if (out.stdout or out.stderr).strip() else "?"
     except (OSError, subprocess.TimeoutExpired):
         return "?"
@@ -129,7 +129,7 @@ def check_sandbox(r: Report, settings, platform: str | None = None, which=shutil
 def check_claude(r: Report, paths: setup_cmd.Paths, bin_path: str):
     s = common.read_json(paths.claude_settings)
     if not isinstance(s, dict):
-        r.fail("Claude Code settings.json", "运行 teamflow setup --home %s" % shlex.quote(paths.home))
+        r.fail("Claude Code settings.json", "运行 %s" % _setup_hint(paths))
         return
     want = setup_cmd.claude_hook_groups(bin_path, paths.cred)
     hooks = s.get("hooks") if isinstance(s.get("hooks"), dict) else {}
@@ -141,20 +141,25 @@ def check_claude(r: Report, paths: setup_cmd.Paths, bin_path: str):
         r.ok("Claude Code 允许 mcp__teamflow__*")
     else:
         r.fail("Claude Code 允许 mcp__teamflow__*", "运行 teamflow setup")
-    cj = common.read_json(paths.claude_json)
+    # 隔离模式（本地试用）的 MCP 在 <dir>/claude/mcp.json，由 --mcp-config 加 --strict-mcp-config 载入
+    mcp_file = paths.claude_mcp or paths.claude_json
+    label = "Claude Code MCP（%s）" % os.path.basename(mcp_file) if paths.claude_mcp else "Claude Code user scope MCP"
+    cj = common.read_json(mcp_file)
     srv = ((cj or {}).get("mcpServers") or {}).get("teamflow") if isinstance(cj, dict) else None
     if isinstance(srv, dict) and srv.get("type") == "http" and str(srv.get("url", "")).endswith("/mcp/"):
         if srv.get("headersHelper") == setup_cmd.helper_cmd(bin_path, "claude", paths.cred):
-            r.ok("Claude Code user scope MCP", srv["url"])
+            r.ok(label, srv["url"])
         else:
-            r.fail("Claude Code MCP headersHelper", "命令串与本机安装不一致，运行 teamflow setup")
+            r.fail("Claude Code MCP headersHelper", "命令串与本机安装不一致，运行 %s" % _setup_hint(paths))
     else:
-        r.fail("Claude Code user scope MCP", "运行 teamflow setup（url 必须以 /mcp/ 结尾）")
-    if os.path.exists(os.path.join(os.getcwd(), ".mcp.json")):
+        r.fail(label, "运行 %s（url 必须以 /mcp/ 结尾）" % _setup_hint(paths))
+    if not paths.claude_mcp and os.path.exists(os.path.join(os.getcwd(), ".mcp.json")):  # --strict-mcp-config 不读它
         mj = common.read_json(os.path.join(os.getcwd(), ".mcp.json"))
         if isinstance(mj, dict) and "teamflow" in (mj.get("mcpServers") or {}):
             r.fail("当前目录 .mcp.json 有同名 teamflow", "它会遮蔽 user scope 的配置；仓库里请改名为 teamflow-cloud")
     for p in (paths.headless_settings, paths.headless_mcp):
+        if p is None:  # 隔离模式没有单独的无头配置：claude -p 直接带 --settings、--mcp-config
+            continue
         if os.path.exists(p):
             r.ok("无头配置 %s" % os.path.basename(p))
         else:
@@ -193,17 +198,53 @@ def check_codex(r: Report, paths: setup_cmd.Paths, bin_path: str):
         r.info("仓库级 .codex", "交互会话里仓库级 hooks 可能不触发（openai/codex#17532），teamflow 只装用户级")
 
 
+def _setup_hint(paths: setup_cmd.Paths) -> str:
+    if paths.isolated:
+        return "scripts/local-up.sh（或 teamflow setup --isolated %s）" % shlex.quote(paths.isolated)
+    return "teamflow setup --home %s" % shlex.quote(paths.home)
+
+
+def check_wrapper(r: Report, paths: setup_cmd.Paths):
+    """隔离模式：hook 命令串指向 <dir>/bin/teamflow 包装，它要能执行、exec 的真实 teamflow 要在。"""
+    w = paths.wrapper
+    target = setup_cmd.wrapper_target(w)
+    if target is None:
+        r.fail("隔离包装 %s" % w, "不存在或不是 teamflow 生成的；运行 %s" % _setup_hint(paths))
+        return
+    if not os.access(w, os.X_OK):
+        r.fail("隔离包装可执行", "chmod 755 %s" % shlex.quote(w))
+        return
+    if not (os.path.isfile(target) and os.access(target, os.X_OK)):
+        r.fail("隔离包装指向的 teamflow", "%s 不存在或不可执行；重装后运行 %s" % (target, _setup_hint(paths)))
+        return
+    r.ok("隔离包装", "%s → %s" % (w, target))
+
+
 def run(ns) -> int:
+    isolated = getattr(ns, "isolated", None)
     home = ns.home or os.path.expanduser("~")
-    paths = setup_cmd.Paths(home, ns.cred)
-    bin_path = os.path.abspath(ns.bin) if ns.bin else setup_cmd.default_bin()
+    paths = setup_cmd.Paths(home, None if isolated else ns.cred, isolated=isolated)
+    if isolated:
+        # 命令串里的 bin 是包装；spool、缓存也在隔离目录（包装里设的 TEAMFLOW_STATE_DIR）
+        bin_path = paths.wrapper
+        os.environ["TEAMFLOW_STATE_DIR"] = paths.state
+    else:
+        bin_path = os.path.abspath(ns.bin) if ns.bin else setup_cmd.default_bin()
     r = Report()
 
     from teamflow import __version__
 
     r.ok("teamflow %s" % __version__, bin_path)
+    if isolated:
+        check_wrapper(r, paths)
     for cmd in ("claude", "codex"):
-        v = _version(cmd)
+        env = None
+        if isolated and cmd == "codex":
+            # codex 每次启动（连 --version 也算）都会在 CODEX_HOME/tmp/arg0 下建目录；不设的话就建到 ~/.codex 里
+            env = dict(os.environ, CODEX_HOME=paths.codex_home)
+            if not os.path.isdir(paths.codex_home):
+                continue
+        v = _version(cmd, env)
         if v:
             r.ok("%s 版本" % cmd, v)
         else:
@@ -225,7 +266,7 @@ def run(ns) -> int:
             except common.CredError:
                 r.fail("workspace %s 的 %s token" % (slug, c), "填入 %s 或重新运行 setup" % paths.cred)
     except common.CredError as e:
-        r.fail("凭据文件", "%s；运行 teamflow setup" % e)
+        r.fail("凭据文件", "%s；运行 %s" % (e, _setup_hint(paths)))
 
     check_claude(r, paths, bin_path)
     check_codex(r, paths, bin_path)

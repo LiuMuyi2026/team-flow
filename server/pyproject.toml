@@ -21,6 +21,10 @@ test = ["pytest>=8", "pytest-asyncio>=0.23"]
 [tool.setuptools]
 packages = ["teamflow_server"]
 
+[tool.setuptools.package-data]
+# 网页前端的构建产物（随仓库提供，运行时不需要 Node）
+teamflow_server = ["web_dist/*", "web_dist/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

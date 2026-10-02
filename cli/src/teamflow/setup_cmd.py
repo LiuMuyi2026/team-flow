@@ -13,6 +13,16 @@
 
 --home 必须能指向临时目录；测试绝不写真实 HOME。改已有文件前先备份。--dry-run 只打印 teamflow 相关键的
 改动前→改动后，并做通用遮蔽（redact.py）。
+
+--isolated <dir>：本地试用的隔离输出（scripts/local-up.sh 用），一个字节都不写 HOME：
+- <dir>/claude/settings.json（5 个 hook，给 claude --settings）、<dir>/claude/mcp.json（给 --mcp-config，
+  配合 --strict-mcp-config）；
+- <dir>/codex/config.toml、<dir>/codex/hooks.json（这个目录就是试用时的 CODEX_HOME）；
+- <dir>/credentials.json（0600）；
+- <dir>/bin/teamflow：一个 sh 包装，把 TEAMFLOW_STATE_DIR 固定为 <dir>/cli-state 再 exec 真正的 teamflow。
+  hook 和 helper 的命令串指向它，规则与 --home 完全相同（`<bin> hook <事件> --client … --cred <绝对路径>`），
+  只是 bin 换成了包装。状态目录写在包装里，是因为 Codex 运行 helper 前会清空环境（见 headers.py），
+  而命令串不能多加参数（D27 冻结的是命令串规则）。
 """
 
 import copy
@@ -55,14 +65,37 @@ MCP_ALLOW = "mcp__teamflow__*"
 
 
 class Paths:
-    def __init__(self, home: str, cred: str | None = None):
+    def __init__(self, home: str, cred: str | None = None, isolated: str | None = None):
         self.home = os.path.abspath(os.path.expanduser(home))
+        self.isolated = None
+        self.wrapper = None
+        self.state = None
+        self.claude_mcp = None  # 只有隔离模式有：给 --mcp-config 的独立文件
+        if isolated:
+            # 隔离模式：所有文件都在 <dir> 里；home 只用来把权限规则里的路径写成 ~/…，不往里写任何东西
+            iso = os.path.abspath(os.path.expanduser(isolated))
+            self.isolated = iso
+            self.cfg_dir = iso
+            self.cred = os.path.join(iso, "credentials.json")
+            self.claude_settings = os.path.join(iso, "claude", "settings.json")
+            self.claude_json = None
+            self.claude_mcp = os.path.join(iso, "claude", "mcp.json")
+            self.codex_home = os.path.join(iso, "codex")
+            self.codex_config = os.path.join(self.codex_home, "config.toml")
+            self.codex_hooks = os.path.join(self.codex_home, "hooks.json")
+            self.headless_settings = None
+            self.headless_mcp = None
+            self.wrapper = os.path.join(iso, "bin", "teamflow")
+            # 不用 <dir>/state：本地开发模式的服务端缺省把登录码哈希、server.json 放在仓库的 .local/state
+            self.state = os.path.join(iso, "cli-state")
+            return
         self.cfg_dir = os.path.join(self.home, ".config", "teamflow")
         self.cred = os.path.abspath(cred) if cred else os.path.join(self.cfg_dir, "credentials.json")
         self.claude_settings = os.path.join(self.home, ".claude", "settings.json")
         self.claude_json = os.path.join(self.home, ".claude.json")
-        self.codex_config = os.path.join(self.home, ".codex", "config.toml")
-        self.codex_hooks = os.path.join(self.home, ".codex", "hooks.json")
+        self.codex_home = os.path.join(self.home, ".codex")
+        self.codex_config = os.path.join(self.codex_home, "config.toml")
+        self.codex_hooks = os.path.join(self.codex_home, "hooks.json")
         self.headless_settings = os.path.join(self.cfg_dir, "claude-headless-settings.json")
         self.headless_mcp = os.path.join(self.cfg_dir, "claude-mcp.json")
 
@@ -352,6 +385,55 @@ def headless_mcp(api_url: str, bin_path: str, cred: str) -> dict:
     return {"mcpServers": {"teamflow": claude_mcp_entry(api_url, bin_path, cred)}}
 
 
+def merge_mcp_json(existing, api_url: str, bin_path: str, cred: str) -> dict:
+    """隔离模式的 <dir>/claude/mcp.json（--mcp-config 的格式）：只设 mcpServers.teamflow，别的 server 原样保留。"""
+    s = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    servers = s.get("mcpServers") if isinstance(s.get("mcpServers"), dict) else {}
+    servers["teamflow"] = claude_mcp_entry(api_url, bin_path, cred)
+    s["mcpServers"] = servers
+    return s
+
+
+WRAPPER_MARK = "# teamflow-isolated-wrapper"
+
+
+def wrapper_script(real_bin: str, state_dir: str) -> str:
+    """隔离模式的 <dir>/bin/teamflow。
+
+    只做两件事：把 TEAMFLOW_STATE_DIR 固定到隔离目录，再 exec 真正的 teamflow（参数原样转交）。
+    不读环境、不输出：Claude Code 用 exec form 直接执行它，Codex 用 shell -c 执行；Codex 运行 helper 前
+    清空环境，所以状态目录必须写死在这里。多一次 /bin/sh 启动，约 1–3ms。"""
+    q = shlex.quote
+    return (
+        "#!/bin/sh\n"
+        "%s\n"
+        "# 本地试用的包装，由 teamflow setup --isolated 生成，重跑会覆盖，请勿手改。\n"
+        "# hook 和凭据 helper 的状态（spool、缓存、错误日志）放在隔离目录里，不写 ~/.local/state/teamflow。\n"
+        "TEAMFLOW_STATE_DIR=%s\n"
+        "export TEAMFLOW_STATE_DIR\n"
+        "exec %s \"$@\"\n" % (WRAPPER_MARK, q(state_dir), q(real_bin))
+    )
+
+
+def wrapper_target(path: str):
+    """读隔离包装里 exec 的真实 teamflow 路径；不是我们生成的包装返回 None。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read(4096)
+    except (OSError, UnicodeDecodeError):
+        return None
+    if WRAPPER_MARK not in text:
+        return None
+    for line in text.splitlines():
+        if line.startswith("exec "):
+            try:
+                toks = shlex.split(line)
+            except ValueError:
+                return None
+            return toks[1] if len(toks) >= 2 else None
+    return None
+
+
 # ---------------------------------------------------------------- 写文件
 
 
@@ -434,6 +516,8 @@ class Plan:
             return ["=== 将写入 %s（现有文件读不了：%s）===" % (path, e.strerror or e)]
         if old_raw is not None and old_raw == text.encode("utf-8"):
             return ["=== 不变 %s ===" % path]
+        if fmt == "raw":  # 隔离模式的包装脚本：只有两条路径，没有配置可比
+            return ["=== 将写入 %s（%s，teamflow 包装脚本）===" % (path, "新建" if old_raw is None else "整体替换")]
         if old_raw is None:
             before, head = {}, "新建"
         else:
@@ -479,9 +563,28 @@ def _dump(obj) -> str:
 
 
 def run(ns) -> int:
+    isolated = getattr(ns, "isolated", None)
+    if isolated:
+        if ns.home or ns.cred:
+            sys.stderr.write("teamflow setup：--isolated 不能和 --home、--cred 一起用（隔离模式的文件都在 <dir> 里，"
+                             "凭据固定是 <dir>/credentials.json）\n")
+            return 2
+        if not os.path.isabs(os.path.expanduser(isolated)):
+            sys.stderr.write("teamflow setup：--isolated 要给绝对路径（hook 命令串里的路径必须是绝对的）\n")
+            return 2
     home = ns.home or os.path.expanduser("~")
-    paths = Paths(home, ns.cred)
+    paths = Paths(home, ns.cred, isolated=isolated)
     bin_path = os.path.abspath(ns.bin) if ns.bin else default_bin()
+    real_bin = bin_path
+    if isolated:
+        # hook 和 helper 的命令串指向包装；包装再 exec 真正的 teamflow
+        if os.path.realpath(real_bin) == os.path.realpath(paths.wrapper):
+            target = wrapper_target(paths.wrapper)
+            if not target:
+                sys.stderr.write("teamflow setup：--bin 指向了隔离包装本身，请用 --bin 指定真正的 teamflow\n")
+                return 2
+            real_bin = target
+        bin_path = paths.wrapper
     clients = [c.strip() for c in (ns.clients or "").split(",") if c.strip()]
     bad = [c for c in clients if c not in common.CLIENTS]
     if bad:
@@ -535,16 +638,24 @@ def run(ns) -> int:
         if not str(tokens.get(c, "")).startswith("tf_pat_"):
             warnings.append("凭据文件里还没有 %s 的 token：请设置环境变量 TEAMFLOW_PAT_%s 后重跑，或手动填入 %s" % (c, c.upper(), paths.cred))
 
+    if isolated:
+        plan.add(paths.wrapper, wrapper_script(real_bin, paths.state), 0o755, fmt="raw")
+
     # 2. Claude Code
     if "claude" in clients:
         s = merge_claude_settings(common.read_json(paths.claude_settings), paths, bin_path,
                                   hardening=not ns.no_hardening, warnings=warnings)
         plan.add(paths.claude_settings, _dump(s), roots=ROOTS_CLAUDE_SETTINGS)
-        cj = common.read_json(paths.claude_json)
-        plan.add(paths.claude_json, _dump(merge_claude_json(cj, api_url, bin_path, paths.cred)), 0o600,
-                 roots=ROOTS_CLAUDE_JSON)
-        plan.add(paths.headless_settings, _dump(headless_settings(paths, bin_path)))
-        plan.add(paths.headless_mcp, _dump(headless_mcp(api_url, bin_path, paths.cred)))
+        if isolated:
+            # 不写 ~/.claude.json：MCP 配置单独放一个文件，启动时用 --mcp-config 加 --strict-mcp-config
+            mj = merge_mcp_json(common.read_json(paths.claude_mcp), api_url, bin_path, paths.cred)
+            plan.add(paths.claude_mcp, _dump(mj), roots=ROOTS_CLAUDE_JSON)
+        else:
+            cj = common.read_json(paths.claude_json)
+            plan.add(paths.claude_json, _dump(merge_claude_json(cj, api_url, bin_path, paths.cred)), 0o600,
+                     roots=ROOTS_CLAUDE_JSON)
+            plan.add(paths.headless_settings, _dump(headless_settings(paths, bin_path)))
+            plan.add(paths.headless_mcp, _dump(headless_mcp(api_url, bin_path, paths.cred)))
 
     # 3. Codex
     if "codex" in clients:
@@ -563,6 +674,17 @@ def run(ns) -> int:
 
     for w in warnings:
         sys.stdout.write("注意：%s\n" % redact.redact_text(w))
+    if isolated:
+        q = shlex.quote
+        if "claude" in clients:
+            sys.stdout.write("Claude Code：claude --settings %s --mcp-config %s --strict-mcp-config\n"
+                             % (q(paths.claude_settings), q(paths.claude_mcp)))
+        if "codex" in clients:
+            sys.stdout.write("Codex：CODEX_HOME=%s codex（第一次进去先在 /hooks 里信任 %d 条 teamflow hook）\n"
+                             % (q(paths.codex_home), len(HOOK_SPECS)))
+        if not ns.dry_run:
+            sys.stdout.write("检查：teamflow doctor --isolated %s\n" % q(paths.isolated))
+        return 0
     if "codex" in clients:
         sys.stdout.write("下一步：在 Codex 里打开 /hooks，信任 %d 条 teamflow hook（命令串变了就要重新信任）。\n"
                          % len(HOOK_SPECS))

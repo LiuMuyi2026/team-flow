@@ -21,13 +21,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, config
+from . import __version__, config, devlogin, webauth
 from .errors import DomainError, rest_error
 from .gateway import Gateway
 from .mcp_server import build_mcp
 from .rest import router
 from .seed import seed
 from .service import Service
+from .web import pages, spa_fallback, web
 
 
 def create_app(service: Service | None = None, *, with_seed: bool = True) -> FastAPI:
@@ -43,6 +44,8 @@ def create_app(service: Service | None = None, *, with_seed: bool = True) -> Fas
         hint = config.tokens_hint()
         if hint:
             print(hint, file=sys.stderr, flush=True)
+        if config.dev_endpoints_enabled():
+            announce_login_links(svc)
         async with mcp_app.lifespan(app):  # FastMCP 的 session manager 必须由外层 app 的 lifespan 启动
             yield
 
@@ -57,6 +60,7 @@ def create_app(service: Service | None = None, *, with_seed: bool = True) -> Fas
     app.router.redirect_slashes = False  # 不要任何尾斜杠 307；/mcp 由 Gateway 在应用内改写
     app.state.svc = svc
     app.state.mcp = mcp
+    app.state.web_sessions = webauth.WebSessions()
 
     # REST 错误一律 {"error": code, "message": ...}（跨包约定），包括请求体校验失败和路由级 404/405
     @app.exception_handler(DomainError)
@@ -77,9 +81,30 @@ def create_app(service: Service | None = None, *, with_seed: bool = True) -> Fas
         return JSONResponse(rest_error(code, str(exc.detail)), status_code=exc.status_code, headers=getattr(exc, "headers", None))
 
     app.include_router(router)
+    app.include_router(web)
+    app.include_router(pages)
     app.mount("/mcp", mcp_app)
+    # 没有任何路由匹配的 GET/HEAD（/api、/mcp、/dev、/healthz 以外）交给静态单页；405 等仍由 router 判
+    app.router.default = spa_fallback(app.router.default)
     app.add_middleware(Gateway)
     return app
+
+
+def announce_login_links(svc: Service) -> None:
+    """本地开发模式启动时：每个成员一个一次性登录码，链接打到 stderr（码的 sha256 写进 TEAMFLOW_STATE）。
+
+    有令牌的成员排在前面（按 TEAMFLOW_DEV_TOKENS 里的顺序）：第 1 个用 127.0.0.1、第 2 个用 localhost，
+    本地试用时"您"和第一个模拟队友在同一个浏览器里就能同时登录。"""
+    order = {h: i for i, h in enumerate(config.token_handles())}
+    active = [m for m in svc.members.values() if m.active]
+    active.sort(key=lambda m: order.get(m.handle, len(order)))  # sort 是稳定的：其余成员保持原顺序
+    members = [(m.handle, m.name) for m in active]
+    try:
+        links = devlogin.startup(members)
+    except OSError as e:
+        print(f"teamflow-server: 本地登录码写不进 {config.state_dir()}（{e.__class__.__name__}），网页登录不可用。", file=sys.stderr, flush=True)
+        return
+    print(devlogin.banner(links), file=sys.stderr, flush=True)
 
 
 app = create_app()

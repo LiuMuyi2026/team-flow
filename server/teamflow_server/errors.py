@@ -24,6 +24,7 @@ HTTP_STATUS = {
     "too_many": 413,
     "too_large": 413,  # 请求体超过 64KB（网关在鉴权之后、交给路由之前判定）
     "unauthorized": 401,
+    "csrf": 403,  # 网页 API 的写请求没过 CSRF（Origin 不是本站，或 X-CSRF-Token 缺失、不一致）
 }
 
 

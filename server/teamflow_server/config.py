@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_LOG = str(Path(__file__).resolve().parents[2] / "spike" / "out" / "server.log.jsonl")
+# 本地试用的状态目录（登录码等）缺省放在仓库根目录的 .local/state（目录里自带 .gitignore，不会被提交）
+DEFAULT_STATE = Path(__file__).resolve().parents[2] / ".local" / "state"
 
 CLIENTS = ("claude_code", "codex", "cli", "cloud")
 
@@ -51,6 +54,15 @@ def tokens() -> dict[str, TokenRec]:
 
     以前的缺省令牌（tf_pat_dev_alice 等）写在仓库里，本机任何进程都能拿它以成员的 agent 身份写入（复审新问题 8）。"""
     return parse_tokens(os.environ.get("TEAMFLOW_DEV_TOKENS"))
+
+
+def token_handles() -> list[str]:
+    """TEAMFLOW_DEV_TOKENS 里出现的 handle，按出现顺序去重。种子数据把它们也登记成成员（本地试用可以用自己的 handle）。"""
+    out: list[str] = []
+    for rec in tokens().values():
+        if rec.handle not in out:
+            out.append(rec.handle)
+    return out
 
 
 TOKENS_HOWTO = (
@@ -108,6 +120,47 @@ def dev_access_ok(header_value: str | None) -> tuple[bool, str]:
 
 def public_url() -> str:
     return os.environ.get("TEAMFLOW_PUBLIC_URL", "http://127.0.0.1:8100").rstrip("/")
+
+
+def public_url_set() -> bool:
+    return bool(os.environ.get("TEAMFLOW_PUBLIC_URL", "").strip())
+
+
+def state_dir() -> Path:
+    """服务端的本地状态目录（TEAMFLOW_STATE）：本地开发模式下放一次性登录码（只存 sha256）和 server.json。
+    不设时用仓库根目录下的 .local/state。注意 CLI 自己的状态目录是另一个变量 TEAMFLOW_STATE_DIR。"""
+    raw = os.environ.get("TEAMFLOW_STATE", "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_STATE
+
+
+# 本地登录与网页 API 只认这几个 Host（防 DNS rebinding：攻击者的域名解析到 127.0.0.1 时 Host 是攻击者的域名）
+LOOPBACK_HOSTNAMES = ("127.0.0.1", "localhost", "[::1]")
+# 经过反向代理的请求带这些头；本地浏览器直连不会带。带了就不算"来自本机"（M0 评审 B1：代理后面来源地址都是 127.0.0.1）
+FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip", "x-forwarded-host")
+
+
+def is_loopback_ip(host: str | None) -> bool:
+    """连接的对端地址是不是本机（127.0.0.0/8、::1、::ffff:127.x）。"""
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return bool((mapped or ip).is_loopback)
+
+
+def loopback_host_header(host: str | None) -> bool:
+    """Host 头是不是本机名字（127.0.0.1 / localhost / [::1]，可带端口）。"""
+    if not host:
+        return False
+    h = host.strip().lower()
+    if h.startswith("["):
+        name = h[: h.find("]") + 1] if "]" in h else h
+    else:
+        name = h.rsplit(":", 1)[0] if ":" in h else h
+    return name in LOOPBACK_HOSTNAMES
 
 
 def allowed_origins() -> set[str]:

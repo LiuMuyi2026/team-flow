@@ -7,3 +7,10 @@ dist/
 build/
 .env
 spike/out/
+
+# 本地试用（scripts/local-up.sh）：虚拟环境、令牌、隔离配置、日志，全在这里
+.local/
+
+# 网页前端（web/）：依赖不提交；构建产物在 server/teamflow_server/web_dist/，要提交
+node_modules/
+web/test-results/

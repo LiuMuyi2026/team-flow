@@ -4,6 +4,9 @@
 1. 路径规范化：``/mcp`` 在应用内改写成 ``/mcp/``（等价于 nginx 的内部改写），两者都不返回 3xx。
 2. DEV 端点的门（B1）：``/api/v1/dev/*`` 默认关闭；打开（TEAMFLOW_DEV_ENDPOINTS=1）时还要带
    ``X-Teamflow-Dev-Secret``，值等于 TEAMFLOW_DEV_SECRET；未设置密钥、密钥不对、开关没开，一律 404。
+   本地网页入口（``/dev/login``、``/api/v1/web/*``）另有一道门（``webauth.local_gate``）：开关打开、对端是本机、
+   没有转发头、Host 是本机名字，否则 404。网页 API 只认人类会话 cookie：带 ``Authorization`` 一律 403
+   ``human_only``，没有有效会话 401，写请求要过 CSRF（Origin + X-CSRF-Token 双提交）否则 403 ``csrf``。
 3. 鉴权：``Authorization: Bearer tf_pat_…``，只来自 TEAMFLOW_DEV_TOKENS（没有缺省令牌）；缺失或错误返回 401 并带 WWW-Authenticate。
    ``/mcp/`` 和 ``/api/v1/hooks`` 完全忽略 Cookie 头；``/mcp/`` 上出现不在白名单的 Origin 返回 403。
    **先鉴权再读请求体**（m7）：未鉴权的请求一个字节的请求体都不读。
@@ -30,7 +33,7 @@ from typing import Any
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 from starlette.datastructures import Headers
 
-from . import config
+from . import config, webauth
 from .errors import rest_error
 from .service import TZ, tool_use_id
 
@@ -221,6 +224,16 @@ def _bearer(headers: Headers) -> str | None:
     return tok.strip() if scheme.lower() == "bearer" and tok.strip() else ""
 
 
+# 网页 API 的响应一律不缓存、不嗅探类型
+WEB_HEADERS: tuple[tuple[bytes, bytes], ...] = ((b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"))
+
+
+def _web_sessions(scope: dict[str, Any]) -> webauth.WebSessions | None:
+    app = scope.get("app")
+    store = getattr(getattr(app, "state", None), "web_sessions", None)
+    return store if isinstance(store, webauth.WebSessions) else None
+
+
 async def _send_json(send: Any, status: int, body: dict[str, Any], extra_headers: tuple[tuple[bytes, bytes], ...] = ()) -> None:
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     headers = [(b"content-type", b"application/json"), (b"content-length", str(len(raw)).encode())] + list(extra_headers)
@@ -246,6 +259,8 @@ class Gateway:
         is_mcp = path == "/mcp/" or path.startswith("/mcp/")
         is_api = path.startswith("/api/")
         is_dev = path.startswith("/api/v1/dev/")
+        is_web = path == "/api/v1/web" or path.startswith("/api/v1/web/")
+        is_login = path == "/dev/login"
         method = scope.get("method", "GET")
         headers = Headers(scope=scope)
         state = scope.setdefault("state", {})
@@ -289,9 +304,61 @@ class Gateway:
             if dh:
                 rec["dev_human"] = dh[:32]
 
+        # 本地网页入口（/dev/login、/api/v1/web/*）：开关、本机来源、没有转发头、Host 是本机名字，否则 404
+        if is_web or is_login:
+            why = webauth.local_gate(scope, headers)
+            if why:
+                await _send_json(send, 404, rest_error("not_found", "没有这个端点。"))
+                done(404, web=why)
+                return
+        if is_login and headers.get("authorization") is not None:
+            # 带着 PAT 来要人类会话的只可能是 agent（浏览器打开登录链接不会带 Authorization）
+            await _send_json(send, 403, rest_error("human_only", "登录链接只给本人在浏览器里打开，PAT 不能换成网页会话。"))
+            done(403, web="pat", tf_err="human_only")
+            return
+        if is_web:
+            # 硬规则 1：网页 API 只认人类会话，PAT（任何 Authorization 头）一律 403，不看它是否有效
+            if headers.get("authorization") is not None:
+                await _send_json(
+                    send,
+                    403,
+                    rest_error("human_only", "网页接口只认您本人登录后的网页会话；PAT 和 Authorization 头一律不行。"),
+                    WEB_HEADERS,
+                )
+                done(403, web="pat", tf_err="human_only")
+                return
+            store = _web_sessions(scope)
+            web_sess = store.get(webauth.cookies(headers).get(webauth.SESSION_COOKIE)) if store else None
+            if web_sess is None:
+                await _send_json(
+                    send,
+                    401,
+                    rest_error(
+                        "unauthorized",
+                        "还没登录，或者登录已过期。请在您自己的终端运行 python -m teamflow_server.devlogin --as <handle> 拿登录链接。",
+                    ),
+                    WEB_HEADERS,
+                )
+                done(401, web="no_session", tf_err="unauthorized")
+                return
+            if method not in webauth.SAFE_METHODS:
+                prob = webauth.csrf_problem(scope, headers, web_sess)
+                if prob:
+                    await _send_json(
+                        send,
+                        403,
+                        rest_error("csrf", "这个请求没通过 CSRF 检查：写操作要从本站页面发出，并带上 X-CSRF-Token。", why=prob),
+                        WEB_HEADERS,
+                    )
+                    done(403, web=f"csrf_{prob}", tf_err="csrf")
+                    return
+            state["tf_web"] = web_sess
+            rec["h"] = web_sess.handle
+            rec["web"] = "ok"
+
         # 鉴权：先于读请求体（m7）
         tok_rec = None
-        needs_auth = (is_mcp or is_api) and not is_dev
+        needs_auth = (is_mcp or is_api) and not is_dev and not is_web
         if needs_auth:
             tok = _bearer(headers)
             tok_rec = config.tokens().get(tok) if tok else None
@@ -395,6 +462,11 @@ class Gateway:
         async def send_wrapper(message: dict[str, Any]) -> None:
             nonlocal size
             if message["type"] == "http.response.start":
+                if is_web:
+                    have = {k.lower() for k, _ in message.get("headers", [])}
+                    extra = [(k, v) for k, v in WEB_HEADERS if k not in have]
+                    if extra:
+                        message = {**message, "headers": [*message.get("headers", []), *extra]}
                 status_box["st"] = message["status"]
                 for k, v in message.get("headers", []):
                     lk = k.lower()

@@ -201,11 +201,15 @@ def _build_parser():
     s.add_argument("--bin", help="teamflow 可执行文件的绝对路径（默认取当前命令）")
     s.add_argument("--clients", default="claude,codex", help="要配置的客户端，逗号分隔")
     s.add_argument("--no-hardening", action="store_true", help="不写 Claude Code 的 deny 规则与沙箱凭据屏蔽")
+    s.add_argument("--isolated", metavar="DIR",
+                   help="本地试用：全部写进这个目录（claude/settings.json、claude/mcp.json、codex/、credentials.json、"
+                   "bin/teamflow 包装），不碰 HOME；要绝对路径，不能和 --home、--cred 同用")
 
     d = sub.add_parser("doctor", help="检查配置、命令串、shell 输出和 spool 积压")
     d.add_argument("--home", help="用这个目录代替 HOME")
     d.add_argument("--cred", help="credentials.json 的绝对路径")
     d.add_argument("--bin", help="teamflow 可执行文件的绝对路径")
+    d.add_argument("--isolated", metavar="DIR", help="检查 setup --isolated 写的本地试用目录")
     return p
 
 
