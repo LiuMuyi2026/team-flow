@@ -2191,6 +2191,22 @@ v1 由三套方案评审合成（mvp_first 39 分、agent_native 32 分、produc
 
 - 注册当天由 owner 核实（agent 不代办）：① 在境内注册商（腾讯云或阿里云）查能不能注册、是不是溢价域名，用运营方名义（主体没定时 owner 个人）实名认证；② 到 beian.miit.gov.cn 核对后缀在可备案清单里（.com、.cn、.net 都在）；③ 在国家知识产权局商标网查第 9 类（软件）、第 38 类（通信）、第 42 类（软件服务）有没有在先或近似商标，美国侧在 USPTO 查一次。三项都过就注册，回填这张表。
 
+**D58 起名结果（2026-10-02，用户要求"带 agentic teamwork 感觉"）**
+
+做法：四轮起名，共生成约 190 个英文名、40 多个中文名；DNS 粗筛域名；联网查 GitHub、npm、PyPI、crates、YC 公司库和网页搜索里的同名产品（USPTO、中国商标网、RDAP 被出口代理拦截，商标与注册状态都要注册当天人工复核）；再由国内成员、美国成员、对外做产品三个视角打分（满分 10）。
+主要发现：好念的 5–7 字母 .com 几乎都已被注册；"人和 agent 组队"这个细分赛道 2026 年已经很挤，GitHub 上已有 bradygaster/squad（AI agent teams）、sergiobuilds/rightseat、ShaoXiangChien/helmmate（调度 Claude Code/Codex 的看板）、batonpass、dibs 等，crew、squad、swarm、relay、helm、copilot 类词根都要避开。
+
+| 方向 | 中文名 | 英文名 | 域名（DNS 粗筛） | 评分 | 风险 |
+|---|---|---|---|---|---|
+| agentic（推荐） | 编队 | Pairwing | pairwing.com 已注册、停放在 Hostinger（可询价）；getpairwing.com、pairwinghq.com、pairwing.cn、pairwing.net、pairwing.dev、pairwing.app 没有解析记录 | 7 / 7 / 7 | 同名产品、开源项目、包都没查到；口头容易被听成 pairing（pairing.dev 是别人的站）；pair 偏一对一，要靠"每人和自己的 agent 结成一对，几对组成编队"来讲；"编队"是常用词，中文商标宜用"中文 + 图形"组合注册 |
+| agentic | 混编 | Mixwing | mixwing.com 已注册（像停放）；get/use 前缀与 .dev/.app 没有解析记录 | 6 / 4 / 5 | 英文第一眼像调音台（Behringer WING）或混音，看不出 AI |
+| 温和 | 邻桌 | Longtable | longtable.com 是卖长条餐桌的网站；longtablehq.com 没有解析记录 | 美国视角 good | 开发者搜 longtable 会被 LaTeX 宏包占满；GitHub 有 HosungYou/LongTable（AI 辅助研究、人工检查点，概念相近） |
+| 温和 | 邻桌 | Elbowmate | elbowmate.com 没有解析记录 | 美国视角 ok，撞名最干净 | 美国人第一反应像护肘类产品；elbow 有"挤开别人"的说法 |
+
+已排除（同赛道撞名或明显问题）：NextDesk、PitchIn、Handmate、Helpton、mixsquad、rightseat、helmsmate、sameboat、mateship、sidewing、crewsong、twinhelm、leadwing 等；中文名排除了搭把手（已有同名 App、京东"搭把手计划"）、补台（与"补胎"近音，拼音 Butai 会被读成 butt-AI）、长桌（"六米长桌"梗）。
+中文名备选（agentic 方向）：编队、联队（人机联队，也是中美联队）、同台、共驾（方向盘在人手里）。
+定下之前不拿任何候选写进代码和配置（AGENTS.md 一律写 `<品牌域名>`）；定下当天按上面三步核实后再注册。
+
 **红队复核与处理**（2026-10-02，对本次修订的复核：6 major、6 minor，全部处理）
 
 | 级别 | 意见 | 处理 |
