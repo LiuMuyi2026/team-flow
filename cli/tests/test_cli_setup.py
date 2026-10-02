@@ -187,9 +187,10 @@ def test_upsert_collapses_duplicate_teamflow_groups():
     old = {"hooks": [{"type": "command", "command": "/old/teamflow hook stop --client codex --cred /c"}]}
     new = {"hooks": [{"type": "command", "command": "/new/teamflow hook stop --client codex --cred /c"}]}
     hooks = {"Stop": [MINE, old, OTHER, old]}
-    assert setup_cmd._upsert_groups(hooks, {"Stop": new}) == {"Stop": [MINE, new, OTHER]}
-    assert setup_cmd._upsert_groups({}, {"Stop": new}) == {"Stop": [new]}
-    assert setup_cmd._upsert_groups({"Stop": [MINE]}, {"Stop": new}) == {"Stop": [MINE, new]}
+    # 末尾那组重复的删空了，后面没有别人的组，直接去掉；别人的组位置不变
+    assert setup_cmd._upsert_groups(hooks, {"Stop": new}) == ({"Stop": [MINE, new, OTHER]}, [])
+    assert setup_cmd._upsert_groups({}, {"Stop": new}) == ({"Stop": [new]}, [])
+    assert setup_cmd._upsert_groups({"Stop": [MINE]}, {"Stop": new}) == ({"Stop": [MINE, new]}, [])
 
 
 def test_credentials_created_0600_with_tokens(env, home):
@@ -212,7 +213,8 @@ def test_dry_run_writes_nothing(env, home):
     assert os.listdir(home) == []
     # 首次运行：token 来自环境变量，计划里的凭据文件要遮蔽
     assert "tf_pat_c1" not in out and "tf_pat_x1" not in out
-    assert '"claude": "tf_pat_****"' in out and '"codex": "tf_pat_****"' in out
+    assert ('  workspaces.team.tokens（新增）\n    改动前：（无）\n    改动后：{"claude": "tf_pat_****", "codex": "tf_pat_****"}\n'
+            in out)
 
 
 def _write_existing_creds(home, tokens):
@@ -236,11 +238,12 @@ def test_dry_run_masks_existing_tokens_when_new_git_email(env, home):
     p = env.run(["setup", "--home", home, "--bin", BIN, "--dry-run"])
     assert p.returncode == 0, p.stderr.decode()
     out = p.stdout.decode()
-    assert "credentials.json ===" in out  # 确实打印了凭据文件的计划
+    assert "credentials.json（修改" in out  # 确实打印了凭据文件的计划
     assert "SECRET" not in out
-    assert '"claude": "tf_pat_****"' in out
-    assert '"codex": "****"' in out  # 不是 tf_pat_ 开头的整段遮掉
-    assert "me@example.com" in out  # 其余内容照常显示
+    # 只列改动：tokens 没变，不打印；新邮箱按键名遮蔽（复审新问题 4：邮箱也算个人信息）
+    assert "tokens" not in out
+    assert "  workspaces.team.git_emails（新增）\n    改动前：（无）\n    改动后：[\"m***@***\"]\n" in out
+    assert "me@example.com" not in out and "example.com" not in out
     assert open(cred).read() == before  # dry-run 不写
     # 真正写入时 token 原样保留
     assert env.run(["setup", "--home", home, "--bin", BIN]).returncode == 0

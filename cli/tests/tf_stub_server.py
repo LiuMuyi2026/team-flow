@@ -30,6 +30,7 @@ class Stub:
         self.status = {}  # path → 强制返回的状态码
         self.reply = {}  # path → (状态码, 响应体对象或 bytes)：完全自定义响应
         self.item_status = {}  # spool key → 逐条状态码
+        self.max_body = None  # 请求体字节数上限（模拟服务端/nginx 的 64KB）：超了返回 413
         self.requests = []
         self.etag = "W/\"1\""
         self.lock = threading.Lock()
@@ -84,6 +85,8 @@ class Stub:
                     )
                 if stub.delay:
                     time.sleep(stub.delay)
+                if stub.max_body is not None and int(self.headers.get("Content-Length") or 0) > stub.max_body:
+                    return self._send(413, {"error": "too_large", "max": stub.max_body})
                 if path in stub.status:
                     return self._send(stub.status[path], {"error": "forced"})
                 if path in stub.reply:

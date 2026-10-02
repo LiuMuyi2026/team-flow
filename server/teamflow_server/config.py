@@ -8,7 +8,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_TOKENS = "tf_pat_dev_alice:alice:claude_code,tf_pat_dev_bob:bob:codex"
 DEFAULT_LOG = str(Path(__file__).resolve().parents[2] / "spike" / "out" / "server.log.jsonl")
 
 CLIENTS = ("claude_code", "codex", "cli", "cloud")
@@ -48,7 +47,26 @@ def parse_tokens(raw: str | None) -> dict[str, TokenRec]:
 
 
 def tokens() -> dict[str, TokenRec]:
-    return parse_tokens(os.environ.get("TEAMFLOW_DEV_TOKENS", DEFAULT_TOKENS))
+    """有效令牌只来自 TEAMFLOW_DEV_TOKENS。没有缺省值：不设（或一条有效的都没有）时所有请求都是 401。
+
+    以前的缺省令牌（tf_pat_dev_alice 等）写在仓库里，本机任何进程都能拿它以成员的 agent 身份写入（复审新问题 8）。"""
+    return parse_tokens(os.environ.get("TEAMFLOW_DEV_TOKENS"))
+
+
+TOKENS_HOWTO = (
+    'TEAMFLOW_DEV_TOKENS="<token>:<handle>:<client>,..."，client 是 claude_code、codex、cli 或 cloud；'
+    "令牌请随机生成，例如 python3 -c 'import secrets;print(\"tf_pat_\"+secrets.token_hex(16))'"
+)
+
+
+def tokens_hint() -> str | None:
+    """启动时打到 stderr 的一行提示（不含任何令牌）。有有效令牌时返回 None。"""
+    raw = os.environ.get("TEAMFLOW_DEV_TOKENS")
+    if raw is None or not raw.strip():
+        return f"teamflow-server: 没有设置 TEAMFLOW_DEV_TOKENS，现在没有任何有效令牌，所有请求都会 401。请设置 {TOKENS_HOWTO}。"
+    if not parse_tokens(raw):
+        return f"teamflow-server: TEAMFLOW_DEV_TOKENS 里没有一条有效的令牌（要以 tf_pat_ 开头、三段用冒号分隔），所有请求都会 401。格式：{TOKENS_HOWTO}。"
+    return None
 
 
 def log_path() -> str:

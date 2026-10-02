@@ -47,7 +47,9 @@ def test_gate_withholds_peer_body_until_accept(svc):
     assert "content" not in item
     assert item["t"]["trust"] == "peer_agent"  # 标题默认可见（团队信任档），但在信封里
     # 人在手机上接受（版本、sha、seq 一致）
-    svc.human_accept(human("bob"), "T-52", v=item["v"], sha=svc.tasks["T-52"].content_sha256, seq=item["assign"]["seq"])
+    svc.human_accept(
+        human("bob"), "T-52", v=item["v"], sha=svc.tasks["T-52"].content_sha256, seq=item["assign"]["seq"], through=svc.page_view("T-52")["through"]
+    )
     item = svc.get_item(bob, "T-52")
     assert "withheld" not in item
     assert item["content"]["trust"] == "peer_agent"

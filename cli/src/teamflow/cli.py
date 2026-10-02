@@ -193,7 +193,7 @@ def _build_parser():
 
     s = sub.add_parser("setup", help="生成 Claude Code 与 Codex 的 hooks、MCP 配置")
     s.add_argument("--home", help="用这个目录代替 HOME（测试和实验必须用临时目录）")
-    s.add_argument("--dry-run", action="store_true", help="只打印将要写入的内容，不写文件")
+    s.add_argument("--dry-run", action="store_true", help="不写文件，只打印 teamflow 相关配置的改动前→改动后（密钥、邮箱一律遮蔽）")
     s.add_argument("--cred", help="credentials.json 的绝对路径（默认 <home>/.config/teamflow/credentials.json）")
     s.add_argument("--api-url", help="凭据文件不存在时写入的服务地址（默认 http://127.0.0.1:8100）")
     s.add_argument("--workspace", default="team", help="凭据文件不存在时写入的 workspace 名")

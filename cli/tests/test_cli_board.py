@@ -171,7 +171,11 @@ def test_missing_credentials_hint(env, tmp_path):
     p = env.run(["note", "T-42", "进度", "--cred", str(tmp_path / "nope.json")])
     assert p.returncode == 1
     err = p.stderr.decode()
-    assert "凭据文件不存在或格式不对" in err and "沙箱" in err
+    assert err.startswith("teamflow note：credentials：找不到凭据文件 %s\n" % (tmp_path / "nope.json"))
+    assert "运行 teamflow setup 生成" in err
+    assert "沙箱" not in err  # 不是在 Claude Code 里跑的：文件就是不存在，不扯沙箱
+    p = env.run(["note", "T-42", "进度", "--cred", str(tmp_path / "nope.json")], CLAUDECODE="1")
+    assert "沙箱" in p.stderr.decode()  # agent 在 Claude Code 里跑的：提一句沙箱
     p = env.run(["block", "--title", "x", "--json", "--cred", str(tmp_path / "nope.json")])
     assert json.loads(p.stdout)["error"] == "credentials"
 

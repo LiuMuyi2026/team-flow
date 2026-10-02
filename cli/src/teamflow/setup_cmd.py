@@ -5,11 +5,13 @@
   <home>/.claude.json 顶层 mcpServers.teamflow（user scope，type http，headersHelper）；
 - Codex：<home>/.codex/config.toml 的 [mcp_servers.teamflow]，<home>/.codex/hooks.json
   （顶层只有 description 和 hooks）；
-- 两端的 hook 组：已有 teamflow 组就原地替换，没有才追加到事件数组末尾。Codex 的信任键里带着组序号
-  （codex-rs/hooks/src/lib.rs hook_key），挪动位置会让我们和别人的组都要重新信任；
+- 两端的 hook 组：已有 teamflow 的 handler 就原地更新，没有才追加一组到事件数组末尾；绝不删除、挪动别人的
+  handler 和组（详见 _merge_event）。Codex 的信任键里带着组序号和 handler 序号
+  （codex-rs/hooks/src/lib.rs hook_key），挪动位置会让我们和别人的 hook 都要重新信任；
 - 无头：<home>/.config/teamflow/claude-headless-settings.json 与 claude-mcp.json。
 
---home 必须能指向临时目录；测试绝不写真实 HOME。改已有文件前先备份。
+--home 必须能指向临时目录；测试绝不写真实 HOME。改已有文件前先备份。--dry-run 只打印 teamflow 相关键的
+改动前→改动后，并做通用遮蔽（redact.py）。
 """
 
 import copy
@@ -128,24 +130,102 @@ def _is_teamflow_group(g) -> bool:
     return isinstance(g, dict) and any(_is_teamflow_handler(h) for h in (g.get("hooks") or []))
 
 
-def _upsert_groups(hooks: dict, groups: dict) -> dict:
-    """已有 teamflow 组：原地替换第一组（多出来的重复组去掉）；没有：追加到末尾。
+def _handlers(g):
+    hs = g.get("hooks") if isinstance(g, dict) else None
+    return hs if isinstance(hs, list) else None
 
-    不挪动任何组的位置：Codex 记信任时键里带组序号（hooks/src/lib.rs hook_key），
-    位置一变，我们的组和被挪动的别人的组都要重新信任。
+
+# 两端只有这两个事件看组的 matcher（codex-rs/hooks/src/events/common.rs matcher_pattern_for_event；
+# cc_hooks.md「Matcher patterns」：UserPromptSubmit、Stop 没有 matcher）
+MATCHER_EVENTS = ("SessionStart", "SessionEnd")
+
+# 删掉 teamflow handler 之后组变空时，留一个 {"hooks": []} 占位，后面组的序号就不变。两端都确认过空组合法：
+# - Codex：codex-rs/config/src/hook_config.rs 的 MatcherGroup.hooks 是 #[serde(default)] Vec，discovery.rs 对空组
+#   只是不产出 handler；hooks/src/engine/mod_tests.rs 有「an empty matcher group should not prevent ... loading」；
+# - Claude Code：cc_hooks.md 没写；本机 2.1.287 的设置 schema 是 {matcher: string().optional(), hooks: array(...)}，
+#   没有最小长度。
+# 某一端将来不认空组，把它改成 False：那样的组整组保留不动，只打印警告。
+EMPTY_GROUP_OK = {"claude": True, "codex": True}
+
+
+def _norm_matcher(m):
+    return None if m in (None, "", "*") else m
+
+
+def _merge_event(arr, grp: dict, event: str, where: str, empty_ok: bool):
+    """一个事件数组的合并。返回 (新数组, 警告)。
+
+    规则（M0 复审新问题 3）：绝不删除、挪动别人的 handler 和组。
+    - 没有 teamflow handler：我们的组追加到末尾。
+    - 第一个 teamflow handler 所在的组原地更新：整组都是 teamflow 的就整组换成新的；和别人混在一组时只换这一个
+      handler，组的 matcher 等字段不动（改了 Codex 对别人那条的哈希也变，要重新信任）。
+    - 其余 teamflow handler 是重复的，要删掉；但 Codex 的信任键是「组序号:handler 序号」（hooks/src/lib.rs
+      hook_key），删掉排在别人 handler 前面的那条，别人的 handler 序号会前移，所以只删「后面再没有别人的 handler」
+      的那些，删不了的保留并警告。组删空了留 {"hooks": []} 占位（在数组末尾的不必占位，直接去掉）。
     """
-    for event, grp in groups.items():
-        arr = hooks.get(event)
-        arr = list(arr) if isinstance(arr, list) else []
-        idx = [i for i, g in enumerate(arr) if _is_teamflow_group(g)]
-        if idx:
-            arr[idx[0]] = grp
-            for i in reversed(idx[1:]):
-                del arr[i]
+    warnings = []
+    arr = list(arr) if isinstance(arr, list) else []
+    hits = [(gi, hi) for gi, g in enumerate(arr) for hi, h in enumerate(_handlers(g) or []) if _is_teamflow_handler(h)]
+    if not hits:
+        arr.append(copy.deepcopy(grp))
+        return arr, warnings
+    g0, h0 = hits[0]
+    by_group = {}
+    for gi, hi in hits:
+        by_group.setdefault(gi, []).append(hi)
+    emptied = {}
+    for gi, his in by_group.items():
+        g = arr[gi]
+        hs = list(_handlers(g))
+        if gi == g0 and len(his) == len(hs):
+            arr[gi] = copy.deepcopy(grp)  # 整组都是我们的
+            continue
+        drop = set(his)
+        if gi == g0:
+            drop.discard(h0)
+            hs[h0] = copy.deepcopy(grp["hooks"][0])
+            if event in MATCHER_EVENTS and _norm_matcher(g.get("matcher")) != _norm_matcher(grp.get("matcher")):
+                warnings.append(
+                    "%s 的 %s：teamflow 的 hook 和别的 hook 在同一组（第 %d 组），这一组的 matcher 是 %s，teamflow 需要 %s；"
+                    "为了不影响别人的 hook 没有改，请手动把 teamflow 那条移到单独的一组后重跑 setup"
+                    % (where, event, gi + 1, json.dumps(g.get("matcher"), ensure_ascii=False),
+                       json.dumps(grp.get("matcher"), ensure_ascii=False)))
+        removable = set()
+        for i in range(len(hs) - 1, -1, -1):  # 只删末尾连续的那几条
+            if i not in drop:
+                break
+            removable.add(i)
+        stuck = sorted(drop - removable)
+        if stuck:
+            warnings.append(
+                "%s 的 %s：第 %d 组里有重复的 teamflow hook（第 %s 条）排在别的 hook 前面，删掉会让后面那条换序号"
+                "（Codex 按序号记信任），所以没有动；会重复执行，请手动删掉后重跑 setup"
+                % (where, event, gi + 1, "、".join(str(i + 1) for i in stuck)))
+        new_hs = [h for i, h in enumerate(hs) if i not in removable]
+        if new_hs:
+            arr[gi] = dict(g, hooks=new_hs)
         else:
-            arr.append(grp)
-        hooks[event] = arr
-    return hooks
+            emptied[gi] = g  # 先不动，看它后面还有没有组
+    while arr and len(arr) - 1 in emptied:  # 末尾删空的组后面没有别人的组，直接去掉，谁的序号都不变
+        del emptied[len(arr) - 1]
+        arr.pop()
+    for gi, g in sorted(emptied.items()):
+        if empty_ok:
+            arr[gi] = dict(g, hooks=[])
+        else:
+            warnings.append(
+                "%s 的 %s：第 %d 组是重复的 teamflow hook，这一端不认空组，删掉它后面的组会前移，所以没有动；"
+                "会重复执行，请手动处理" % (where, event, gi + 1))
+    return arr, warnings
+
+
+def _upsert_groups(hooks: dict, groups: dict, where: str = "", empty_ok: bool = True):
+    """每个事件按 _merge_event 合并；返回 (hooks, 警告)。不挪动任何别人的组和 handler。"""
+    warnings = []
+    for event, grp in groups.items():
+        hooks[event], w = _merge_event(hooks.get(event), grp, event, where, empty_ok)
+        warnings.extend(w)
+    return hooks, warnings
 
 
 def _add_unique(lst: list, items):
@@ -175,7 +255,8 @@ def deny_rules(paths: Paths, bin_path: str) -> list:
     return out
 
 
-def merge_claude_settings(existing: dict | None, paths: Paths, bin_path: str, hardening: bool = True) -> dict:
+def merge_claude_settings(existing: dict | None, paths: Paths, bin_path: str, hardening: bool = True,
+                          warnings: list | None = None) -> dict:
     s = copy.deepcopy(existing) if isinstance(existing, dict) else {}
     perms = s.get("permissions") if isinstance(s.get("permissions"), dict) else {}
     s["permissions"] = perms
@@ -194,7 +275,10 @@ def merge_claude_settings(existing: dict | None, paths: Paths, bin_path: str, ha
                 files.append({"path": p, "mode": "deny"})
         cr["files"] = files
     hooks = s.get("hooks") if isinstance(s.get("hooks"), dict) else {}
-    s["hooks"] = _upsert_groups(hooks, claude_hook_groups(bin_path, paths.cred))
+    s["hooks"], w = _upsert_groups(hooks, claude_hook_groups(bin_path, paths.cred), "Claude Code settings.json",
+                                   EMPTY_GROUP_OK["claude"])
+    if warnings is not None:
+        warnings.extend(w)
     return s
 
 
@@ -214,7 +298,9 @@ def merge_codex_hooks(existing, bin_path: str, cred: str) -> tuple[dict, list]:
         warnings.append("hooks.json 里有 Codex 不认的顶层键 %s，已去掉（否则整个文件加载失败）" % extra)
     desc = ex.get("description") if isinstance(ex.get("description"), str) and ex.get("description") else CODEX_HOOKS_DESC
     hooks = ex.get("hooks") if isinstance(ex.get("hooks"), dict) else {}
-    hooks = _upsert_groups(copy.deepcopy(hooks), codex_hook_groups(bin_path, cred))
+    hooks, w = _upsert_groups(copy.deepcopy(hooks), codex_hook_groups(bin_path, cred), "Codex hooks.json",
+                              EMPTY_GROUP_OK["codex"])
+    warnings.extend(w)
     return {"description": desc, "hooks": hooks}, warnings
 
 
@@ -278,15 +364,6 @@ def mask_token(v):
     return MASK if v.startswith(TOKEN_PREFIX) else "****"
 
 
-def masked_creds(creds: dict) -> dict:
-    """凭据的展示版：所有 workspace 的 tokens 都遮蔽。"""
-    out = copy.deepcopy(creds)
-    for ws in (out.get("workspaces") or {}).values():
-        if isinstance(ws, dict) and isinstance(ws.get("tokens"), dict):
-            ws["tokens"] = {k: mask_token(v) for k, v in ws["tokens"].items()}
-    return out
-
-
 def scrub_tokens(text: str) -> str:
     """兜底：任何地方漏出来的 tf_pat_xxx 都换成 tf_pat_****。"""
     import re
@@ -294,22 +371,69 @@ def scrub_tokens(text: str) -> str:
     return re.sub(r"tf_pat_(?!\*\*\*\*)[A-Za-z0-9_.\-]*", MASK, text)
 
 
+def _parse(text: str, fmt: str):
+    if fmt == "toml":
+        import tomllib
+
+        return tomllib.loads(text)
+    return json.loads(text)
+
+
+# dry-run 只显示这些键下面的改动（None：整个文件都是 teamflow 的）
+ROOTS_CLAUDE_SETTINGS = (("permissions",), ("sandbox",), ("hooks",))
+ROOTS_CLAUDE_JSON = (("mcpServers", "teamflow"),)
+ROOTS_CODEX_CONFIG = (("mcp_servers", "teamflow"),)
+ROOTS_CODEX_HOOKS = (("description",), ("hooks",))
+
+
 class Plan:
-    """收集要写的文件，dry-run 只打印（打印的是遮蔽过 token 的展示版）。"""
+    """收集要写的文件。
+
+    dry-run 不打印整份文件（M0 复审新问题 4：~/.claude.json、config.toml 里有别的 MCP server 的密钥、
+    oauthAccount 里的邮箱，而 dry-run 输出常被重定向进存证文件）：只按结构比对现有文件和将要写入的内容，
+    列出 teamflow 相关键下的「改动前→改动后」，再做通用遮蔽（redact.py）。
+    """
 
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
-        self.items = []  # (path, text, mode, shown)
+        self.items = []  # (path, text, mode, fmt, roots)
 
-    def add(self, path, text, mode=0o644, shown=None):
-        """shown：dry-run 时打印的版本（含凭据的文件必须给遮蔽过的）。"""
-        self.items.append((path, text, mode, text if shown is None else shown))
+    def add(self, path, text, mode=0o644, fmt="json", roots=None):
+        """fmt：json 或 toml（dry-run 比对用）；roots：dry-run 只显示这些键路径下的改动，None 表示全显示。"""
+        self.items.append((path, text, mode, fmt, roots))
+
+    @staticmethod
+    def preview(path, text, fmt="json", roots=None) -> list:
+        from teamflow import redact
+
+        try:
+            with open(path, "rb") as f:
+                old_raw = f.read()
+        except FileNotFoundError:
+            old_raw = None
+        except OSError as e:
+            return ["=== 将写入 %s（现有文件读不了：%s）===" % (path, e.strerror or e)]
+        if old_raw is not None and old_raw == text.encode("utf-8"):
+            return ["=== 不变 %s ===" % path]
+        if old_raw is None:
+            before, head = {}, "新建"
+        else:
+            try:
+                before, head = _parse(old_raw.decode("utf-8"), fmt), "修改，只列 teamflow 相关的改动"
+            except (ValueError, UnicodeDecodeError):
+                before, head = None, "现有文件解析不了，将整体替换，原文件会先备份"
+        lines = ["=== 将写入 %s（%s）===" % (path, head)]
+        body = redact.render(before, _parse(text, fmt), roots)
+        return lines + (body or ["  （内容不变，只有格式变化）"])
 
     def apply(self, out=sys.stdout):
         stamp = time.strftime("%Y%m%d%H%M%S")
-        for path, text, mode, shown in self.items:
+        for path, text, mode, fmt, roots in self.items:
             if self.dry_run:
-                out.write(scrub_tokens("=== 将写入 %s ===\n%s\n" % (path, shown.rstrip("\n"))))
+                from teamflow import redact
+
+                for line in self.preview(path, text, fmt, roots):
+                    out.write(redact.redact_text(scrub_tokens(line)) + "\n")
                 continue
             common.ensure_dir(os.path.dirname(path))
             if os.path.exists(path):
@@ -381,7 +505,7 @@ def run(ns) -> int:
             ws["git_emails"] = emails + [email]
             new_creds = True
     if new_creds:
-        plan.add(paths.cred, _dump(creds), 0o600, shown=_dump(masked_creds(creds)))
+        plan.add(paths.cred, _dump(creds), 0o600)  # tokens、git_emails 在 dry-run 里按键名遮蔽
     elif not ns.dry_run:
         try:
             os.chmod(paths.cred, 0o600)
@@ -394,10 +518,12 @@ def run(ns) -> int:
 
     # 2. Claude Code
     if "claude" in clients:
-        s = merge_claude_settings(common.read_json(paths.claude_settings), paths, bin_path, hardening=not ns.no_hardening)
-        plan.add(paths.claude_settings, _dump(s))
+        s = merge_claude_settings(common.read_json(paths.claude_settings), paths, bin_path,
+                                  hardening=not ns.no_hardening, warnings=warnings)
+        plan.add(paths.claude_settings, _dump(s), roots=ROOTS_CLAUDE_SETTINGS)
         cj = common.read_json(paths.claude_json)
-        plan.add(paths.claude_json, _dump(merge_claude_json(cj, api_url, bin_path, paths.cred)), 0o600)
+        plan.add(paths.claude_json, _dump(merge_claude_json(cj, api_url, bin_path, paths.cred)), 0o600,
+                 roots=ROOTS_CLAUDE_JSON)
         plan.add(paths.headless_settings, _dump(headless_settings(paths, bin_path)))
         plan.add(paths.headless_mcp, _dump(headless_mcp(api_url, bin_path, paths.cred)))
 
@@ -407,14 +533,17 @@ def run(ns) -> int:
         if os.path.exists(paths.codex_config):
             with open(paths.codex_config, encoding="utf-8") as f:
                 text = f.read()
-        plan.add(paths.codex_config, merge_codex_config(text, api_url, bin_path, paths.cred))
+        plan.add(paths.codex_config, merge_codex_config(text, api_url, bin_path, paths.cred), fmt="toml",
+                 roots=ROOTS_CODEX_CONFIG)
         hj, w = merge_codex_hooks(common.read_json(paths.codex_hooks), bin_path, paths.cred)
         warnings.extend(w)
-        plan.add(paths.codex_hooks, _dump(hj))
+        plan.add(paths.codex_hooks, _dump(hj), roots=ROOTS_CODEX_HOOKS)
 
     plan.apply()
+    from teamflow import redact
+
     for w in warnings:
-        sys.stdout.write("注意：%s\n" % w)
+        sys.stdout.write("注意：%s\n" % redact.redact_text(w))
     if "codex" in clients:
         sys.stdout.write("下一步：在 Codex 里打开 /hooks，信任 4 条 teamflow hook（命令串变了就要重新信任）。\n")
     if not ns.dry_run:

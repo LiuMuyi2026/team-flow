@@ -4,10 +4,12 @@
 1. 路径规范化：``/mcp`` 在应用内改写成 ``/mcp/``（等价于 nginx 的内部改写），两者都不返回 3xx。
 2. DEV 端点的门（B1）：``/api/v1/dev/*`` 默认关闭；打开（TEAMFLOW_DEV_ENDPOINTS=1）时还要带
    ``X-Teamflow-Dev-Secret``，值等于 TEAMFLOW_DEV_SECRET；未设置密钥、密钥不对、开关没开，一律 404。
-3. 鉴权：``Authorization: Bearer tf_pat_…``，来自 TEAMFLOW_DEV_TOKENS；缺失或错误返回 401 并带 WWW-Authenticate。
+3. 鉴权：``Authorization: Bearer tf_pat_…``，只来自 TEAMFLOW_DEV_TOKENS（没有缺省令牌）；缺失或错误返回 401 并带 WWW-Authenticate。
    ``/mcp/`` 和 ``/api/v1/hooks`` 完全忽略 Cookie 头；``/mcp/`` 上出现不在白名单的 Origin 返回 403。
    **先鉴权再读请求体**（m7）：未鉴权的请求一个字节的请求体都不读。
-4. /mcp 请求体上限 64KB：Content-Length 超了直接 413，分块传输读到超过也 413。
+4. 请求体上限 64KB（``/mcp/`` 和应用内 REST ``/api/*`` 都是）：Content-Length 超了直接 413，分块传输读到超过也 413。
+   ``/mcp/`` 返回 JSON-RPC 错误，REST 返回 ``{"error": "too_large", ...}``。同样是鉴权（DEV 端点是开关和密钥）
+   通过之后才读，未鉴权的大请求体直接 401/404。生产 nginx 也设 ``client_max_body_size 64k``，这里是兜底。
 5. 故障注入：TEAMFLOW_FAULT_DELAY_MS 让 ``/api/v1/hooks/*`` 和 ``/api/v1/me/*`` 延迟返回。
 6. 把鉴权结果和解析出的 JSON-RPC 信息放进 ``scope["state"]``，供 REST 依赖和 MCP 工具读取。
 7. 新代 -32022（版本不支持）的 ``data.supported`` 补上旧代版本：SDK 的传输层写死只列新代（m6）。
@@ -39,7 +41,10 @@ CODEX_TURN_KEY = "x-codex-turn-metadata"
 _log_lock = threading.Lock()
 _last_init: dict[str, dict[str, Any]] = {}  # token_id → 最近一次 initialize 的 {pv, ci}（旧代后续请求不再带 clientInfo）
 _MAX_CAPTURE = 256 * 1024
-MAX_MCP_BODY = 64 * 1024  # /mcp 请求体上限：9 个工具的参数最长 4000 字，64KB 绰绰有余（SDK 默认 4MB）
+MAX_BODY = 64 * 1024  # 请求体上限：9 个工具、REST 正文最长 4000 字，64KB 绰绰有余（SDK 默认 4MB）
+MAX_MCP_BODY = MAX_BODY
+MAX_REST_BODY = MAX_BODY
+_BODY_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 _MAX_LOG_VALUE = 4096
 UNSUPPORTED_PROTOCOL_VERSION = -32022
 
@@ -308,16 +313,26 @@ class Gateway:
                 done(403)
                 return
 
-        # MCP 请求体：鉴权通过后才读，读出来解析，再原样回放给下游；上限 64KB
-        if is_mcp and method == "POST":
-            too_large = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Request body too large (max 64KB)"}}
+        # 请求体：鉴权通过后才读，读出来（MCP 还要解析），再原样回放给下游；/mcp/ 与 /api/* 都是上限 64KB
+        if (is_mcp and method == "POST") or (is_api and method in _BODY_METHODS):
+            if is_mcp:
+                too_large: dict[str, Any] = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Request body too large (max 64KB)"},
+                }
+                limit = MAX_MCP_BODY
+            else:
+                limit = MAX_REST_BODY
+                too_large = rest_error("too_large", "请求体超过 64KB 上限，请精简后重试。", max=limit)
             try:
                 declared = int(headers.get("content-length") or 0)
             except ValueError:
                 declared = 0
-            if declared > MAX_MCP_BODY:
+            err_tag = {} if is_mcp else {"tf_err": "too_large"}
+            if declared > limit:
                 await _send_json(send, 413, too_large)
-                done(413, body_limit="content-length")
+                done(413, body_limit="content-length", **err_tag)
                 return
             chunks: list[bytes] = []
             more = True
@@ -328,23 +343,26 @@ class Gateway:
                     return
                 chunk = message.get("body", b"")
                 total += len(chunk)
-                if total > MAX_MCP_BODY:
+                if total > limit:
                     await _send_json(send, 413, too_large)
-                    done(413, body_limit="stream")
+                    done(413, body_limit="stream", **err_tag)
                     return
                 chunks.append(chunk)
                 more = message.get("more_body", False)
             body = b"".join(chunks)
             replayed = False
+            orig_receive = receive
 
             async def replay() -> dict[str, Any]:
                 nonlocal replayed
                 if not replayed:
                     replayed = True
                     return {"type": "http.request", "body": body, "more_body": False}
-                return await receive()
+                return await orig_receive()
 
             receive = replay
+
+        if is_mcp and method == "POST":
             rpc = parse_rpc(body, headers)
             state["tf_rpc"] = rpc
             rec.update({k: (_cap(v) if k in ("ci", "codex_turn", "call_id") else v) for k, v in rpc.items() if k != "meta"})

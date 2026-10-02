@@ -23,13 +23,15 @@ uv pip install --python .venv/bin/python -e cli     # 开发
 | `teamflow done T-42 "<说明>"` | 兜底：标记完成 → `POST /api/v1/tasks/T-42:done` |
 | `teamflow block --title "…" [--task T-42] [--need handle] [--detail …] [--tried …]` | 兜底：报告困难 → `POST /api/v1/blockers`；`--need` 只是提议 |
 | `teamflow claude-flags [--home d] [--quoted]` | 给 `claude --bare -p $(teamflow claude-flags)` 用 |
-| `teamflow setup --home <d> [--dry-run] [--no-hardening] [--bin p] [--cred p]` | 写两端的 hooks 与 MCP 配置；实验和测试必须用临时目录。已有 teamflow 组就原地替换、没有才追加到末尾（Codex 信任键带组序号，不挪位置）；`--dry-run` 打印的凭据一律遮蔽成 `tf_pat_****` |
+| `teamflow setup --home <d> [--dry-run] [--no-hardening] [--bin p] [--cred p]` | 写两端的 hooks 与 MCP 配置；实验和测试必须用临时目录。已有 teamflow 的 hook 就原地更新、没有才追加一组到末尾；绝不删除、挪动别人的组和 handler（Codex 信任键带组序号和 handler 序号）：和别人同组时只换我们那一条，重复的只删不影响别人序号的那些，删空的组留 `{"hooks": []}` 占位，删不了的打印「注意」。`--dry-run` 不打印整份文件，只列 teamflow 相关键的改动前→改动后，并遮蔽一切像密钥、token、邮箱的值（`redact.py`） |
 | `teamflow doctor --home <d>` | 基础检查：hook 组「存在且命令串一致」（不要求在末尾）；Linux 上 `sandbox.enabled` 为 true 时检查 `bwrap`、`socat`，缺了标失败 |
 
 `note` / `done` / `block` 都接受 `--client claude|codex`（默认按环境判断：只有 Codex 的会话变量时用 codex，否则 claude）、
 `--cred`、`--ws`、`--json`。默认输出一两行中文；失败时 stderr 以错误码开头（如 `teamflow note：needs_accept：…`），
 和 MCP 工具的错误文本一致；`--json` 输出一行 `{"ok": true, "id": …, "st": …}` 或 `{"ok": false, "error": …, "status": …, "message": …}`。
 返回码 0 成功、1 服务端拒绝或网络/凭据问题、2 参数不对（不发请求）。
+读不到凭据时（含 `inbox`）输出 `credentials：<问题>`，下面每行一条修复办法：文件不存在、是空的或没有权限
+（Claude Code 沙箱屏蔽了凭据文件时就是后两种）、缺 token、workspace 不对，各给对应的办法；不输出 token。
 
 hook、mcp-headers、flush 三条快速路径只用标准库，并且不导入 `json`/`re`
 （读 JSON 用 C 实现的 `_json` 扫描器，写 JSON 用 `common.dumps` 手写的最小编码），HTTP 用 `http.client`（回环地址永远直连，不跟随重定向）。
@@ -86,7 +88,7 @@ ID `^[TB]-[0-9]{1,6}$`；handle `^[a-z][a-z0-9_]{1,15}$`；`client` ∈ `claude_
 **`GET /api/v1/me/delta?cursor=<c>`**：带 `If-None-Match`；返回与上面相同形状的快照（可含新的 `cursor`、`ETag`），
 未变化返回 304。CLI 在本地比对「需要我」的条目（todo、to_accept、help_me、fwd、proposed）决定增量。
 
-**`POST /api/v1/hooks/batch`**：`{"v":1,"items":[…]}`，最多 100 条；每条都有 `key`（幂等键）和 `type`：
+**`POST /api/v1/hooks/batch`**：`{"v":1,"items":[…]}`，最多 100 条、请求体不超过 64KB（`flush` 按条数和编码后的字节数切批，每批不超过 60KB；仍然 413 时对半拆开重发，只有单条就超限的才进 dead-letter）；每条都有 `key`（幂等键）和 `type`：
 
 - `turn_end`：`session_id, client, ts, turn, cwd_name, repo, branch, head, commits[{sha,title}]（本人最多 5 条）, own_more, other_commits`
 - `end`：`session_id, client, ts, reason`（`clear|resume|logout|prompt_input_exit|other`）

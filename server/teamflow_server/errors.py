@@ -22,6 +22,7 @@ HTTP_STATUS = {
     "invalid": 400,
     "conflict": 409,
     "too_many": 413,
+    "too_large": 413,  # 请求体超过 64KB（网关在鉴权之后、交给路由之前判定）
     "unauthorized": 401,
 }
 

@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable, Literal
 
 from . import config
 from .errors import DomainError
-from .sanitize import clean, ident_or_hash, mask, scan, sha256, unsafe_title
+from .sanitize import clean, ident_or_hash, mask, one_line, scan, sha256, unsafe_title
 
 TZ = timezone(timedelta(hours=8))  # Asia/Shanghai，无夏令时
 WS = "team"
@@ -351,8 +351,14 @@ class Service:
         return v
 
     def _title(self, actor: Actor, value: str | None) -> str | None:
-        """标题：清洗、长度、扫描之外，agent 写的标题更严（plan 5.1 闸门表、I6）：
-        团队档下标题是唯一不经接受就跨人送到 agent 的自由文本，所以不许有网址、路径和命令片段。"""
+        """标题：清洗、长度、扫描之外（plan 5.1 闸门表、I6）：
+
+        - 所有标题一律单行。人写的把换行（含 U+2028/2029、NEL 等）折成空格；agent 写的带换行直接 422。
+        - agent 写的标题更严：团队档下标题是唯一不经接受就跨人送到 agent 的自由文本，所以在 NFKC 骨架上
+          检查网址或域名、路径、管道或重定向、反引号、命令替换（规则见 sanitize 的"标题"一节）。
+        """
+        if actor.kind != "agent" and value is not None:
+            value = one_line(value)
         v = self._text("title", value, required=True)
         if actor.kind == "agent":
             hit = unsafe_title(v)
@@ -360,14 +366,14 @@ class Service:
                 self._audit("title.rejected", actor, "invalid", rule=hit.rule)
                 raise DomainError(
                     "invalid",
-                    f"agent 写的标题里不能有网址、~/ 或绝对路径、管道或重定向符（| > <）、反引号、$( 或 ${{，"
-                    f"这次是第 {hit.pos + 1} 个字符起的{hit.desc}。标题请用文字描述，"
-                    "网址、路径和命令写进正文（正文要对方本人接受后才会给对方的 agent）。",
+                    "agent 写的标题必须是一行文字，不能有网址或域名、路径（~/、/etc、.aws/、C:\\、%VAR%、$HOME/）、"
+                    f"管道或重定向（| >> 2> > 文件）、反引号、$( 或 ${{；这次是第 {hit.pos + 1} 个字符起的{hit.desc}。"
+                    "标题请用文字描述，网址、路径和命令写进正文（正文要对方本人接受后才会给对方的 agent）。",
                     status=422,
                     rule=hit.rule,
                     pos=hit.pos,
                 )
-        return v
+        return one_line(v)
 
     def _member(self, handle: str | None, *, what: str = "成员") -> Member:
         h = (handle or "").strip().lstrip("@").lower()
@@ -432,9 +438,13 @@ class Service:
         }
 
     def _title_env(self, obj: Task | Blocker, viewer: str) -> dict[str, Any]:
+        """标题信封。读取时再折一次行：标题一律单行，旧数据里万一有换行也不会原样送到 agent。"""
         if isinstance(obj, Task):
-            return self.envelope(obj.title, obj.created_by, obj.created_by_kind, obj.created_by_client, viewer)
-        return self.envelope(obj.title, obj.raised_by, obj.raised_by_kind, obj.raised_by_client, viewer)
+            env = self.envelope(obj.title, obj.created_by, obj.created_by_kind, obj.created_by_client, viewer)
+        else:
+            env = self.envelope(obj.title, obj.raised_by, obj.raised_by_kind, obj.raised_by_client, viewer)
+        env["t"] = one_line(env["t"])
+        return env
 
     def can_see_content(self, viewer: str, obj: Task | Blocker) -> bool:
         """本人是作者直接为真；否则要有接受过正文的 acceptance，且版本和 sha 都等于对象当前值。
@@ -1119,20 +1129,25 @@ class Service:
             raise DomainError("human_only", "这个操作只能由本人在手机微信里完成，agent 和命令行都不行。")
 
     @staticmethod
-    def _need_version(v: Any, sha: Any, seq: Any = 0, *, with_seq: bool = False) -> None:
-        """人类动作必须带上页面渲染时看到的版本（H3）。缺了就是请求不合法，不是冲突。"""
-        missing = [n for n, x in (("v", v), ("sha", sha)) if x is None]
-        if with_seq and seq is None:
-            missing.append("seq")
-        if missing:
-            raise DomainError("invalid", f"缺少 {'、'.join(missing)}：要带上页面上看到的版本，内容被改过时才能发现。")
+    def _need_page_fields(**fields: Any) -> None:
+        """人类动作必须带上页面渲染时看到的值（H3）：版本 v、sha（任务接受还有 seq），以及 through
+        （页面渲染时最大的动态编号）。缺了就是请求不合法（400），不是冲突。
 
-    def _check_through(self, through: Any, *, required: bool) -> int | None:
-        """through_event_id：页面渲染时的最大事件 ID，不能超过当前最大事件 ID（不能"看见"还没发生的动态）。"""
+        through 必填：缺省时若取"本次动作的事件 ID"，页面渲染之后、点按钮之前对方 agent 写的评论就会被
+        当成"已看到"放给本人的 agent（复审新问题 1）。"""
+        missing = [n for n, x in fields.items() if x is None]
+        if missing:
+            raise DomainError(
+                "invalid",
+                f"缺少 {'、'.join(missing)}：要带上页面渲染时看到的版本和最大的动态编号（through），"
+                "内容被改过时才能发现，页面之后才出现的动态也不会算作您已看过。",
+            )
+
+    def _check_through(self, through: Any) -> int:
+        """through_event_id：页面渲染时的最大事件 ID。必填，不能超过当前最大事件 ID（不能"看见"还没发生的动态）。
+        接受、认领、帮忙、转发共用。"""
         if through is None:
-            if required:
-                raise DomainError("invalid", "缺少 through：要带上页面渲染时最大的动态编号。")
-            return None
+            raise DomainError("invalid", "缺少 through：要带上页面渲染时最大的动态编号。")
         if not isinstance(through, int) or isinstance(through, bool) or through < 0:
             raise DomainError("invalid", "through 必须是非负整数。")
         latest = self.latest_event_id()
@@ -1154,7 +1169,11 @@ class Service:
             )
 
     def page_view(self, raw_id: str) -> dict[str, Any]:
-        """DEV ONLY：模拟手机详情页渲染时表单里带的值（v、sha、seq、through）。"""
+        """DEV ONLY：模拟手机详情页渲染时表单里带的值。
+
+        v、sha（任务还有 seq）是页面上看到的版本；through 是页面渲染时这个对象最大的动态编号。
+        接受、认领、帮忙、转发都必须原样带回 through：页面渲染之后才出现的动态（比如对方 agent
+        刚写的评论）编号比它大，不会算作本人已看到，也就不会放给本人的 agent。"""
         with self.lock:
             obj = self._obj(raw_id)
             out: dict[str, Any] = {
@@ -1175,20 +1194,21 @@ class Service:
         v: int | None,
         sha: str | None,
         seq: int | None,
-        through: int | None = None,
+        through: int | None,
     ) -> dict[str, Any]:
-        """人在手机上点「接受」：v、sha、seq 必填，与当前不一致返回 409（plan 5.3、H3）。"""
+        """人在手机上点「接受」：v、sha、seq、through 必填；版本与当前不一致返回 409（plan 5.3、H3），
+        through 超过当前最大事件 ID 返回 400。"""
         self._require_human(actor)
-        self._need_version(v, sha, seq, with_seq=True)
+        self._need_page_fields(v=v, sha=sha, seq=seq, through=through)
         with self.lock:
             t = self._task(raw_id)
-            through_c = self._check_through(through, required=False)
+            through_c = self._check_through(through)
             if t.assignee != actor.handle or t.assign_state != "pending" or t.status not in ("open", "in_progress"):
                 raise DomainError("conflict", f"{t.id} 当前不是待您接受的状态（{t.label}）。", id=t.id)
             self._version_conflict(t, v, sha, seq)  # type: ignore[arg-type]
-            ev = self._emit("task.accepted", t.id, actor, v=t.content_version, seq=t.assign_seq)
+            self._emit("task.accepted", t.id, actor, v=t.content_version, seq=t.assign_seq)
             t.assign_state = "accepted"
-            self._write_acceptance(actor, t, through_c if through_c is not None else ev.id)
+            self._write_acceptance(actor, t, through_c)
             self._touch(t)
             self._check_task(t)
             if t.assigned_by:
@@ -1196,20 +1216,20 @@ class Service:
             return {"id": t.id, "st": t.label, "v": t.content_version}
 
     def human_claim(
-        self, actor: Actor, raw_id: str, *, v: int | None, sha: str | None, through: int | None = None
+        self, actor: Actor, raw_id: str, *, v: int | None, sha: str | None, through: int | None
     ) -> dict[str, Any]:
-        """人在手机上点「认领」：同时完成认领和接受当前版本。v、sha 必填，不一致返回 409。
+        """人在手机上点「认领」：同时完成认领和接受当前版本。v、sha、through 必填，版本不一致返回 409。
         之后任务是"待开始"，由本人或其 agent 开始。"""
         self._require_human(actor)
-        self._need_version(v, sha)
+        self._need_page_fields(v=v, sha=sha, through=through)
         with self.lock:
             t = self._task(raw_id)
-            through_c = self._check_through(through, required=False)
+            through_c = self._check_through(through)
             self._version_conflict(t, v, sha)  # type: ignore[arg-type]
             if not self._cas_claim(t, actor):
                 raise self._taken_error(t)
-            ev = self._emit("task.claimed", t.id, actor)
-            self._write_acceptance(actor, t, through_c if through_c is not None else ev.id)
+            self._emit("task.claimed", t.id, actor)
+            self._write_acceptance(actor, t, through_c)
             self._check_task(t)
             return {"id": t.id, "st": t.label, "v": t.content_version}
 
@@ -1222,8 +1242,7 @@ class Service:
         self._require_human(actor)
         with self.lock:
             obj = self._obj(raw_id)
-            through_c = self._check_through(through, required=True)
-            assert through_c is not None
+            through_c = self._check_through(through)
             key = (actor.handle, obj.id)
             prev = self.acceptances.get(key)
             if prev is None:
@@ -1234,20 +1253,21 @@ class Service:
             return {"id": obj.id, "through": self.acceptances[key].through_event_id}
 
     def human_help(
-        self, actor: Actor, raw_id: str, *, v: int | None, sha: str | None, through: int | None = None
+        self, actor: Actor, raw_id: str, *, v: int | None, sha: str | None, through: int | None
     ) -> dict[str, Any]:
-        """人认领困难（帮忙）：WHERE status='open' AND helper IS NULL；同时写 acceptance。v、sha 必填，不一致返回 409。"""
+        """人认领困难（帮忙）：WHERE status='open' AND helper IS NULL；同时写 acceptance。
+        v、sha、through 必填，版本不一致返回 409。"""
         self._require_human(actor)
-        self._need_version(v, sha)
+        self._need_page_fields(v=v, sha=sha, through=through)
         with self.lock:
             b = self._blocker(raw_id)
-            through_c = self._check_through(through, required=False)
+            through_c = self._check_through(through)
             self._version_conflict(b, v, sha)  # type: ignore[arg-type]
             if b.status != "open" or b.helper is not None:
                 raise DomainError("taken", f"{b.id} 已经有 {b.helper} 在帮忙了。", id=b.id, by=b.helper)
             b.helper = actor.handle
-            ev = self._emit("blocker.helped", b.id, actor)
-            self._write_acceptance(actor, b, through_c if through_c is not None else ev.id)
+            self._emit("blocker.helped", b.id, actor)
+            self._write_acceptance(actor, b, through_c)
             self._notify(b.raised_by, "task_reply", b.id, f"{actor.handle} 来帮忙看 {b.id} 了", actor, f"helped:{b.id}")
             self._touch(b)
             return {"id": b.id, "helper": b.helper}

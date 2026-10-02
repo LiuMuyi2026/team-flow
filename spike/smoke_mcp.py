@@ -9,12 +9,21 @@
 另外断言评审修复后的协议行为：
 - 能力宣告只有 tools，两代都不宣告 listChanged（m6）；discover 与 -32022 的 supported 同时列出两代版本（m6）；
 - 业务错误的 content 文本以错误码开头（I5）；
-- /mcp 请求体超过 64KB 返回 413，不带令牌的大请求体直接 401（先鉴权再读请求体，m7）。
+- /mcp 请求体超过 64KB 返回 413，不带令牌的大请求体直接 401（先鉴权再读请求体，m7）；
+- 应用内 REST 同样：64KB 以上带令牌 413 too_large，不带令牌 401（复审新问题 6）；
+- 令牌没有缺省值（复审新问题 8）：以前写在仓库里的 tf_pat_dev_alice 等一律 401（除非服务端显式配了它们）。
 再用官方 mcp 2.2.0 客户端（auto 与 legacy 两种模式）交叉验证一次，并记录它见到的所有 HTTP 状态码。
 
-用法：
-  .venv/bin/python spike/smoke_mcp.py --base http://127.0.0.1:8190 [--token tf_pat_dev_alice] [--out spike/out/smoke_mcp.json]
-退出码：全部通过为 0，否则为 1。报告是 JSON（同时打印到 stdout）。
+可选的 DEV 段（复审新问题 1）：给了 --dev-secret 和 --peer-token 时，模拟"bob 打开 T-52 详情页 → alice 的 agent
+写评论 → bob 点接受"：不带 through 400、through 超过最大事件 400、带页面上的 through 200；之后 bob 的 agent
+读 T-52 能看到正文、看不到那条评论（peer_agent_text n=1）。最后 dev/reset 恢复种子数据。需要服务端用种子数据启动，
+--token 是 alice 的 Claude Code 令牌、--peer-token 是 bob 的令牌，并打开 DEV 端点。
+
+用法（令牌没有缺省值，必须显式给）：
+  .venv/bin/python spike/smoke_mcp.py --base http://127.0.0.1:8190 --token "$TF_A" \\
+      [--peer-token "$TF_B" --dev-secret "$TEAMFLOW_DEV_SECRET"] [--out spike/out/smoke_mcp.json]
+  也可以用环境变量 TEAMFLOW_SMOKE_TOKEN、TEAMFLOW_SMOKE_PEER_TOKEN、TEAMFLOW_DEV_SECRET。
+退出码：全部通过为 0，否则为 1（缺令牌为 2）。报告是 JSON（同时打印到 stdout），不含令牌和密钥。
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -235,6 +245,81 @@ async def negative_auth(raw: Raw, rep: Report, url: str) -> None:
     rep.check(f"64KB+ body {url} → 413", r.status_code == 413, r.status_code)
 
 
+async def rest_checks(raw: Raw, rep: Report, base: str, token_was_default: bool) -> None:
+    """应用内 REST：请求体上限 64KB（先鉴权再读）；以前的缺省令牌不再有效。"""
+    url = f"{base}/api/v1/tasks"
+    big = {"title": "smoke 大请求体", "body": "x" * (MAX_MCP_BODY + 1)}
+    r = await raw.c.post(url, json=big)
+    raw.rep.http.append({"label": "rest-no-token-big", "url": url, "method": "POST", "status": r.status_code})
+    rep.check("REST no token + 64KB+ body → 401 (auth before body)", r.status_code == 401, r.status_code)
+    r = await raw.c.post(url, json=big, headers={"authorization": f"Bearer {raw.token}"})
+    raw.rep.http.append({"label": "rest-big-body", "url": url, "method": "POST", "status": r.status_code})
+    body = parse_body(r) or {}
+    rep.check(
+        "REST 64KB+ body → 413 too_large",
+        r.status_code == 413 and body.get("error") == "too_large" and body.get("max") == MAX_MCP_BODY,
+        {"status": r.status_code, "error": body.get("error"), "max": body.get("max")},
+    )
+    if not token_was_default:
+        r = await raw.c.get(f"{base}/api/v1/me/inbox", headers={"authorization": "Bearer tf_pat_dev_alice"})
+        rep.check("former default token tf_pat_dev_alice → 401", r.status_code == 401, r.status_code)
+
+
+async def modern_call(c: httpx.AsyncClient, url: str, token: str, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    h = {
+        "accept": ACCEPT,
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": "tools/call",
+        "mcp-name": name,
+    }
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args, "_meta": modern_meta()}}
+    r = await c.post(url, json=body, headers=h)
+    return ((parse_body(r) or {}).get("result")) or {}
+
+
+async def dev_through_flow(raw: Raw, rep: Report, base: str, peer_token: str, secret: str) -> None:
+    """复审新问题 1：页面渲染后、点按钮前对方 agent 写的评论不放给本人的 agent；through 必填。"""
+    c = raw.c
+    mcp = f"{base}/mcp/"
+    bob = {"x-teamflow-dev-secret": secret, "x-teamflow-dev-human": "bob"}
+    path = f"{base}/api/v1/dev/tasks/T-52:accept"
+    r = await c.get(f"{base}/api/v1/dev/items/T-52", headers=bob)
+    seen = parse_body(r) or {}
+    rep.check(
+        "DEV detail page T-52 gives v, sha, seq, through",
+        r.status_code == 200 and {"v", "sha", "seq", "through"} <= set(seen) and isinstance(seen.get("through"), int),
+        {"status": r.status_code, "keys": sorted(seen)},
+    )
+    if r.status_code != 200:
+        return
+    late = "smoke：页面渲染之后才写的评论"
+    res = await modern_call(c, mcp, raw.token, "comment", {"target": "T-52", "body": late})
+    rep.check("alice's agent comments on T-52 after bob's page rendered", res.get("isError") is False, res.get("structuredContent"))
+    form = {k: seen.get(k) for k in ("v", "sha", "seq")}
+    r = await c.post(path, headers=bob, json=form)
+    body = parse_body(r) or {}
+    rep.check("DEV accept without through → 400 invalid", r.status_code == 400 and body.get("error") == "invalid", {"status": r.status_code, "error": body.get("error")})
+    latest = ((parse_body(await c.get(f"{base}/healthz")) or {}).get("events")) or 0
+    r = await c.post(path, headers=bob, json={**form, "through": latest + 1})
+    body = parse_body(r) or {}
+    rep.check("DEV accept with through > latest → 400 invalid", r.status_code == 400 and body.get("error") == "invalid", {"status": r.status_code, "error": body.get("error")})
+    r = await c.post(path, headers=bob, json={**form, "through": seen["through"]})
+    rep.check("DEV accept with the page's through → 200", r.status_code == 200, r.status_code)
+    res = await modern_call(c, mcp, peer_token, "get_item", {"id": "T-52", "events": 10})
+    sc = res.get("structuredContent") or {}
+    texts = " ".join(e.get("t", "") for e in sc.get("ev") or [])
+    held = [e.get("n") for e in sc.get("ev") or [] if e.get("withheld") == "peer_agent_text"]
+    rep.check(
+        "bob's agent sees accepted body but not the comment written after render",
+        "content" in sc and late not in texts and held == [1],
+        {"content": "content" in sc, "late_visible": late in texts, "held": held},
+    )
+    r = await c.post(f"{base}/api/v1/dev/reset", headers=bob)
+    rep.check("DEV reset restores seed", r.status_code == 200, r.status_code)
+
+
 async def official_client(rep: Report, url: str, token: str, mode: str) -> dict[str, Any]:
     import httpx2
     from mcp.client import Client
@@ -282,9 +367,14 @@ async def official_client(rep: Report, url: str, token: str, mode: str) -> dict[
 async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", default="http://127.0.0.1:8190")
-    ap.add_argument("--token", default="tf_pat_dev_alice")
+    ap.add_argument("--token", default=os.environ.get("TEAMFLOW_SMOKE_TOKEN"), help="alice 的 Claude Code 令牌（没有缺省值）")
+    ap.add_argument("--peer-token", default=os.environ.get("TEAMFLOW_SMOKE_PEER_TOKEN"), help="bob 的令牌（DEV 段用）")
+    ap.add_argument("--dev-secret", default=os.environ.get("TEAMFLOW_DEV_SECRET"), help="DEV 端点密钥（DEV 段用）")
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent / "out" / "smoke_mcp.json"))
     args = ap.parse_args()
+    if not args.token:
+        print("smoke_mcp: 需要 --token 或 TEAMFLOW_SMOKE_TOKEN（服务端 TEAMFLOW_DEV_TOKENS 里配的令牌；没有缺省值）", file=sys.stderr)
+        return 2
     base = args.base.rstrip("/")
     urls = [f"{base}/mcp", f"{base}/mcp/"]
     rep = Report()
@@ -301,6 +391,12 @@ async def main() -> int:
             if mt:
                 hashes[f"modern {url}"] = tools_hash(mt)
             await negative_auth(raw, rep, url)
+        await rest_checks(raw, rep, base, token_was_default=args.token == "tf_pat_dev_alice")
+        skipped: list[str] = []
+        if args.peer_token and args.dev_secret:
+            await dev_through_flow(raw, rep, base, args.peer_token, args.dev_secret)
+        else:
+            skipped.append("dev_through_flow（需要 --peer-token 和 --dev-secret）")
     rep.check("tools/list identical across eras and URLs", len(set(hashes.values())) == 1, hashes)
     redirects = [h for h in rep.http if 300 <= h["status"] < 400]
     rep.check("no 3xx on any raw request", not redirects, redirects or len(rep.http))
@@ -313,6 +409,7 @@ async def main() -> int:
         "ok": rep.ok,
         "passed": sum(c["ok"] for c in rep.checks),
         "failed": [c for c in rep.checks if not c["ok"]],
+        "skipped": skipped,
         "tools_sha256": next(iter(hashes.values()), None),
         "checks": rep.checks,
         "http": rep.http,

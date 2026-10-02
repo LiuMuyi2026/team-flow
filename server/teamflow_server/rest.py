@@ -301,7 +301,8 @@ def hook_batch(request: Request, payload: dict[str, Any] = Body(...)) -> dict[st
 # DEV ONLY：模拟"人在手机微信里操作"。M1 上线前删除。
 # 默认关闭（TEAMFLOW_DEV_ENDPOINTS 缺省为 0）；打开时还要带 X-Teamflow-Dev-Secret，值等于 TEAMFLOW_DEV_SECRET，
 # 未设置密钥则一律 404（gateway 先挡一次，这里再查一次）。带任何 Authorization（PAT）一律 403 human_only。
-# 人类动作必须带页面上看到的版本：接受 v、sha、seq；认领、帮忙 v、sha；转发 through（I1）。
+# 人类动作必须带页面上看到的值：接受 v、sha、seq、through；认领、帮忙 v、sha、through；转发 through（I1、复审新问题 1）。
+# through 是详情页渲染时最大的动态编号：缺失 400 invalid；超过当前最大事件 ID 也是 400（与转发一致）。
 # ---------------------------------------------------------------------------
 
 
@@ -328,7 +329,10 @@ def dev_human(request: Request) -> Actor:
 
 @router.get("/api/v1/dev/items/{oid}")
 def dev_item(request: Request, oid: str) -> dict[str, Any]:
-    """模拟手机详情页：表单里会带的 v、sha、seq（任务）和 through（页面渲染时最大的动态编号）。"""
+    """模拟手机详情页：表单里会带的 v、sha、seq（任务）和 through（页面渲染时最大的动态编号）。
+
+    接受、认领、帮忙、转发都要把这里的 through 原样带回：页面渲染之后才出现的动态编号比它大，
+    不会算作本人已看到，也就不会放给本人的 agent。"""
     dev_human(request)
     return svc_of(request).page_view(oid)
 

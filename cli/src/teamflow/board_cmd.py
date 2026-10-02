@@ -242,15 +242,76 @@ def _usage_fail(cmd: str, msg: str, as_json: bool) -> int:
     return 2
 
 
-def _cred_fail(cmd: str, e: Exception, as_json: bool) -> int:
-    msg = str(e)
-    if isinstance(e, CredFileError):
-        # plan 6.4 的加固会让沙箱里的命令读不到凭据文件（M0 评审 m5）
-        msg += "。如果是在 Claude Code 的沙箱里运行，凭据文件会被屏蔽，请在您自己的终端里运行这条命令"
-    if as_json:
-        sys.stdout.write(common.dumps({"ok": False, "error": "credentials", "status": 0, "message": msg}) + "\n")
+def _sandbox_lines(in_claude: bool) -> list:
+    if in_claude:
+        why = ("这条命令是在 Claude Code 里运行的。teamflow setup 让 Claude Code 的沙箱屏蔽了凭据文件（不让 agent 读到 token），"
+               "沙箱里的命令就读不到它（读出来是空的，或者没有权限）。")
     else:
-        sys.stderr.write("teamflow %s：%s\n" % (cmd, msg))
+        why = ("如果是在 Claude Code 的沙箱里运行的：凭据文件被 sandbox.credentials 屏蔽了（teamflow setup 的加固），"
+               "沙箱里的命令读不到它。")
+    return [
+        why,
+        "修复办法（任选一个）：",
+        "  1. MCP 能用时直接用 teamflow 的 MCP 工具，它的凭据由 Claude Code 在沙箱外读取；",
+        "  2. 让 Claude Code 在沙箱外重跑这条命令（通常会先请您确认）；",
+        "  3. 您在自己的终端里运行同一条命令。",
+    ]
+
+
+def cred_help(cred: str, client: str, err: Exception, env=None) -> list:
+    """读不到凭据时的说明与修复办法（M0 复审 m5）：第一行是问题，后面是怎么修。
+
+    setup 的加固（sandbox.credentials）让沙箱里的命令读不到凭据文件，agent 从 Bash 跑兜底命令就会走到这里。
+    只在兜底命令失败时调用，不在 hook 快速路径上；只说路径、workspace 名和客户端，从不输出 token。
+    """
+    env = os.environ if env is None else env
+    in_claude = env.get("CLAUDECODE") == "1"
+    if not cred or not os.path.isabs(cred):
+        return ["--cred 必须是绝对路径（现在是 %r）" % (cred or ""),
+                "修复：写成 ~/.config/teamflow/credentials.json 展开后的绝对路径，或者不写 --cred，用默认位置"]
+    if isinstance(err, CredFileError):
+        try:
+            with open(cred, "rb") as f:
+                raw = f.read(1 << 20)
+        except FileNotFoundError:
+            lines = ["找不到凭据文件 %s" % cred,
+                     "修复：运行 teamflow setup 生成（token 从环境变量 TEAMFLOW_PAT_CLAUDE、TEAMFLOW_PAT_CODEX 读取）；"
+                     "凭据放在别处就加 --cred <绝对路径>"]
+            return lines + (_sandbox_lines(True) if in_claude else [])
+        except PermissionError:
+            return (["没有权限读取凭据文件 %s" % cred] + _sandbox_lines(in_claude)
+                    + ["不是在沙箱里的话：检查文件的属主和权限（应当是您本人、600）"])
+        except OSError as e:
+            return ["读不了凭据文件 %s（%s）" % (cred, e.strerror or type(e).__name__)]
+        if not raw.strip():
+            return (["凭据文件 %s 是空的" % cred] + _sandbox_lines(in_claude)
+                    + ["不是在沙箱里的话：重跑 teamflow setup 重新生成"])
+        return ["凭据文件 %s 的内容不对（不是 JSON，或者没有 workspaces）" % cred,
+                "修复：重跑 teamflow setup（会先备份原文件），或者手动改正"]
+    msg = str(err)
+    var = "TEAMFLOW_PAT_%s" % (client or "claude").upper()
+    if msg.startswith("缺少 "):
+        msg = "凭据文件里还没有 %s 的 token" % client
+        fix = "修复：设置环境变量 %s 后重跑 teamflow setup，或者手动填进 %s 里这个 workspace 的 tokens.%s" % (var, cred, client)
+    elif "非法字符" in msg:
+        fix = "修复：检查 %s 里 %s 的 token 是否完整（只能有字母、数字和 _ - .），或者重新设置 %s 后重跑 teamflow setup" % (
+            cred, client, var)
+    elif msg.startswith("api_url"):
+        fix = "修复：%s 里这个 workspace 的 api_url 要以 http:// 或 https:// 开头" % cred
+    elif "workspace" in msg:
+        fix = "修复：用 --ws 指定凭据文件里已有的 workspace，或者在 %s 里设好 default" % cred
+    else:
+        fix = "修复：重跑 teamflow setup，然后运行 teamflow doctor 检查"
+    return [msg, fix]
+
+
+def _cred_fail(cmd: str, e: Exception, as_json: bool, cred: str = "", client: str = "") -> int:
+    lines = cred_help(cred, client, e)
+    if as_json:
+        sys.stdout.write(common.dumps({"ok": False, "error": "credentials", "status": 0, "message": "\n".join(lines)}) + "\n")
+    else:
+        # 和其他失败一样以错误码开头，后面每行一条修复办法
+        sys.stderr.write("teamflow %s：credentials：%s\n%s" % (cmd, lines[0], "".join("  %s\n" % x for x in lines[1:])))
     return 1
 
 
@@ -287,7 +348,7 @@ def run(ns) -> int:
     try:
         res = call(ns.cred, client, ns.ws, path, body)
     except common.CredError as e:
-        return _cred_fail(cmd, e, as_json)
+        return _cred_fail(cmd, e, as_json, ns.cred, client)
 
     if cmd == "note":
         return _emit(cmd, res, as_json, lambda f: "已记录 %s 的进度%s。" % (f.get("id") or tid, _st_text(f)))

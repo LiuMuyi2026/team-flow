@@ -1,0 +1,40 @@
+# 第二轮复审"新发现的问题"1–8 的攻击探针（2026-10-02 最终验证，服务端 8196，随机令牌 + DEV 开关 + 随机密钥）
+# 探针源码与完整输出在 <scratchpad>/final/round2/（不进 git）；像密钥的样本全部运行时拼接；本文件不含令牌和密钥。
+## 1 through 必填（p1_through.py，31/31）
+  接受、认领、帮忙三种动作，各自：不带 through 400 invalid；through=null 400；超过最大事件 400；-1 400；"abc" 422
+  被拒之后正文仍 withheld；带详情页的 through 200；接受后本人 agent 读到正文
+  页面渲染之后对方 agent 写的评论（accept e=20 > page through=17；claim e=23 > 18；help e=26 > 19）仍不给本人 agent
+  本人点「转发」（through=最新）之后才可见；PAT 调 :accept 403 human_only
+## 2 agent 标题（p2_titles.py，71/71；每个样本都走 REST、MCP 新代、MCP 旧代、update_task、report_blocker、REST :edit 六个入口）
+  复审原样本 8 个全部 422：全角 curl 网址、～／.aws／、访问 evil.example、.aws/credentials、.ssh/id_rsa、https:∕∕、%USERPROFILE%、多行伪造哨兵
+  新变体 46 个全部 422：U+2028/NEL/CR/VT 换行、evil。com、evil｡com、全角域名、零宽拆开、组合符号、大写、末尾点、evil.dev/x.sh、
+    a.b.cn、例子.中国、邮箱、git@github.com:、file:///、hxxps://、https:/\、https : //、www．、//host、localhost:8080、10.0.0.1:8080、
+    读取/etc/passwd、~root/.ssh、$HOME/、${HOME}、$(…)、$env:、全角盘符、\\server、../../、>> ~/.bashrc、> out.txt、2> err.log、
+    全角｜、∣、反引号（含全角）、javascript:、data:、⁄etc⁄、单行伪造【teamflow 团队看板｜…】、evil.c<U+180B>om、https:/<U+13430>/
+  放行 16 个全部 201：p95 > 300ms、错误率 < 1%、1.2.3、report.md、install.sh、Dockerfile.dev、log.info、ASP.NET、-> 箭头、node.js/react、.env、
+    a >= b、首页骨架屏：加载态、【紧急】修复登录、v2.0、C# 和 F#
+  alice 的 list_tasks(pool)（两代）、REST 列表、get_item(T-51) 里读不到任何被拒样本
+  残余（不在复审样本里，仍能写入）：例子.com、evil[.]com、evil dot com、evil点com、evil.vercel.app、evil.pages.dev、пример.рф、
+    打开/data/secret.txt（紧贴中文的非系统目录）、执行 rm -rf ~（命令片段、无路径）
+## 3 setup 合并（p3_setup_merge.py，15/15；真实 teamflow setup --home 子进程）
+  Claude settings.json 与 Codex hooks.json：别人的 8 条 handler 的 (事件, 组序号, handler 序号) 与内容都不变；含别人 handler 的 7 个组 matcher 不变
+  中间的重复 teamflow 整组变 {matcher, hooks: []} 占位；末尾的重复整组去掉；混合组只换 teamflow 那条；删不了的重复和 matcher 不一致都有「注意」
+  再跑一次 setup 两份文件逐字节不变；doctor 对删不了的重复和 matcher 不一致标失败
+  真实 Claude Code 2.1.287 读合并后的 settings.json（含 {"hooks": []} 占位组）：无设置错误，别人的 6 个 handler 都执行，matcher=resume 的没执行
+## 4 dry-run（p4_dryrun.py，24/24）
+  15 种假密钥（sk-ant、sk-proj、ghp_、xoxb、rk_live、AKIA、AIza、JWT、tf_pat_、PGPASSWORD=、curl -u、URL 口令、Slack webhook、mysql -p、sshpass -p）
+  放在别的 MCP server、oauthAccount、已有凭据、permissions.allow 里用户批准过的命令、同一事件数组里别人的 hook、teamflow 自己的旧 headers 里：
+  输出里一个都没有（含任意 12 字符片段），3 个邮箱和新传入的 PAT 也没有；别人的 server 名不出现；dry-run 不写文件
+## 6 REST 请求体（p6_body.py，35/35；原始 socket：声明 70KB、只发 10 字节）
+  9 个端点（含 hooks、DELETE/PUT/PATCH）：无令牌立即 401，带令牌立即 413 too_large（都没等正文），分块传 70KB 也 413
+  错误令牌立即 401；DEV 端点无密钥立即 404、有密钥 413；/mcp/ 无令牌 401、带令牌 413；60KB 合法 JSON 不受影响（业务 422）
+  连带问题（本轮已修）：CLI 一批 100 条带提交标题的条目约 92KB，修复前整批 413 后 100 条全进 dead/；按字节切批后 0 条进 dead/
+## 7 清洗与扫描（p7_clean_scan.py，46/46）
+  复审点名的 24 个不可见字符全清掉；NEL/VT/FF/U+001C–001E/U+2028/2029 变 \n；被它们拆开的 GitHub 令牌仍认得出
+  认出：token: value、全角冒号、JSON "client_secret"、Authorization: Bearer、xoxb、xoxp、AIza、JWT、rk_live、sk_test、ASIA、gho_、ghs_、password:、AppSecret：
+  不误杀：branch:、head: <sha>、session_id: <uuid>、commit 3f2a9c1、status:、key: T-53、accept: …、progress: 80% 等
+  写入口（comment、update_task、REST blockers、create_task、REST :note）422；hooks 提交标题里的 Slack 令牌 st=masked
+  残余（本轮已修）：U+180B–180D、U+180F、U+13430–1343F 等格式控制符修复前不清洗，evil.c<U+180B>om 能当标题写入、能拆开令牌躲过扫描
+## 8 没有缺省令牌（p8_notokens.sh，44/44；8196 上依次起三次服务端）
+  不设 TEAMFLOW_DEV_TOKENS、或格式全错时：旧的 tf_pat_dev_alice/bob 和随机令牌对 REST、hooks、/mcp/ 都 401；/healthz 200
+  启动时 stderr 一行提示，不含令牌；显式配置时只有配置的令牌 200，旧缺省令牌和没配的令牌 401，不打印提示

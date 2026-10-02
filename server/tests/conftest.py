@@ -96,9 +96,9 @@ def page(svc: Service, oid: str) -> dict[str, Any]:
 
 
 def vs(svc: Service, oid: str, *, seq: bool = False) -> dict[str, Any]:
-    """human_* 需要的版本参数（页面上看到的当前值）。"""
+    """human_* 需要的页面参数（页面上看到的当前值）：v、sha、through，任务接受再加 seq。"""
     p = svc.page_view(oid)
-    out = {"v": p["v"], "sha": p["sha"]}
+    out = {"v": p["v"], "sha": p["sha"], "through": p["through"]}
     if seq:
         out["seq"] = p["seq"]
     return out

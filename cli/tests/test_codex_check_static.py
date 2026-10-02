@@ -95,3 +95,35 @@ def test_duplicate_groups_fail(tmp_path):
     r = rows["Stop 只有一组 teamflow hook"]
     assert r["ok"] is False and "有 2 组" in r["detail"], r
     assert rows["SessionStart 只有一组 teamflow hook"]["ok"] is True
+
+
+def test_mixed_group_and_placeholder_pass(tmp_path):
+    """复审新问题 3：setup 不拆别人的组，teamflow 的 handler 可能和别人的同组，前面也可能有删空留下的占位组；
+    自检只要求整个事件里只有一条 teamflow handler，并按它真实的组序号、handler 序号去找信任状态。"""
+    hj_path = _setup(tmp_path)
+    hj = json.loads(hj_path.read_text(encoding="utf-8"))
+    for i, ev in enumerate(EVENTS):
+        ours = hj["hooks"][ev][0]["hooks"][0]
+        hj["hooks"][ev] = [{"hooks": []}, {"hooks": [_foreign_group(i)["hooks"][0], ours]}]
+    hj_path.write_text(json.dumps(hj), encoding="utf-8")
+    _setup(tmp_path)  # 重跑：只更新我们那一条，不拆组、不去掉占位
+
+    hj2 = json.loads(hj_path.read_text(encoding="utf-8"))
+    assert [len(g["hooks"]) for g in hj2["hooks"]["Stop"]] == [0, 2]
+    rows, _ = _static(tmp_path, tmp_path / "out")
+    for ev in EVENTS:
+        r = rows["%s 只有一组 teamflow hook" % ev]
+        assert r["ok"] is True and "第 2/2 组" in r["detail"] and "是第 2 条" in r["detail"], r
+    data = json.loads((tmp_path / "out" / "static.json").read_text(encoding="utf-8"))
+    assert data["trust"]["Stop"]["key"].endswith(":stop:1:1")  # Codex 的信任键：组序号 1、handler 序号 1
+
+
+def test_same_group_duplicate_handlers_fail(tmp_path):
+    hj_path = _setup(tmp_path)
+    hj = json.loads(hj_path.read_text(encoding="utf-8"))
+    h = hj["hooks"]["Stop"][0]["hooks"][0]
+    hj["hooks"]["Stop"][0]["hooks"] = [h, dict(h)]
+    hj_path.write_text(json.dumps(hj), encoding="utf-8")
+    rows, _ = _static(tmp_path, tmp_path / "out")
+    r = rows["Stop 只有一组 teamflow hook"]
+    assert r["ok"] is False and "第 1 组里有 2 条" in r["detail"], r

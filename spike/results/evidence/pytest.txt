@@ -1,5 +1,11 @@
-# 本轮验证的 pytest 结果（重新 uv pip install -e server -e cli 之后）
+# pytest 结果（每次都先重新 uv pip install -e server -e cli）
+## 第一轮修复后（评审 B1、I1–I7、m1–m7），端口 8194 那一轮
 $ .venv/bin/pytest -q server cli
   382 passed in 69.59s (0:01:09)
-$ .venv/bin/pytest -q server cli（本轮加入 cli/tests/test_codex_check_static.py 之后）
+$ .venv/bin/pytest -q server cli（加入 cli/tests/test_codex_check_static.py 之后）
   385 passed in 70.40s (0:01:10)
+## 第二轮修复后（复审新问题 1–8），最终验证（2026-10-02，端口 8196）
+$ .venv/bin/pytest -q server cli
+  621 passed in 78.01s (0:01:18)        # server 408，cli 213
+$ .venv/bin/pytest -q server cli（第三轮两处小修：清洗去掉全部格式控制符 Cf 与蒙古文变体选择符；CLI 按字节切批）
+  642 passed in 79.51s (0:01:19)        # server 426（+18，test_sanitize.py），cli 216（+3，test_cli_spool.py）

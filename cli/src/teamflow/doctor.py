@@ -71,19 +71,30 @@ def _handler_cmd(h):
 
 
 def _check_group(r: Report, who: str, event: str, arr, want: dict, fix: str):
-    """检查「存在且命令串一致」；不要求在数组末尾（setup 原地替换，不挪位置）。"""
+    """检查「只有一条 teamflow handler、命令串一致」；不要求在数组末尾，也允许和别人的 handler 同组
+    （setup 原地更新，不挪动也不拆开别人的组，见 setup_cmd._merge_event）。"""
     arr = arr if isinstance(arr, list) else []
-    ours = [g for g in arr if setup_cmd._is_teamflow_group(g)]
+    hits = [(gi, h) for gi, g in enumerate(arr) for h in (setup_cmd._handlers(g) or [])
+            if setup_cmd._is_teamflow_handler(h)]
     name = "%s %s hook" % (who, event)
-    if not ours:
+    if not hits:
         r.fail(name, "没有 teamflow 的 hook；" + fix)
         return
-    if len(ours) > 1:
-        r.fail(name, "有 %d 组 teamflow hook，会重复执行；%s" % (len(ours), fix))
+    groups = sorted({gi for gi, _ in hits})
+    if len(groups) > 1:
+        r.fail(name, "有 %d 组 teamflow hook，会重复执行；%s（setup 删不掉的会提示手动处理）" % (len(groups), fix))
         return
-    have = [_handler_cmd(h) for h in ours[0].get("hooks") or []]
-    if have != [_handler_cmd(h) for h in want["hooks"]]:
+    if len(hits) > 1:
+        r.fail(name, "同一组里有 %d 条 teamflow hook，会重复执行；%s" % (len(hits), fix))
+        return
+    gi, h = hits[0]
+    if _handler_cmd(h) != _handler_cmd(want["hooks"][0]):
         r.fail(name + " 命令串", "与本机安装不一致；" + fix)
+        return
+    if event in setup_cmd.MATCHER_EVENTS and \
+            setup_cmd._norm_matcher(arr[gi].get("matcher")) != setup_cmd._norm_matcher(want.get("matcher")):
+        r.fail(name + " matcher", "所在的第 %d 组 matcher 是 %r，应为 %r；teamflow 的 hook 和别人的在同一组时，setup 不改"
+               "组的 matcher，请手动把它移到单独的一组" % (gi + 1, arr[gi].get("matcher"), want.get("matcher")))
         return
     r.ok(name)
 

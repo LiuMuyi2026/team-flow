@@ -8,16 +8,18 @@ from teamflow import common
 
 
 def run(client: str, cred: str) -> int:
-    from teamflow import inbox, net, spool
+    from teamflow import board_cmd, inbox, net, spool
 
     try:
-        creds = common.load_creds(cred)
+        try:
+            creds = common.load_creds(cred)
+        except common.CredError as e:
+            raise board_cmd.CredFileError(str(e)) from None
         slug, ws = common.select_workspace(creds, os.getcwd())
         token = common.token_for(ws, client)
         base = common.api_base(ws)
     except common.CredError as e:
-        sys.stderr.write("teamflow inbox：%s\n" % e)
-        return 1
+        return board_cmd._cred_fail("inbox", e, False, cred, client)
     data, cached_at = None, None
     try:
         status, _, raw = net.request(

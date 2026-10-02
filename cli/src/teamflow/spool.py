@@ -5,6 +5,8 @@
 - 已成功上传的键留一个空的 sent/<key> 标记 8 天，防止同一事件被重新写入后再发一遍。
 - flush 用 O_EXCL 创建的锁文件保证同一时间只有一个上传者。
 - 5xx、429、408、网络错误：指数退避 5 秒到 5 分钟；其他 4xx：移进 dead/，不再重试。
+- 一批最多 BATCH_MAX 条、编码后不超过 BATCH_BYTES：服务端和 nginx 的请求体上限都是 64KB，超了整批 413。
+  万一还是 413（服务端上限更小），对半拆开重发；只有单条就超限的才进 dead/。
 - 心跳类记录 24 小时后丢弃，提交类记录保留 7 天。
 """
 
@@ -14,6 +16,7 @@ import time
 from teamflow import common
 
 BATCH_MAX = 100
+BATCH_BYTES = 60 * 1024  # 服务端 /api/* 与 nginx 的请求体上限是 64KB，留出 {"v":1,"items":[]} 和余量
 BACKOFF_MIN = 5
 BACKOFF_MAX = 300
 HEARTBEAT_TTL = 24 * 3600
@@ -190,6 +193,22 @@ def _expired(rec, now) -> bool:
     return now - float(rec.get("created") or 0) > ttl
 
 
+def _chunks(entries, max_items=BATCH_MAX, max_bytes=BATCH_BYTES):
+    """按条数和编码后的字节数切批（M0 第三轮复审：100 条带长提交标题的条目能到 90KB，整批 413 后全进 dead/）。
+    单条就超过 max_bytes 的自成一批，由服务端判定（413 就进 dead/）。"""
+    out, cur, size = [], [], 0
+    for e in entries:
+        n = len(common.dumps(e[1].get("item")).encode("utf-8")) + 1
+        if cur and (len(cur) >= max_items or size + n > max_bytes):
+            out.append(cur)
+            cur, size = [], 0
+        cur.append(e)
+        size += n
+    if cur:
+        out.append(cur)
+    return out
+
+
 def _send_group(d, cred, ws_slug, client, entries, now):
     """entries: [(path, rec)]，同一个 (凭据, workspace, client)。"""
     from teamflow import net
@@ -205,8 +224,9 @@ def _send_group(d, cred, ws_slug, client, entries, now):
         for path, _ in entries:
             _move(path, os.path.join(d, "dead"), "cred: %s" % e)
         return
-    for i in range(0, len(entries), BATCH_MAX):
-        chunk = entries[i : i + BATCH_MAX]
+    queue = _chunks(entries)
+    while queue:
+        chunk = queue.pop(0)
         keys = [rec["key"] for _, rec in chunk]
         batch_key = idem_key(client, ws_slug, "batch", ",".join(sorted(keys)))
         body = {"v": 1, "items": [rec["item"] for _, rec in chunk]}
@@ -225,6 +245,10 @@ def _send_group(d, cred, ws_slug, client, entries, now):
         if status >= 500 or status in RETRYABLE:
             for path, rec in chunk:
                 _retry(path, rec, now, "http %d" % status)
+            continue
+        if status == 413 and len(chunk) > 1:  # 服务端上限比我们估的小：对半拆开重发，不整批丢
+            mid = len(chunk) // 2
+            queue[:0] = [chunk[:mid], chunk[mid:]]
             continue
         if not 200 <= status < 300:
             for path, _ in chunk:
