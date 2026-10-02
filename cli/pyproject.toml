@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "teamflow"
+version = "0.1.0"
+description = "Team Flow 命令行：Claude Code / Codex 的 hook 执行体、MCP 凭据 helper 和兜底命令"
+requires-python = ">=3.11"
+readme = "README.md"
+# hook、mcp-headers、flush 三条快速路径只用标准库；tomlkit 只在 setup 写 Codex config.toml 时按需导入。
+dependencies = ["tomlkit>=0.13"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+teamflow = "teamflow.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/teamflow"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
