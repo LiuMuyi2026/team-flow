@@ -30,6 +30,7 @@ class Stub:
         self.status = {}  # path → 强制返回的状态码
         self.reply = {}  # path → (状态码, 响应体对象或 bytes)：完全自定义响应
         self.item_status = {}  # spool key → 逐条状态码
+        self.item_extra = {}  # spool key → 逐条结果里多给的字段（如 {"st": "no_repo", "dropped": 1}）
         self.max_body = None  # 请求体字节数上限（模拟服务端/nginx 的 64KB）：超了返回 413
         self.requests = []
         self.etag = "W/\"1\""
@@ -102,7 +103,8 @@ class Stub:
                     return self._send(200, stub.inbox)
                 if method == "POST" and path == "/api/v1/hooks/batch":
                     items = (body or {}).get("items") or []
-                    res = [{"key": it.get("key"), "status": stub.item_status.get(it.get("key"), 200)} for it in items]
+                    res = [{"key": it.get("key"), "status": stub.item_status.get(it.get("key"), 200),
+                            **stub.item_extra.get(it.get("key"), {})} for it in items]
                     return self._send(200, {"results": res})
                 if method == "GET" and path == "/api/v1/me/delta":
                     if self.headers.get("If-None-Match") == stub.etag:

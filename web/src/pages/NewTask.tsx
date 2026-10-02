@@ -22,6 +22,8 @@ export function NewTask() {
 
   const others = me.members.filter((m) => m.h !== me.me);
   const titleMissing = !title.trim();
+  // 改了标题或内容，上一次提交的错误提示（比如疑似密钥被拦下）就不再说的是现在这段话：收起来，免得以为还被拦着
+  const clearError = () => setMsg((m) => (m && m.kind === "error" ? null : m));
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -50,7 +52,7 @@ export function NewTask() {
       ? "留空就是待认领：谁都可以认领。"
       : assignee === me.me
         ? "指派给您自己：直接进入待开始。"
-        : `指派给 ${assignee}：对方会收到微信，要对方接受后才算数。`;
+        : `指派给 ${assignee}：对方会收到通知，要对方接受后才算数。`;
 
   return (
     <form className="page form" onSubmit={(e) => void submit(e)} noValidate>
@@ -64,7 +66,10 @@ export function NewTask() {
         type="text"
         value={title}
         maxLength={TITLE_MAX}
-        onChange={(e) => setTitle(e.target.value)}
+        onChange={(e) => {
+          setTitle(e.target.value);
+          clearError();
+        }}
         placeholder="一句话说清楚要做什么"
         aria-invalid={tried && titleMissing ? true : undefined}
         autoComplete="off"
@@ -74,7 +79,17 @@ export function NewTask() {
       <label className="field-label" htmlFor="f-body">
         内容（选填）
       </label>
-      <textarea id="f-body" rows={6} value={body} maxLength={BODY_MAX} onChange={(e) => setBody(e.target.value)} placeholder="背景、要求、链接，想到什么写什么" />
+      <textarea
+        id="f-body"
+        rows={6}
+        value={body}
+        maxLength={BODY_MAX}
+        onChange={(e) => {
+          setBody(e.target.value);
+          clearError();
+        }}
+        placeholder="背景、要求、链接，想到什么写什么"
+      />
       <p className="hint">
         对方接受或认领后，对方的 agent 能读到这段内容。不要写密钥、token 和个人信息，写了会被拦下。
         {body.length > BODY_MAX - 300 ? ` 还能写 ${BODY_MAX - body.length} 字。` : ""}
@@ -109,7 +124,7 @@ export function NewTask() {
       <label className="check">
         <input type="checkbox" checked={urgent} onChange={(e) => setUrgent(e.target.checked)} /> 紧急
       </label>
-      <p className="hint">标了紧急，对方在免打扰时间也会收到微信。请只在真着急时用。</p>
+      <p className="hint">标了紧急，对方在免打扰时间也会收到通知。请只在真着急时用。</p>
 
       <div className="btn-row">
         <button type="submit" className="btn btn-primary" disabled={busy}>

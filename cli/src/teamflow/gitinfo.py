@@ -109,6 +109,13 @@ def head(cwd: str, timeout: float = GIT_TIMEOUT):
     return None
 
 
+def toplevel(cwd: str, timeout: float = GIT_TIMEOUT):
+    """仓库根目录（只在本机用：按仓库记"没被服务端记下的提交"提醒，不上传）。"""
+    out = run(cwd, ["rev-parse", "--show-toplevel"], timeout)
+    s = out.strip() if out else ""
+    return s if s and os.path.isabs(s) else None
+
+
 def user_email(cwd: str, timeout: float = GIT_TIMEOUT):
     out = run(cwd, ["config", "--get", "user.email"], timeout)
     return out.strip().lower() if out and out.strip() else None

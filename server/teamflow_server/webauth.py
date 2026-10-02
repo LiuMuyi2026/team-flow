@@ -1,4 +1,4 @@
-"""网页的人类会话（M0：只有本地开发模式的登录能发；M1 换成手机微信 H5 会话）。
+"""网页的人类会话（M0：只有本地开发模式的登录能发；M1 换成通行密钥登录的会话，plan D54）。
 
 - 会话 cookie ``tf_web``：HttpOnly、SameSite=Strict、Path=/、12 小时；https 时另加 Secure（本机 http 试用不加，
   浏览器不给 http://127.0.0.1 存 Secure cookie 的情况各家不一）。服务端只存会话 ID 的 sha256，数据只在内存里，
@@ -49,7 +49,7 @@ class WebSession:
     csrf: str
     created: float
     expires: float
-    via: str = "dev"  # 本地开发登录发的。M1 的微信 H5 会话另有来源
+    via: str = "dev"  # 本地开发登录发的。M1 通行密钥登录的会话另有来源
 
 
 class WebSessions:

@@ -93,7 +93,7 @@ def fault_delay_ms() -> int:
 
 
 def dev_endpoints_enabled() -> bool:
-    """DEV ONLY 端点（模拟"人在手机上操作"）。默认关闭，只在 TEAMFLOW_DEV_ENDPOINTS=1 时打开；M1 上线前整组删除。"""
+    """DEV ONLY 端点（模拟"本人在网页上操作"）。默认关闭，只在 TEAMFLOW_DEV_ENDPOINTS=1 时打开；M1 上线前整组删除。"""
     return os.environ.get("TEAMFLOW_DEV_ENDPOINTS", "0").strip().lower() in ("1", "true", "yes")
 
 

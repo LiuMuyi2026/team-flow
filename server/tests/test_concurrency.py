@@ -61,7 +61,7 @@ async def test_http_concurrent_human_claims(client, svc):
 
 
 async def test_http_concurrent_agent_vs_human(client, svc):
-    """alice 的 agent 认领自己发布的 T-53，同时 bob 在手机上认领：只有一个成功。"""
+    """alice 的 agent 认领自己发布的 T-53，同时 bob 在网页上认领：只有一个成功。"""
 
     async def agent_claim():
         return await client.post("/api/v1/tasks/T-53:claim", headers={"authorization": f"Bearer {ALICE}"})

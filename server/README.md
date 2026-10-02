@@ -32,7 +32,7 @@ python spike/smoke_mcp.py --base http://127.0.0.1:8100 --token "$TF_A"   # 两�
 | `TEAMFLOW_ALLOWED_ORIGINS` | 空 | `/mcp/` 上允许的 Origin |
 | `TEAMFLOW_MCP_JSON_RESPONSE` | `1` | MCP 响应用 JSON（`0` 用 SSE） |
 
-## DEV ONLY 端点（模拟"人在手机微信里操作"，M1 上线前整组删除）
+## DEV ONLY 端点（模拟"本人在网页上操作"，M1 上线前整组删除）
 
 - 默认关闭。要用时同时设置 `TEAMFLOW_DEV_ENDPOINTS=1` 和一个随机的 `TEAMFLOW_DEV_SECRET`，请求带
   `X-Teamflow-Dev-Secret: <密钥>` 和 `X-Teamflow-Dev-Human: <handle>`。开关没开、没配密钥、密钥不对，一律 404
@@ -49,11 +49,12 @@ python spike/smoke_mcp.py --base http://127.0.0.1:8100 --token "$TF_A"   # 两�
     `through` 超过当前最大事件 ID 也是 400 `invalid`（与转发一致）。
   - `through` 不再缺省为"本次动作的事件 ID"：页面渲染之后、点按钮之前对方 agent 写的评论编号比 `through` 大，
     不算本人看过，接受、认领、帮忙之后仍然不放给本人的 agent，要本人重新打开页面再转发（复审新问题 1）。
-  - 「转发」只推进"已看到的动态位置"，绝不授予或升级正文可见性：没接受过正文的人转发之后，agent 拿到的正文仍是 withheld。
+  - 「转发」只推进"已看到的动态位置"，绝不授予或升级正文可见性：没接受过正文的人转发之后，agent 拿到的正文仍是 `withheld: "not_accepted"`。
 
 ## 本地试用：网页登录与网页 API
 
-在自己电脑上试用整套东西时，浏览器扮演"手机上的人"（接受、拒绝、认领、转发、帮忙这些只有人能做的动作）。
+在自己电脑上试用整套东西时，浏览器以成员本人的身份登录，做接受、拒绝、认领、转发、帮忙这些只有人能做的动作
+（正式版用通行密钥登录、每个动作再验证一次，plan D54、D55；本地试用用一次性登录码代替）。
 接口说明给前端看的在 `docs/web-api.md`；代码在 `web.py`（路由）、`webauth.py`（会话、CSRF、本地入口的门）、
 `devlogin.py`（一次性登录码，只用标准库）。
 
@@ -90,6 +91,10 @@ python -m teamflow_server.devlogin --as bob [--open] [--ttl 10] [--host 127.0.0.
 `X-CSRF-Token` 同时等于 `tf_csrf` cookie 和会话里记的值，否则 403 `csrf`。网页 API 带 `Authorization`（任何值）
 一律 403 `human_only`；网页 cookie 也调不了 PAT 接口（那边只认 Bearer）。
 
+**模拟通知**：`GET /api/v1/web/notifications`（2026-10-02 前叫 `/wechat`）读 outbox 里发给本人的通知。正式版按各人
+选的渠道（邮件或微信）发出，只做提醒。`GET /api/v1/web/me` 的成员带 `agent: true` 表示有令牌（本地试用里就是您和
+模拟的队友），网页「我」页"换成队友"的例子从这些人里挑。
+
 **网页 API 复用 service，不复制规则**：会话变成 `Actor(handle, "human", via="web")`，调 `human_accept`、
 `human_claim`、`human_forward`、`human_help`、`human_ask`，以及这次新加的 `human_decline`（plan 5.3：seq 和原因必填，
 退回发布人"待开始"，通知"li 没接 T-52"）、`human_release`（plan 5.2：可选放回待认领，assign_seq 加 1）；开始、完成、
@@ -104,7 +109,7 @@ CSP `script-src 'self'`、`style-src 'self'`、`frame-ancestors 'none'`，`Refer
 `web/`（Vite + React + TypeScript），改了要在 `web/` 里 `npm run build` 重新生成 `web_dist/`，见 `web/README.md`。
 注意不用 plan 7.2 写的 `no-referrer`：那样浏览器给同源的 POST 发 `Origin: null`（Fetch 规范），写请求的 Origin 校验
 就过不去；`same-origin` 同样不把地址带给别的站。服务端在 Origin 缺失或为 `null` 时只认 `Sec-Fetch-Site: same-origin`
-兜底。M1 的微信 H5 落地页要按这一条改 plan。
+兜底。M1 的正式网页同样按这一条处理（plan 7.2 写的 `no-referrer` 要改）。
 
 **残余风险**（本地试用接受，正式版没有这些入口）：
 - 同一系统用户的进程（包括您的 agent）能读服务端的 stderr（如果服务端是 agent 替您启动的，登录链接就在它的输出里）、
@@ -113,7 +118,8 @@ CSP `script-src 'self'`、`style-src 'self'`、`frame-ancestors 'none'`，`Refer
 - uvicorn 的访问日志会打出带查询串的路径（`/dev/login?code=…`）；码用过即失效，但还是建议加 `--no-access-log`。
   Team Flow 自己的观测日志只记路径，不记查询串、请求体和 cookie。
 - 本地 http 试用不带 Secure；会话 cookie 对同一主机的其他端口也会发送（cookie 不按端口隔离）。
-- 本地试用不校验 UA 含 MicroMessenger（plan 4.4 正式版的要求），电脑浏览器就能做人类动作——这正是本地试用的目的。
+- 本地试用不做通行密钥断言（正式版每个人类动作都要一次，在电脑上确认的放行类动作 10 分钟后才对 agent 生效，
+  plan D54、D55），有登录会话就能做人类动作——这正是本地试用的目的。
 
 ## agent 写的标题（plan 5.1 闸门表、I6）
 
@@ -145,8 +151,63 @@ CSP `script-src 'self'`、`style-src 'self'`、`frame-ancestors 'none'`，`Refer
 
 所有 REST 错误都是 `{"error": "<code>", "message": "...", ...}`（可能附带 `id`、`by`、`rule`、`pos` 等结构化字段），
 包括请求体校验失败（422 `invalid`）、请求体超过 64KB（413 `too_large`，网关在鉴权之后、交给路由之前判定）
-和路由级 404/405。MCP 的 isError 结果里 structuredContent 仍是短键
-`{"err", "msg", ...}`，content 文本以错误码开头（`needs_human：已发到您的微信……`）。
+和路由级 404/405（路由级 404 另带 `no_route: true`，表示没有这个接口，不是没有这一项）。MCP 的 isError 结果里 structuredContent 仍是短键
+`{"err", "msg", ...}`，content 文本以错误码开头（`needs_human：T-51 是 bob 发布的……已通知您，请在 Team Flow 网页上……`）。
+
+## agent 看到的文字不提通知渠道（2026-10-02）
+
+依据 plan D54、D55、D60、D61：人的身份和确认在 Team Flow 网页上（正式版用通行密钥），电脑上也能确认 T1 动作；
+微信只是可选的通知渠道，默认邮件，通知只做提醒。所以 agent 能看到的文字一律不提"微信""手机"：
+
+- server instructions、工具描述（仍是常量，硬规则 4）。规则部分三条（底稿是 plan 6.3，按 2026-10-02 评审改过，
+  plan 的草稿待同步）：
+  - "不替用户操作"单列一条，覆盖 `needs_*`、`withheld`、`human_only`：接受、拒绝、认领、帮忙、转发、确认只能由用户本人做，
+    不要自己打开或操作 Team Flow 网页（网页就在 agent 所在的电脑上，浏览器自动化共享登录态就能点），也不要请用户做通行密钥
+    验证（指纹、面容、设备密码或 PIN 都算）。
+  - `needs_human`、`needs_accept`、`human_only`："照结果里的说明转告用户……结果里没写已通知，就不要说已通知"。
+  - `withheld` 单列一条、按值说："读取不会通知任何人"；`not_accepted`、`peer_agent_text` 要本人接受、认领或转发；
+    `pending_effect`（D55 的 10 分钟等待期，M1 才有，`service.WITHHELD_PENDING_EFFECT` 先占位）是用户已经确认过，
+    照结果里的时间说几点起能读到，不要请他再确认一次。
+- 错误说明：`needs_human` 是"已通知您，请在 Team Flow 网页上打开 T-xx 点「认领」"（这次调用确实发了 agent_asks 通知）；
+  `needs_accept` 只说"需要您本人在 Team Flow 网页上……「接受」"，不说已通知；`human_only` 是"这个操作只能由本人在
+  Team Flow 网页上完成……请转告用户本人操作，不要替用户打开网页"（`service.HUMAN_ONLY_MSG`，REST 和 service 共用）。
+- 不承诺网页上没有的按钮：本地试用版的网页没有编辑、取消任务、重新打开（plan 437 行列为正式版的 T1），
+  这三处错误说明写"请转告用户本人处理（本地试用版的网页还没有……按钮）"，不再写"请用户本人在 Team Flow 网页上编辑/操作"。
+- 测试：`tests/test_rules.py` 的 `test_agent_visible_text_does_not_name_a_channel`（含上面两条独立规则）和
+  `test_agent_texts_only_point_to_buttons_the_web_has`（「」里的按钮网页上都要有）；`spike/smoke_mcp.py` 断言两代协议
+  拿到的 instructions 不提渠道、withheld 那条在。
+
+**扣留原因改名**：`get_item` 的 `withheld` 原来是 `"needs_accept"`，和 `claim_task` 的错误码同名；本地试用里 Claude
+读到它就照 instructions 里按错误码下的那条说"已发到您的微信"，其实读取什么都没发。现在是：
+
+| 位置 | 旧值 | 新值 |
+|---|---|---|
+| `get_item` 的 `withheld`（正文、困难详情，以及本人还读不到的人写的评论） | `needs_accept` | `not_accepted`（`service.WITHHELD_NOT_ACCEPTED`） |
+| 网页详情的 `agent.content` | `needs_accept` | `not_accepted`（同一个常量） |
+| 别人的 agent 写的、还没转发的文字 | `peer_agent_text` | 不变 |
+
+错误码 `needs_accept`（409，开始、完成前要先接受）不变。扣留原因不和任何错误码同名，测试里断言了
+（`test_withheld_reason_is_not_an_error_code_and_reading_sends_nothing`，读取也不往 outbox 写任何通知）。
+plan 5.1 闸门表里的 `withheld:"needs_accept"` 要跟着改成 `not_accepted`。
+
+## hooks 上报的提交：认不出仓库时明确告知（2026-10-02）
+
+服务端按 `repo`（CLI 读的 `origin` 地址，去掉凭据）认提交属于哪个仓库。本地试用发现：演示仓库没有 `origin` 时，
+`turn_end` 里的提交被悄悄丢掉，逐条结果还是 200 `ok`。现在：
+
+- `turn_end` / `start` 带了提交却没有 `repo`：会话照常登记，提交一条不记，逐条结果是
+  `{"key", "status": 200, "st": "no_repo", "dropped": <没记下的提交数>}`，另写审计 `hook.commits_no_repo`。
+  200 是因为心跳本身送到了，CLI 不该把它放进 dead-letter 或重试；`st` 是给 CLI 认的枚举。
+- 旧写法的 `commit` 条目：仍是 422 `bad`，`err` 分成 `repo` 和 `sha`（原来是 `sha_or_repo`）。
+- `dropped` 包括 `own_more`（CLI 只发前 5 条，另外的本人提交只给条数，没有 `repo` 时同样没记），范围 1–1000 才算。
+- 重放：第一次的响应在路上丢了、CLI 重试时，逐条结果是 409 `st: "dup"`，并带回第一次的 `was: "no_repo"` 和 `dropped`
+  （幂等键表里只给 no_repo 这一种结果多存这两个字段）。原来 409 什么都不带，CLI 当成功，提醒又被悄悄吞掉。
+- 提交 sha 认 7–64 位十六进制（SHA-256 仓库是 64 位，CLI 的 gitinfo 本来就认）。
+- CLI：spool 收到 `no_repo`（或 409 带 `was: "no_repo"`；旧服务端不带时，没有 `repo` 的提交按没记处理）就在状态目录的
+  `notices/unrecorded.json` 按仓库根目录记条数、时间（不记提交标题，目录只在本机），`teamflow doctor` 逐个仓库报出来和修法；
+  同一个仓库之后带着地址的提交上报成功，只清这个仓库的那一项。Stop hook 有提交要报、会话开始时又没读到 `origin` 时，
+  会再读一次，会话中途补上的 `origin` 当场生效；但补上的 `origin` 按 `repo_patterns` 属于另一个 workspace 时，这一回合的
+  提交整条不发（不发给会话开始时钉住的那个 workspace），记本地提醒，doctor 请用户重开会话。
 
 CLI 兜底命令（MCP 不可用时）用这三个端点，鉴权同其他 REST（`Authorization: Bearer tf_pat_…` + `X-Teamflow-Client`），
 支持 `Idempotency-Key`：

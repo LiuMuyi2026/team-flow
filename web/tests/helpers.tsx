@@ -46,7 +46,7 @@ export function task(over: Partial<TaskItem> = {}): TaskItem {
       },
     ],
     page: { id: "T-52", v, sha: `sha-v${v}`, through: 9, seq: 1 },
-    agent: { content: "needs_accept", through: 0, unforwarded: 1 },
+    agent: { content: "not_accepted", through: 0, unforwarded: 1 },
     created: "2026-10-02T22:42:47+08:00",
     can: ["accept", "decline", "forward", "comment"],
     path: "/task?w=team&id=T-52",

@@ -152,6 +152,20 @@ class Raw:
         return self._id
 
 
+def instructions_ok(text: str | None) -> bool:
+    """instructions 不提具体通知渠道（微信只是可选通知渠道，人的确认在 Team Flow 网页上，plan D54、D55、D61），
+    并且单列一条：读到 withheld 时不能说已经通知了用户（读取不会通知任何人）。"""
+    text = text or ""
+    withheld = [line for line in text.splitlines() if "withheld" in line]
+    return (
+        "微信" not in text
+        and "手机" not in text
+        and "Team Flow 网页" in text
+        and len(withheld) == 1
+        and "读取不会通知任何人" in withheld[0]
+    )
+
+
 async def legacy_flow(raw: Raw, rep: Report, url: str, version: str = "2025-06-18") -> list[dict[str, Any]] | None:
     tag = f"legacy[{version}] {url}"
     base_h = {"accept": ACCEPT, "content-type": "application/json", "authorization": f"Bearer {raw.token}"}
@@ -161,6 +175,7 @@ async def legacy_flow(raw: Raw, rep: Report, url: str, version: str = "2025-06-1
     rep.check(f"{tag} initialize 200", r.status_code == 200, r.status_code)
     rep.check(f"{tag} initialize protocolVersion", res.get("protocolVersion") == version, res.get("protocolVersion"))
     rep.check(f"{tag} instructions present", bool(res.get("instructions")), len(res.get("instructions") or ""))
+    rep.check(f"{tag} instructions channel-neutral", instructions_ok(res.get("instructions")), len(res.get("instructions") or ""))
     sid = r.headers.get("mcp-session-id")
     rep.check(f"{tag} stateless (no Mcp-Session-Id)", sid is None, sid)
     caps = res.get("capabilities")
@@ -206,6 +221,7 @@ async def modern_flow(raw: Raw, rep: Report, url: str) -> list[dict[str, Any]] |
     rep.check(f"{tag} discover supportedVersions lists legacy too", LEGACY_VERSIONS <= set(res.get("supportedVersions") or []), res.get("supportedVersions"))
     rep.check(f"{tag} discover capabilities only tools", res.get("capabilities") == {"tools": {}}, res.get("capabilities"))
     rep.check(f"{tag} discover instructions present", bool(res.get("instructions")), len(res.get("instructions") or ""))
+    rep.check(f"{tag} discover instructions channel-neutral", instructions_ok(res.get("instructions")), len(res.get("instructions") or ""))
     rep.check(f"{tag} no Mcp-Session-Id", r.headers.get("mcp-session-id") is None, r.headers.get("mcp-session-id"))
     r = await raw.post(tag, url, {"jsonrpc": "2.0", "id": raw.nid(), "method": "tools/list", "params": {"_meta": modern_meta()}}, hdr("tools/list"))
     res = ((parse_body(r) or {}).get("result")) or {}
@@ -374,6 +390,9 @@ async def dev_through_flow(raw: Raw, rep: Report, base: str, peer_token: str, se
     )
     if r.status_code != 200:
         return
+    res = await modern_call(c, mcp, peer_token, "get_item", {"id": "T-52"})
+    held = (res.get("structuredContent") or {}).get("withheld")
+    rep.check("before accept bob's agent gets withheld=not_accepted (not an error code)", held == "not_accepted", held)
     late = "smoke：页面渲染之后才写的评论"
     res = await modern_call(c, mcp, raw.token, "comment", {"target": "T-52", "body": late})
     rep.check("alice's agent comments on T-52 after bob's page rendered", res.get("isError") is False, res.get("structuredContent"))

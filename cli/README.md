@@ -25,7 +25,7 @@ uv pip install --python .venv/bin/python -e cli     # 开发
 | `teamflow claude-flags [--home d] [--quoted]` | 给 `claude --bare -p $(teamflow claude-flags)` 用 |
 | `teamflow setup --home <d> [--dry-run] [--no-hardening] [--bin p] [--cred p]` | 写两端的 hooks 与 MCP 配置（Claude Code 5 个 hook，比 Codex 多一个 PostToolUse；Codex 4 个）；实验和测试必须用临时目录。已有 teamflow 的 hook 就原地更新、没有才追加一组到末尾；绝不删除、挪动别人的组和 handler（Codex 信任键带组序号和 handler 序号）：和别人同组时只换我们那一条，重复的只删不影响别人序号的那些，删空的组留 `{"hooks": []}` 占位，删不了的打印「注意」。`--dry-run` 不打印整份文件，只列 teamflow 相关键的改动前→改动后，并遮蔽一切像密钥、token、邮箱的值（`redact.py`） |
 | `teamflow setup --isolated <绝对路径> [--bin p] [--api-url u] [--workspace w] [--no-hardening] [--dry-run]` | 本地试用（`scripts/local-up.sh` 用）：全部写进这个目录，一个字节都不写 HOME。`claude/settings.json`（5 个 hook，给 `claude --settings`）、`claude/mcp.json`（给 `--mcp-config`，配合 `--strict-mcp-config`）、`codex/config.toml` 与 `codex/hooks.json`（这个目录就是试用时的 `CODEX_HOME`）、`credentials.json`（0600）、`bin/teamflow`（sh 包装：把 `TEAMFLOW_STATE_DIR` 固定为 `<dir>/cli-state` 再 exec `--bin` 指的真正 teamflow）。hook 和 helper 的命令串规则不变（`<bin> hook <事件> --client … --cred <绝对路径>`），只是 bin 换成包装；状态目录写在包装里，因为 Codex 运行 helper 前清空环境、命令串又不能多加参数。不能和 `--home`、`--cred` 同用。合并规则同上：重跑逐字节不变，Codex 写进 `config.toml` 的信任记录保留 |
-| `teamflow doctor --home <d>` | 基础检查：hook 组「存在且命令串一致」（不要求在末尾；Claude Code 查 5 个、Codex 查 4 个；SessionStart、SessionEnd、PostToolUse 还查所在组的 matcher；teamflow 的 handler 设了 `async` / `asyncRewake` 算失败）；Linux 上 `sandbox.enabled` 为 true 时检查 `bwrap`、`socat`，缺了标失败。`--isolated <dir>` 检查本地试用目录：另查包装脚本和它指向的 teamflow，MCP 查 `<dir>/claude/mcp.json`，spool 查 `<dir>/cli-state`，跑 `codex --version` 时带 `CODEX_HOME=<dir>/codex`（codex 每次启动都会在 `CODEX_HOME/tmp/arg0` 建目录，不带就建到 `~/.codex`） |
+| `teamflow doctor --home <d>` | 基础检查：hook 组「存在且命令串一致」（不要求在末尾；Claude Code 查 5 个、Codex 查 4 个；SessionStart、SessionEnd、PostToolUse 还查所在组的 matcher；teamflow 的 handler 设了 `async` / `asyncRewake` 算失败）；Linux 上 `sandbox.enabled` 为 true 时检查 `bwrap`、`socat`，缺了标失败。另查最近 7 天有没有服务端没记下的提交（仓库没有 `origin` 时，见下方 hooks/batch 的 `no_repo`）。`--isolated <dir>` 检查本地试用目录：另查包装脚本和它指向的 teamflow，MCP 查 `<dir>/claude/mcp.json`，spool 查 `<dir>/cli-state`，跑 `codex --version` 时带 `CODEX_HOME=<dir>/codex`（codex 每次启动都会在 `CODEX_HOME/tmp/arg0` 建目录，不带就建到 `~/.codex`） |
 
 `note` / `done` / `block` 都接受 `--client claude|codex`（默认按环境判断：只有 Codex 的会话变量时用 codex，否则 claude）、
 `--cred`、`--ws`、`--json`。默认输出一两行中文；失败时 stderr 以错误码开头（如 `teamflow note：needs_accept：…`），
@@ -111,6 +111,18 @@ ID `^[TB]-[0-9]{1,6}$`；handle `^[a-z][a-z0-9_]{1,15}$`；`client` ∈ `claude_
 返回 `{"results":[{"key":"…","status":200}]}`。逐条 2xx 或 409（已存在）算成功；5xx/408/425/429 按 5 秒到 5 分钟指数退避；
 其余 4xx 进 dead-letter（`spool/dead/`）。整批非 2xx 同理。同一会话按写入顺序上报：更早的记录还在退避时，同会话后写的
 记录（比如 SessionEnd 的 `end`）等它到期一起发；否则 `end` 先到，服务端会把迟到的 `tool_map` 判成"会话已结束"（403）。
+
+逐条结果 `{"status":200,"st":"no_repo","dropped":N}`：这一回合带了提交，但没有 `repo`（仓库没有 `origin`），服务端登记了
+会话、没记提交（`dropped` 含 `own_more`）。记录照常算成功（不重试、不进 dead-letter），另在状态目录的
+`notices/unrecorded.json` 按仓库根目录记条数和时间（不记提交标题；目录只在本机，spool 记录里的 `dir` 字段不上传）。
+第一次的响应丢了、重试拿到 409 时，服务端带回 `was: "no_repo"` 和 `dropped`；旧服务端不带，没有 `repo` 的提交也按没记处理。
+`teamflow doctor` 逐个仓库报"最近 7 天有 N 个提交没被服务端记下"和修法；已经补上 `origin` 的只给提示。同一个仓库之后带
+`repo` 的提交上报成功，只清这个仓库的那一项，别的仓库的提醒留着。
+
+Stop 有提交要报、会话状态里又没有 `repo` 时，会重新读一次 `origin`，会话中途补上的地址当场生效。但 workspace 是会话开始时
+按 cwd 和当时的 remote 选的：补上的 `origin` 按 `repo_patterns` 属于另一个 workspace 时，这一回合的提交整条不发（sha、标题、
+地址都不发给会话开始时钉住的那个 workspace），会话照常发心跳；doctor 报"请在这个仓库里重开会话"，重开后按新的 remote 选对
+workspace，提交照常上报，提醒消失。
 
 ## 凭据文件
 

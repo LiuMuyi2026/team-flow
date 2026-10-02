@@ -14,6 +14,7 @@
   import-codex-config <源> <目标>     从您平时的 Codex 配置里只读地抄模型、服务商等设置（不抄 MCP 和 hooks）
   codex-trust <config.toml> <hooks.json>  数一数 Codex 已经记录信任的 teamflow hook 条数
   probe-members <me> <mates>          用这些 handle 的一次性令牌在进程里构造一次服务端，打印它的成员，逗号分隔
+  code-fingerprint                    服务端代码和网页构建产物的指纹（local-up.sh 据此判断在跑的服务端是不是旧代码）
 """
 
 from __future__ import annotations
@@ -295,6 +296,33 @@ def probe_members(handles: list[str]) -> list[str]:
         return [m.handle for m in svc.members.values() if getattr(m, "active", True)]
 
 
+def code_fingerprint(root: str = ROOT) -> str:
+    """服务端进程用到的代码：server/teamflow_server 下的 .py（不含 __pycache__）、网页构建产物 web_dist、server/pyproject.toml。
+
+    在跑的服务端是旧代码时（拉了新代码后重跑 local-up.sh），网页从磁盘读到的是新前端，接口和 agent 看到的文字却是旧的，
+    两套说法混在一起（红队 2026-10-02）。local-up.sh 把启动时的指纹记进 .local/local.env，对不上就重启。
+    只看路径和内容，不看修改时间：git checkout 回同一版不算变。"""
+    import hashlib
+
+    h = hashlib.sha256()
+    pkg = os.path.join(root, "server", "teamflow_server")
+    files = [os.path.join(root, "server", "pyproject.toml")]
+    for d, dirs, names in os.walk(pkg):
+        dirs[:] = sorted(x for x in dirs if x != "__pycache__")
+        for n in sorted(names):
+            if n.endswith(".py") or os.path.relpath(d, pkg).split(os.sep)[0] == "web_dist":
+                files.append(os.path.join(d, n))
+    for path in sorted(files):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        h.update(os.path.relpath(path, root).replace(os.sep, "/").encode() + b"\0")
+        h.update(hashlib.sha256(data).digest())
+    return h.hexdigest()[:16]
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -340,6 +368,9 @@ def main(argv: list[str]) -> int:
         return 0
     if cmd == "codex-trust":
         print(codex_trust(args[0], args[1]))
+        return 0
+    if cmd == "code-fingerprint":
+        print(code_fingerprint())
         return 0
     print("未知子命令 %s" % cmd, file=sys.stderr)
     return 2

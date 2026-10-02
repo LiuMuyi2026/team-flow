@@ -1,7 +1,7 @@
 // 网页 API 客户端：只认同源的人类会话 cookie；写请求带 X-CSRF-Token（双提交）。
 // 错误一律变成 ApiError，message 是可以直接给人看的话（docs/web-api.md 第 5 节）。
 
-import type { Home, Item, Me, TaskList, TaskView, Wechat } from "./types";
+import type { Home, Item, Me, Notifications, TaskList, TaskView } from "./types";
 
 const BASE = "/api/v1/web";
 
@@ -60,6 +60,9 @@ function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() ? v : undefined;
 }
 
+export const STALE_SERVER_TEXT =
+  "网页和服务端的版本对不上：代码更新过，在跑的服务端还是旧的。请重新运行 scripts/local-up.sh（会自动重启服务端，看板数据会清空），再刷新页面。";
+
 /** 把服务端的错误变成人话。服务端的 message 本来就是中文，能用就用；几类常见的统一说法。 */
 export function humanMessage(status: number, code: string, body: Record<string, unknown>): string {
   const server = str(body.message);
@@ -67,6 +70,9 @@ export function humanMessage(status: number, code: string, body: Record<string, 
   if (status === 403 && code === "csrf") return "页面已经过期，请刷新后再试。";
   if (status === 403 && code === "human_only") return "这个操作只能由您本人在网页上做。";
   if (status === 403) return server ?? "这个操作您现在不能做。";
+  // 路由级 404（不是"没有这一项"，是"没有这个接口"）：多半是拉了新代码、在跑的服务端还是旧的。
+  // 旧服务端不带 no_route，只有 Starlette 默认的 "Not Found"，两种都认
+  if (status === 404 && (body.no_route === true || body.message === "Not Found")) return STALE_SERVER_TEXT;
   if (status === 404) return "没有找到这一项。可能编号不对，或者服务端刚重启过（重启后数据会清空）。";
   if (status === 409 && code === "conflict") return CONFLICT_TEXT;
   if (status === 409 && code === "taken") return server ?? "已经有人认领了。";
@@ -138,7 +144,7 @@ export const api = {
   },
   task: (id: string) => request<Item>("GET", `/tasks/${encodeURIComponent(id)}`),
   blocker: (id: string) => request<Item>("GET", `/blockers/${encodeURIComponent(id)}`),
-  wechat: (limit = 50) => request<Wechat>("GET", `/wechat?limit=${limit}`),
+  notifications: (limit = 50) => request<Notifications>("GET", `/notifications?limit=${limit}`),
 
   // -------------------------------------------------------------------------
   // 写：人类动作都带页面渲染时看到的值（v、sha、seq、through），见 docs/web-api.md 第 1 节

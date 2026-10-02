@@ -36,6 +36,18 @@ TEXT_EVENT_TYPES = {"note", "comment", "task.released", "task.canceled", "task.d
 # 网页详情页（for_human）给每条动态带的结构化字段：只放 handle、枚举、编号，不放自由文本
 HUMAN_EVENT_DATA = ("to", "need", "reason", "v", "through")
 
+# agent 读到的扣留原因（get_item 的 withheld，plan 5.1 闸门表）。只说"为什么读不到"：读取不会通知任何人。
+# 和人类动作的错误码（needs_human、needs_accept）分开起名：本地试用里 agent 读到 withheld:"needs_accept"，
+# 照 instructions 里那条按错误码下的指令跟用户说"已发到您的微信"，其实读取什么都没发。
+WITHHELD_NOT_ACCEPTED = "not_accepted"  # 正文、困难详情、人写的评论：本人还没在网页上接受（或认领、帮忙）这一版
+WITHHELD_PEER_AGENT_TEXT = "peer_agent_text"  # 别人的 agent 写的评论类文字：本人还没转发给自己的 agent
+# 本人已经在电脑上确认，还没到 effective_at（D55：不在确认设备上做的放行类动作 10 分钟后才对 agent 生效）。
+# M1 才实现；instructions 里先写上（M1 冻结哈希之前要覆盖到），原型不会返回这个值。
+WITHHELD_PENDING_EFFECT = "pending_effect"
+WITHHELD_REASONS = (WITHHELD_NOT_ACCEPTED, WITHHELD_PEER_AGENT_TEXT, WITHHELD_PENDING_EFFECT)
+
+HUMAN_ONLY_MSG = "这个操作只能由本人在 Team Flow 网页上完成，agent 和命令行都不行。请转告用户本人操作，不要替用户打开网页。"
+
 # MCP 工具名（与 mcp_server.TOOL_ORDER 一致，测试里断言）。tool_map 条目的 tool 字段只认这些。
 TOOL_NAMES = ("inbox", "list_tasks", "get_item", "team_status", "create_task", "claim_task", "update_task", "report_blocker", "comment")
 READ_TOOL_NAMES = frozenset({"inbox", "list_tasks", "get_item", "team_status"})
@@ -88,7 +100,7 @@ class Actor:
     kind: Literal["human", "agent"]
     client: str | None = None  # claude_code / codex / cli；人为 None
     token_id: str | None = None
-    via: str = "mcp"  # mcp / rest / hook / dev / wechat / seed
+    via: str = "mcp"  # mcp / rest / hook / dev / web / seed
     session: str | None = None  # 精确归属到的会话 external_id（必须经 resolve_session 校验）
     attribution: str = "member"  # exact / member
     thread: str | None = None  # Codex 子线程（x-codex-turn-metadata.thread_id），只作记录，不参与归属
@@ -293,7 +305,9 @@ class Service:
             self.audit: list[dict[str, Any]] = []
             self.idem: dict[tuple[str, str, str], IdemRec] = {}
             self.dedupe: dict[tuple[str, str, str], tuple[datetime, dict[str, Any]]] = {}
-            self.hook_keys: dict[tuple[str, str], datetime] = {}
+            # 幂等键 → (过期时间, 第一次结果里要在重放时带回的字段)。目前只有 no_repo 要带回：第一次的响应在路上丢了、
+            # CLI 重试拿到 409 时，照样知道那一回合的提交一条都没记（st 仍是 dup，另给 was、dropped）
+            self.hook_keys: dict[tuple[str, str], tuple[datetime, dict[str, Any] | None]] = {}
             # (token_id, tool_use_id) → 映射；(token_id, tool_use_id) → 这次调用产生的事件（24 小时内的索引）
             self.tool_maps: dict[tuple[str, str], ToolMap] = {}
             self.call_events: dict[tuple[str, str], list[Event]] = {}
@@ -364,7 +378,8 @@ class Service:
         return ev
 
     def _notify(self, to: str | None, kind: str, subject: str, text: str, actor: Actor | None, dedupe_key: str) -> None:
-        """模拟微信模板消息：只放编号、handle、客户端（H5）。M0 不真的发送，只进 outbox。"""
+        """通知：只放编号、handle、客户端（H5）。M0 不真的发送，只进 outbox，本地试用的网页「模拟通知」从这里读；
+        正式版按收件人自己选的渠道（邮件或微信，D61）发出，通知只做提醒，不授予任何权限。"""
         if not to or (actor and to == actor.handle):
             return  # 不给自己发
         member = self.members.get(to)
@@ -566,10 +581,10 @@ class Service:
                     held[e.actor or "?"] = held.get(e.actor or "?", 0) + 1
                     continue
                 else:
-                    item["withheld"] = "needs_accept"
+                    item["withheld"] = WITHHELD_NOT_ACCEPTED
             out.append({k: v for k, v in item.items() if v is not None})
         for by, n in held.items():
-            out.append({"withheld": "peer_agent_text", "by": by, "n": n, "url": self.url(obj.id)})
+            out.append({"withheld": WITHHELD_PEER_AGENT_TEXT, "by": by, "n": n, "url": self.url(obj.id)})
         return out
 
     # -- 相关性与计数 ----------------------------------------------------------------
@@ -747,7 +762,7 @@ class Service:
                     if obj.body:
                         out["content"] = self.envelope(obj.body, obj.created_by, obj.created_by_kind, obj.created_by_client, me)
                 elif obj.body:
-                    out["withheld"] = "needs_accept"
+                    out["withheld"] = WITHHELD_NOT_ACCEPTED
                 blk = [b.id for b in self.blockers.values() if b.task_id == obj.id and b.status == "open"]
                 if blk:
                     out["blk"] = blk
@@ -774,7 +789,7 @@ class Service:
                     if c:
                         out["content"] = c
                 elif obj.detail or obj.tried:
-                    out["withheld"] = "needs_accept"
+                    out["withheld"] = WITHHELD_NOT_ACCEPTED
             out["ev"] = self._events_view(me, obj, events, for_human=for_human)
             out["url"] = self.url(obj.id)
             if for_human:
@@ -788,7 +803,7 @@ class Service:
         if self.can_see_content(me, obj):
             content = "visible" if has_text else "none"
         else:
-            content = "needs_accept" if has_text else "none"
+            content = WITHHELD_NOT_ACCEPTED if has_text else "none"
         extra: dict[str, Any] = {
             "page": self.page_view(obj.id),
             "agent": {
@@ -1010,14 +1025,20 @@ class Service:
             t = self._task(raw_id)
             if t.status in ("done", "canceled"):
                 word = "已完成" if t.status == "done" else "已取消"
-                raise DomainError("invalid", f"{t.id} {word}，不能再认领。需要重新打开时请用户在手机上操作。", id=t.id, st=t.label)
+                raise DomainError(
+                    "invalid",
+                    # 不承诺网页上没有的按钮：本地试用版的网页没有「重新打开」（plan 437 行把 :reopen 列为正式版的 T1）
+                    f"{t.id} {word}，不能再认领。agent 不能重新打开任务；需要的话，请转告用户本人处理（本地试用版的网页还没有重新打开的按钮）。",
+                    id=t.id,
+                    st=t.label,
+                )
             if t.assignee == me:
                 if t.status == "in_progress":
                     return self._claim_summary(t, me)  # 幂等
                 if t.assign_state == "pending":
                     raise DomainError(
                         "needs_accept",
-                        f"{t.id} 是 {t.assigned_by} 指派给您的，需要您本人在手机上打开 {t.id} 点「接受」后才能开始。"
+                        f"{t.id} 是 {t.assigned_by} 指派给您的，需要您本人在 Team Flow 网页上打开 {t.id} 点「接受」后才能开始。"
                         "请转告用户；接受后再调用 claim_task。",
                         id=t.id,
                         by=t.assigned_by,
@@ -1038,7 +1059,7 @@ class Service:
                 self._audit("claim_task", actor, "needs_human", id=t.id)
                 raise DomainError(
                     "needs_human",
-                    f"{t.id} 是 {t.created_by} 发布的，认领就是承诺，需要您本人决定。已发到您的微信，请在手机上点「认领」；"
+                    f"{t.id} 是 {t.created_by} 发布的，认领就是承诺，需要您本人决定。已通知您，请在 Team Flow 网页上打开 {t.id} 点「认领」；"
                     "认领后再调用 claim_task 开始。",
                     id=t.id,
                     by=t.created_by,
@@ -1070,7 +1091,7 @@ class Service:
         if t.assign_state != "accepted" or not self.can_see_content(actor.handle, t):
             raise DomainError(
                 "needs_accept",
-                f"{t.id} 的内容有更新，需要您本人在手机上重新「接受」后才能开始。",
+                f"{t.id} 的内容有更新，需要您本人在 Team Flow 网页上重新「接受」后才能开始。",
                 id=t.id,
             )
         now = self.now()
@@ -1116,7 +1137,8 @@ class Service:
                 if actor.kind == "agent" and others:
                     raise DomainError(
                         "not_allowed",
-                        f"{t.id} 已被 {others[0].handle} 接受，agent 不能再改标题和正文；需要改的话请用户在手机上编辑。",
+                        f"{t.id} 已被 {others[0].handle} 接受，agent 不能再改标题和正文；需要改的话，请转告用户本人处理"
+                        "（本地试用版的网页还没有编辑按钮），也可以用 comment 提建议。",
                         id=t.id,
                     )
                 if t.status in ("done", "canceled"):
@@ -1171,7 +1193,11 @@ class Service:
                         raise DomainError("not_allowed", f"{t.id} 是 {t.created_by} 发布的，只有发布人可以取消。", id=t.id)
                     others = self._content_acceptors(t.id, me)
                     if actor.kind == "agent" and others:
-                        raise DomainError("not_allowed", f"{t.id} 已被 {others[0].handle} 接受过，agent 不能取消；请用户在手机上操作。", id=t.id)
+                        raise DomainError(
+                            "not_allowed",
+                            f"{t.id} 已被 {others[0].handle} 接受过，agent 不能取消；需要取消的话，请转告用户本人处理（本地试用版的网页还没有取消任务的按钮）。",
+                            id=t.id,
+                        )
                     if not note_c:
                         raise DomainError("invalid", "取消任务要写原因（note）。", id=t.id)
                     t.status = "canceled"
@@ -1269,7 +1295,8 @@ class Service:
                 "id": b.id,
                 "st": b.status,
                 "need_state": b.need_state,
-                "suggest": self._suggest(actor.handle, project=b.project, exclude=set(), repo=repo),
+                # 建议人选不含已经点名的人（本地试用发现：点名 bob 时建议里还是 bob）
+                "suggest": self._suggest(actor.handle, project=b.project, exclude={needs} if needs else set(), repo=repo),
             }
             self.dedupe[dkey] = (now + timedelta(minutes=10), result)
             return result
@@ -1299,11 +1326,11 @@ class Service:
             self.dedupe[dkey] = (self.now() + timedelta(minutes=10), result)
             return result
 
-    # -- 人的动作（只认手机微信 H5；M0 由 DEV ONLY 端点模拟） ---------------------------
+    # -- 人的动作（只认人类网页会话，M1 起每次另加一次通行密钥断言，D54；M0 由本地网页和 DEV ONLY 端点模拟） ----
 
     def _require_human(self, actor: Actor) -> None:
         if actor.kind != "human":
-            raise DomainError("human_only", "这个操作只能由本人在手机微信里完成，agent 和命令行都不行。")
+            raise DomainError("human_only", HUMAN_ONLY_MSG)
 
     @staticmethod
     def _need_page_fields(**fields: Any) -> None:
@@ -1346,7 +1373,7 @@ class Service:
             )
 
     def page_view(self, raw_id: str) -> dict[str, Any]:
-        """DEV ONLY：模拟手机详情页渲染时表单里带的值。
+        """详情页渲染时表单里带的值（网页详情和 DEV ONLY 端点共用）。
 
         v、sha（任务还有 seq）是页面上看到的版本；through 是页面渲染时这个对象最大的动态编号。
         接受、认领、帮忙、转发都必须原样带回 through：页面渲染之后才出现的动态（比如对方 agent
@@ -1373,7 +1400,7 @@ class Service:
         seq: int | None,
         through: int | None,
     ) -> dict[str, Any]:
-        """人在手机上点「接受」：v、sha、seq、through 必填；版本与当前不一致返回 409（plan 5.3、H3），
+        """本人在网页上点「接受」：v、sha、seq、through 必填；版本与当前不一致返回 409（plan 5.3、H3），
         through 超过当前最大事件 ID 返回 400。"""
         self._require_human(actor)
         self._need_page_fields(v=v, sha=sha, seq=seq, through=through)
@@ -1395,7 +1422,7 @@ class Service:
     def human_claim(
         self, actor: Actor, raw_id: str, *, v: int | None, sha: str | None, through: int | None
     ) -> dict[str, Any]:
-        """人在手机上点「认领」：同时完成认领和接受当前版本。v、sha、through 必填，版本不一致返回 409。
+        """本人在网页上点「认领」：同时完成认领和接受当前版本。v、sha、through 必填，版本不一致返回 409。
         之后任务是"待开始"，由本人或其 agent 开始。"""
         self._require_human(actor)
         self._need_page_fields(v=v, sha=sha, through=through)
@@ -1450,7 +1477,7 @@ class Service:
             return {"id": b.id, "helper": b.helper}
 
     def human_decline(self, actor: Actor, raw_id: str, *, seq: int | None, reason: str | None) -> dict[str, Any]:
-        """被指派人在手机上点「拒绝」（plan 5.3）：seq 必填（I4：WHERE assign_seq=:seq），原因必填。
+        """被指派人在网页上点「拒绝」（plan 5.3）：seq 必填（I4：WHERE assign_seq=:seq），原因必填。
 
         负责人改回 steward（发布人），状态 accepted（"待开始"）；steward 已停用时退回待认领。通知指派人「li 没接 T-52」。
         原因按评论类文字处理（清洗、2000 字、扫描），对指派人的 agent 来说和评论一样要转发后才给。"""
@@ -1481,7 +1508,7 @@ class Service:
             return {"id": t.id, "st": t.label, "who": t.assignee}
 
     def human_release(self, actor: Actor, raw_id: str, *, note: str | None = None, to_pool: bool = False) -> dict[str, Any]:
-        """负责人在手机上点「取消认领」（plan 5.2）。
+        """负责人在网页上点「取消认领」（plan 5.2）。
 
         - 不放回待认领：和 agent 的取消认领同一条规则（update_task(status=open)），只限进行中，负责人不变；
         - 放回待认领（to_pool）：进行中或待开始都可以，负责人清空、assign_seq 加 1（旧表单作废），回到待认领。"""
@@ -1823,7 +1850,7 @@ class Service:
 
     HOOK_TYPES = ("turn_end", "commit", "end", "start", "tool_map")
     _REASON = re.compile(r"^[a-z_]{1,32}$")
-    _SHA = re.compile(r"^[0-9a-f]{7,40}$")
+    _SHA = re.compile(r"^[0-9a-f]{7,64}$")  # 64：SHA-256 仓库（CLI 的 gitinfo 认 40 和 64 位）
 
     def _hook_commit(self, actor: Actor, repo: str | None, sha: Any, title: Any) -> str:
         """记一条本人提交；返回 ok / masked / bad。提交标题命中扫描只遮蔽，不拒绝，不计熔断。"""
@@ -1849,11 +1876,15 @@ class Service:
         条目里的 client 强制等于 token 的 client；条目指向的会话属于别的 token 时，整条忽略（不记提交、
         不改会话、end 也不清对方会话的 current_task），写审计，返回 403 ignored。
         返回 results[{key, status, st}]：status 是逐条 HTTP 语义（200 成功、409 重复、422 不合格、403 忽略），st 是枚举。
+        turn_end / start 带了提交却没有 repo（仓库没有 origin，服务端认不出是哪个仓库）：会话照常登记，提交一条都不记，
+        返回 200 ``st: "no_repo"`` 加 ``dropped``（没记下的提交数，含 own_more），CLI 据此在 doctor 里报出来，不再悄悄丢掉。
+        这一条重放时（第一次的响应丢了，CLI 重试）返回 409 ``st: "dup"``，并带回 ``was: "no_repo"`` 和 ``dropped``。
+        提交里有不合格的 sha 时同样带 ``dropped``。
         """
         if len(items) > 100:
             raise DomainError("too_many", "一次最多 100 条，请分批发送。", max=100)
         results: list[dict[str, Any]] = [{} for _ in items]
-        codes = {"ok": 200, "masked": 200, "dup": 409, "bad": 422, "ignored": 403}
+        codes = {"ok": 200, "masked": 200, "no_repo": 200, "dup": 409, "bad": 422, "ignored": 403}
         idx = 0
 
         def res(key: str | None, st: str, err: str | None = None, at: int | None = None, **more: Any) -> None:
@@ -1869,7 +1900,7 @@ class Service:
 
         with self.lock:
             now = self.now()
-            for k_, exp in list(self.hook_keys.items()):
+            for k_, (exp, _) in list(self.hook_keys.items()):
                 if exp < now:
                     del self.hook_keys[k_]
             self._purge_tool_maps()
@@ -1883,7 +1914,7 @@ class Service:
                     continue
                 hk = (actor.token_id or actor.handle, k)
                 if hk in self.hook_keys:
-                    res(k, "dup")
+                    res(k, "dup", **(self.hook_keys[hk][1] or {}))
                     continue
                 typ = it.get("type") or it.get("ev")
                 if typ not in self.HOOK_TYPES:
@@ -1909,6 +1940,7 @@ class Service:
                         continue
                 repo = ident_or_hash(it.get("repo"))
                 st = "ok"
+                more: dict[str, Any] = {}
                 if typ in ("turn_end", "start"):
                     if sid:
                         self._upsert_session(
@@ -1922,11 +1954,24 @@ class Service:
                             reopen=(typ == "start"),
                         )
                     commits = it.get("commits") if isinstance(it.get("commits"), list) else []
+                    dropped = 0
                     for c in commits[:5]:
                         if isinstance(c, dict):
                             r = self._hook_commit(actor, repo, c.get("sha"), c.get("title"))
                             if r == "masked":
                                 st = "masked"
+                            elif r == "bad":
+                                dropped += 1
+                    if dropped and not repo:
+                        # 一条都没记：告诉 CLI 是因为认不出仓库，不是网络或服务端出错。
+                        # 只发了前 5 条，own_more 是本人另外的提交数，同样没记，一并算进 dropped
+                        om = it.get("own_more")
+                        if type(om) is int and 0 < om <= 1000:
+                            dropped += om
+                        st = "no_repo"
+                        self._audit("hook.commits_no_repo", actor, "dropped", n=dropped, client=client)
+                    if dropped:
+                        more["dropped"] = dropped
                 elif typ == "end":
                     if sid:
                         reason = it.get("reason") if isinstance(it.get("reason"), str) and self._REASON.fullmatch(it["reason"]) else "other"
@@ -1936,19 +1981,19 @@ class Service:
                 elif typ == "commit":
                     r = self._hook_commit(actor, repo, it.get("sha"), it.get("title"))
                     if r == "bad":
-                        res(k, "bad", "sha_or_repo")
+                        res(k, "bad", "repo" if not repo else "sha")
                         continue
                     st = r
                     if sid:
                         self._upsert_session(actor, client, sid)
-                self.hook_keys[hk] = now + timedelta(days=8)
-                res(k, st)
+                self.hook_keys[hk] = (now + timedelta(days=8), {"was": st, **more} if st == "no_repo" else None)
+                res(k, st, **more)
             for i, k, hk, client, sid, it in deferred:
                 st_, err_, n_ = self._hook_tool_map(actor, client, sid, it, ended_here=ended_here)
                 if st_ != "ok":
                     res(k, st_, err_, at=i)
                     continue
-                self.hook_keys[hk] = now + timedelta(days=8)
+                self.hook_keys[hk] = (now + timedelta(days=8), None)
                 res(k, "ok", at=i, n=n_)
             return {"results": results}
 

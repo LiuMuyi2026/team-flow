@@ -2,8 +2,8 @@
 """扮演队友：一个人在本地试用里模拟团队里的其他人和他们的 agent。
 
 - 队友的 agent 写入（发布、指派、报困难、评论、完成）用队友的令牌走 REST /api/v1，和真实的 agent 一样受服务端规则约束；
-- 队友本人的动作（接受、认领、帮忙、确认点名）是"手机上的人"才能做的，令牌做不了（硬规则 1）。这里用队友的
-  一次性登录码登进网页接口，等于您替队友在他的手机上点按钮。所以这几个子命令只能在您自己的终端里运行：
+- 队友本人的动作（接受、认领、帮忙、确认点名）只有本人在网页上才能做，令牌做不了（硬规则 1）。这里用队友的
+  一次性登录码登进网页接口，等于您替队友在网页上点按钮。所以这几个子命令只能在您自己的终端里运行：
   登录码由 python -m teamflow_server.devlogin 生成，它不给没有终端的进程（比如 agent）发码。
 
 子命令一览：scripts/sim-teammate.py --help
@@ -130,7 +130,7 @@ class Human:
     def _require_tty(self):
         if not sys.stdin.isatty():
             raise Fail(
-                "这一步是 %s 本人在手机上的操作，要用他的登录码登进网页。请在您自己的终端里运行"
+                "这一步是 %s 本人在网页上的操作，要用他的登录码登进网页。请在您自己的终端里运行"
                 "（登录码等于本人身份，不交给 agent）。" % self.handle
             )
 
@@ -232,7 +232,7 @@ def cmd_publish_pool(trial, a):
     res = ag.call("POST", "/api/v1/tasks", {"title": title, "body": body if a.body is None else a.body})
     print("%s 发布了待认领任务 %s「%s」。" % (ag.label, res["id"], title))
     print("接下来：您的 agent 在下次会话开始时只会看到「新的待认领」的个数；让它查一下待认领、认领 %s，"
-          "它会得到 needs_human，网页「模拟微信」里出现「您的 agent 想开始 %s，点这里认领」，"
+          "它会得到 needs_human，网页「模拟通知」里出现「您的 Claude Code 想开始 %s，点这里认领」（用 Codex 就写 Codex），"
           "点开看过正文后点「认领」。" % (res["id"], res["id"]))
 
 
@@ -241,8 +241,8 @@ def cmd_assign_me(trial, a):
     title, body = (a.title, a.body) if a.title else pick(ASSIGN_SAMPLES, None)
     res = ag.call("POST", "/api/v1/tasks", {"title": title, "body": body if a.body is None else a.body, "assignee": trial.me})
     print("%s 请您协作：%s「%s」，状态是待接受。" % (ag.label, res["id"], title))
-    print("接下来：网页「待我处理」和「模拟微信」里会出现这条；打开详情页看过正文后点「接受」。"
-          "接受之前，您的 agent 读正文只会拿到 withheld。")
+    print("接下来：网页「待我处理」和「模拟通知」里会出现这条；打开详情页看过正文后点「接受」。"
+          "接受之前，您的 agent 读正文只会拿到 withheld（not_accepted）。")
 
 
 def cmd_blocker_need_me(trial, a):
@@ -274,7 +274,7 @@ def cmd_confirm_as_owner(trial, a):
     h = Human(trial, owner)
     res = h.call("POST", "/api/v1/web/blockers/%s:ask" % bid)
     print("%s 本人确认了点名（%s，need_state=%s）。" % (owner, bid, res.get("need_state")))
-    print("接下来：您的「模拟微信」里会出现「%s 请您帮忙看 %s」；打开 %s 看过之后点「认领」去帮忙。" % (owner, bid, bid))
+    print("接下来：您的「模拟通知」里会出现「%s 请您帮忙看 %s」；打开 %s 看过之后点「认领」去帮忙。" % (owner, bid, bid))
 
 
 def cmd_comment(trial, a):
@@ -303,7 +303,7 @@ def cmd_claim(trial, a):
     h.call("POST", "/api/v1/web/tasks/%s:claim" % tid, {k: pg[k] for k in ("v", "sha", "through")})
     ag = Agent(trial, a.as_, a.client)
     res = ag.call("POST", "/api/v1/tasks/%s:claim" % tid)
-    print("%s 在手机上认领了 %s，%s 开始做（状态 %s）。" % (a.as_, tid, ag.label, res.get("st")))
+    print("%s 本人认领了 %s，%s 开始做（状态 %s）。" % (a.as_, tid, ag.label, res.get("st")))
 
 
 def cmd_help(trial, a):
@@ -324,7 +324,7 @@ def cmd_done(trial, a):
                    % (tid, t.get("who") or "（没有）", a.as_, a.as_))
     st = t.get("st")
     if st == "pending":
-        print("%s 还没接受 %s，先替他在手机上点「接受」……" % (a.as_, tid))
+        print("%s 还没接受 %s，先替他在网页上点「接受」……" % (a.as_, tid))
         cmd_accept(trial, argparse.Namespace(id=tid, as_=a.as_))
         st = "todo"
     if st in ("todo",):
@@ -333,7 +333,7 @@ def cmd_done(trial, a):
         raise Fail("%s 现在是 %s，没法完成。" % (tid, st))
     res = ag.call("POST", "/api/v1/tasks/%s:done" % tid, {"note": a.note or DONE_NOTE})
     print("%s 完成了 %s（状态 %s）。" % (ag.label, tid, res.get("st")))
-    print("接下来：您的「模拟微信」里会有「%s 接受了 %s」和「您请 %s 做的 %s 已完成」；让您的 agent 看一下收件箱，"
+    print("接下来：您的「模拟通知」里会有「%s 接受了 %s」和「您请 %s 做的 %s 已完成」；让您的 agent 看一下收件箱，"
           "replies 里有这两条（本地版会话开始的摘要里不列回音）。" % (a.as_, tid, a.as_, tid))
 
 
@@ -382,14 +382,14 @@ def cmd_status(trial, a):
             who = " · %s" % r["who"] if r.get("who") else ""
             blk = " · 困难 %s" % "、".join(r["blk"]) if r.get("blk") else ""
             print("    %s %s「%s」%s%s · %s" % (r["id"], labels.get(r.get("st"), r.get("st")), title_of(r.get("t")), who, blk, r.get("upd", "")))
-    print("  网页上「模拟微信」里能看到发给您的通知；队友收到的：scripts/sim-teammate.py wechat --as <队友>")
+    print("  网页上「模拟通知」里能看到发给您的通知；队友收到的：scripts/sim-teammate.py notifications --as <队友>")
 
 
-def cmd_wechat(trial, a):
+def cmd_notifications(trial, a):
     h = Human(trial, a.as_)
-    js = h.call("GET", "/api/v1/web/wechat?limit=10")
+    js = h.call("GET", "/api/v1/web/notifications?limit=10")
     items = js.get("items") or []
-    print("%s 的模拟微信（最新 %d 条，共 %s 条）：" % (a.as_, len(items), js.get("total", len(items))))
+    print("%s 的模拟通知（最新 %d 条，共 %s 条）：" % (a.as_, len(items), js.get("total", len(items))))
     for it in items:
         print("  %s  %s  %s" % (it.get("at") or "", it.get("kind_text") or it.get("kind"), it.get("text") or ""))
     if not items:
@@ -400,7 +400,7 @@ COMMANDS = [
     ("publish-pool", cmd_publish_pool, "队友的 agent 发布一个待认领任务（场景 1）", 0, []),
     ("assign-me", cmd_assign_me, "队友的 agent 指派给您一个任务，请您协作（场景 2）", 0, []),
     ("blocker-need-me", cmd_blocker_need_me, "队友的 agent 报一个困难并提议请您帮忙（场景 4）", 1, ["task"]),
-    ("confirm-as-owner", cmd_confirm_as_owner, "扮演报困难的队友本人，在手机上确认点名（场景 4）", 1, ["id"]),
+    ("confirm-as-owner", cmd_confirm_as_owner, "扮演报困难的队友本人，在网页上确认点名（场景 4）", 1, ["id"]),
     ("comment", cmd_comment, "队友的 agent 在任务或困难上写一条评论（场景 4）", 0, ["id", "body"]),
     ("done", cmd_done, "队友完成您请他做的任务；还没接受的先替他接受（场景 5）", 0, ["id", "note"]),
     ("accept", cmd_accept, "扮演队友本人接受您指派给他的任务（场景 2 反过来）", 0, ["id"]),
@@ -408,7 +408,7 @@ COMMANDS = [
     ("help", cmd_help, "扮演队友本人认领您的困难，来帮忙（场景 4 反过来）", 0, ["id"]),
     ("scan-test", cmd_scan_test, "队友的 agent 在评论里贴一段像密钥的字符串，看服务端拦截（场景 6）", 0, ["id"]),
     ("status", cmd_status, "打印当前看板（以队友 agent 的视角）", 0, []),
-    ("wechat", cmd_wechat, "看某个队友收到的模拟微信", 0, []),
+    ("notifications", cmd_notifications, "看某个队友收到的模拟通知（正式版按他选的渠道发邮件或微信）", 0, []),
 ]
 
 
@@ -417,7 +417,7 @@ def build_parser(trial):
         prog="scripts/sim-teammate.py",
         description="扮演队友和他们的 agent，在本地试用里走一遍规划 3.2 的场景。队友：%s；您：%s。"
         % ("、".join(trial.mates), trial.me),
-        epilog="确认点名、接受、认领、帮忙、看模拟微信是队友本人的操作，要在您自己的终端里运行。",
+        epilog="确认点名、接受、认领、帮忙、看模拟通知是队友本人的操作，要在您自己的终端里运行。",
     )
     sub = p.add_subparsers(dest="cmd", metavar="<子命令>")
     for name, fn, helptext, mate_idx, extra in COMMANDS:

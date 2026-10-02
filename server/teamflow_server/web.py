@@ -25,7 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import FileResponse
 
-from . import devlogin, webauth
+from . import config, devlogin, webauth
 from .errors import DomainError
 from .service import TZ, WS, Actor, Blocker, Service, Task, client_name, mdhm
 
@@ -274,11 +274,19 @@ def _blank(v: str | None) -> str | None:
 
 @web.get("/me")
 def web_me(request: Request) -> dict[str, Any]:
-    """我是谁、CSRF token、成员和项目（发布页的下拉框用）。"""
+    """我是谁、CSRF token、成员和项目（发布页的下拉框用）。
+
+    成员带 ``agent: true`` 的，是 TEAMFLOW_DEV_TOKENS 里有令牌的人：本地试用里就是您和 scripts/sim-teammate.py
+    模拟的队友。「我」页"换成队友"的例子从这些人里挑，不挑只存在于演示数据里的人（alice 没有模拟命令）。"""
     actor, svc = me_actor(request), svc_of(request)
     sess: webauth.WebSession = request.scope["state"]["tf_web"]
+    with_agent = set(config.token_handles())
     with svc.lock:
-        members = [{"h": m.handle, "name": m.name} for m in sorted(svc.members.values(), key=lambda m: m.handle) if m.active]
+        members = [
+            {"h": m.handle, "name": m.name, **({"agent": True} if m.handle in with_agent else {})}
+            for m in sorted(svc.members.values(), key=lambda m: m.handle)
+            if m.active
+        ]
         projects = [{"key": p.key, "name": p.name} for p in sorted(svc.projects.values(), key=lambda p: p.key)]
         name = svc.members[actor.handle].name
     return {
@@ -350,9 +358,9 @@ def web_blocker(request: Request, bid: str) -> dict[str, Any]:
     return _detail(request, bid, "B-")
 
 
-@web.get("/wechat")
-def web_wechat(request: Request, limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
-    """"模拟微信"：本人会收到的模板消息（来自 outbox），新的在前。正式版里这些发到手机微信。"""
+@web.get("/notifications")
+def web_notifications(request: Request, limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    """"模拟通知"：本人会收到的通知（来自 outbox），新的在前。正式版按本人选的渠道（邮件或微信）发出，只做提醒。"""
     actor, svc = me_actor(request), svc_of(request)
     with svc.lock:
         rows = [(i, n) for i, n in enumerate(svc.outbox, 1) if n.get("to") == actor.handle]
@@ -514,7 +522,7 @@ def dev_login_page(request: Request, code: str | None = None, as_: str | None = 
         "Team Flow 本地试用",
         [
             f"您将以 <strong>{who}</strong> 的身份登录这台电脑上的试用版。",
-            "登录链接只能用一次。这个页面只在本机打开；正式版里，您的身份来自手机微信。",
+            "登录链接只能用一次。这个页面只在本机打开；正式版里，您用通行密钥登录。",
         ],
         form=(code or "", handle, "登录"),
     )

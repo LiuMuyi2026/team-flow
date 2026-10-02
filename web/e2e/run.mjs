@@ -280,10 +280,13 @@ try {
   await snap(bob, "bob-已接受");
   ok("重新查看后再接受成功，状态变成待开始，agent 能读正文");
 
-  // ---- alice：首页、困难、转发、确认点名、模拟微信 --------------------------
-  // alice 的 Claude Code 想认领 bob 的 Codex 发布的 T-51 → needs_human → alice 的模拟微信
+  // ---- alice：首页、困难、转发、确认点名、模拟通知 --------------------------
+  // alice 的 Claude Code 想认领 bob 的 Codex 发布的 T-51 → needs_human → alice 的模拟通知
   const claim = await agent("alice", "POST", "/api/v1/tasks/T-51:claim", {});
   assert.ok(JSON.stringify(claim.data).includes("needs_human"), JSON.stringify(claim.data));
+  // agent 看到的说明不提具体通知渠道（微信只是可选通知渠道，人在网页上确认）
+  assert.ok(claim.data.message.includes("已通知您") && claim.data.message.includes("Team Flow 网页"), claim.data.message);
+  assert.ok(!/微信|手机/.test(claim.data.message), claim.data.message);
   // alice 的 Claude Code 报困难并提议请 bob 帮忙（agent 的点名要主人确认）
   const rb = await agent("alice", "POST", "/api/v1/blockers", {
     title: "预发环境没有权限",
@@ -331,19 +334,21 @@ try {
 
   // B-8：确认 agent 提议的点名
   await alice.goto(`${BASE}/blocker?w=team&id=${B8}`);
-  await alice.getByText(`确认后，bob 会收到微信「alice 请您帮忙看 ${B8}」`).waitFor();
+  await alice.getByText(`确认后，bob 会收到通知「alice 请您帮忙看 ${B8}」`).waitFor();
   await snap(alice, "alice-确认点名");
   await alice.getByRole("button", { name: "确认", exact: true }).click();
   await alice.getByText("已点名 bob").waitFor();
   ok("确认 agent 提议的点名");
 
-  // 模拟微信：agent 想开始 T-51 → 点「详情」→ 认领
-  await alice.getByRole("link", { name: /模拟微信/ }).click();
-  await alice.getByText("本地试用：这里代替微信通知。").waitFor();
+  // 模拟通知：agent 想开始 T-51 → 点「详情」→ 认领
+  await alice.getByRole("link", { name: /模拟通知/ }).click();
+  await alice.waitForURL(`${BASE}/notifications`);
+  await alice.getByText("本地试用：这里代替真正的通知。").waitFor();
+  await alice.getByText(/正式版会按您选的渠道（邮件或微信）/).waitFor();
   await alice.getByText("您的 Claude Code 想开始 T-51，点这里认领").waitFor();
-  await snap(alice, "alice-模拟微信");
+  await snap(alice, "alice-模拟通知");
   const t51 = await detailResponse(alice, "T-51", () =>
-    alice.locator(".wx", { hasText: "想开始 T-51" }).getByRole("link", { name: "详情" }).click(),
+    alice.locator(".ntf", { hasText: "想开始 T-51" }).getByRole("link", { name: "详情" }).click(),
   );
   assert.ok(new URL(alice.url()).searchParams.get("n"), "点开的链接带 n=");
   await alice.getByText("这段话由 bob 的 Codex 生成").waitFor();
@@ -355,7 +360,7 @@ try {
   assert.equal(cl.status(), 200);
   assert.deepEqual(cl.request().postDataJSON(), { v: t51.page.v, sha: t51.page.sha, through: t51.page.through });
   await alice.getByText("T-51 · 待开始").waitFor();
-  ok("模拟微信的「详情」打开 T-51（带 n=），认领带 v、sha、through");
+  ok("模拟通知的「详情」打开 T-51（带 n=），认领带 v、sha、through");
 
   // 待开始：取消认领只能放回待认领（勾选框锁定）；开始；完成（说明选填）
   await alice.getByRole("button", { name: "取消认领", exact: true }).click();
@@ -410,8 +415,10 @@ try {
   // 发布：疑似密钥被拦下（422）；正常的指派给 bob
   await alice.goto(`${BASE}/new`);
   await alice.getByLabel("标题").fill("核对支付回调的签名");
-  await alice.getByLabel("内容（选填）").fill("对方给的测试密钥是 " + "AKID" + randomBytes(10).toString("hex") + "，帮忙验一下。");
+  // 一看就是占位的样本（AKID 加一串 x）：照样命中扫描规则 tencent_akid，截图随仓库公开也不会被当成真密钥
+  await alice.getByLabel("内容（选填）").fill("对方给的测试密钥是 " + "AKID" + "x".repeat(20) + "，帮忙验一下。");
   await alice.getByLabel("指派给").selectOption("bob");
+  await alice.getByText("指派给 bob：对方会收到通知，要对方接受后才算数。").waitFor();
   await alice.getByRole("button", { name: "发布", exact: true }).click();
   await alice.getByText("您写的内容里像是有密钥或个人信息").waitFor();
   await snap(alice, "发布-疑似密钥被拦下");
@@ -427,6 +434,8 @@ try {
     "6. 测试用例要覆盖：超时、5xx、签名错误、重复回调、乱序回调。每一种都要有断言，不能只打日志。\n".repeat(4) +
     "最后：做完在评论里贴 PR 链接。";
   await alice.getByLabel("内容（选填）").fill(long);
+  // 改了内容，上一次被拦下的提示自动收起：截图里不该还挂着"请删掉这部分再提交"
+  assert.equal(await alice.getByText("您写的内容里像是有密钥或个人信息").count(), 0, "改了内容后旧的错误提示还在");
   await snap(alice, "发布-填好", { audit: true });
   const [created] = await Promise.all([
     alice.waitForResponse((r) => r.url().endsWith("/api/v1/web/tasks") && r.request().method() === "POST"),
@@ -457,17 +466,28 @@ try {
   }
   ok("正文超过 800 字时滚到底「接受」才能点；~/.ssh、token、curl | sh、外部网址、忽略指令都标了出来");
 
-  // bob 的模拟微信、评论
+  // bob 的模拟通知、评论
   await bob.getByRole("textbox", { name: "评论" }).fill("我下午看。");
   await bob.getByRole("button", { name: "评论", exact: true }).click();
   await bob.getByText("评论已发布。").waitFor();
-  await bob.goto(`http://localhost:${PORT}/wechat`);
+  await bob.goto(`http://localhost:${PORT}/notifications`);
   await bob.getByText(`alice 请您帮忙看 ${B8}`).waitFor();
-  await snap(bob, "bob-模拟微信");
-  ok("bob 的模拟微信收到 alice 确认后的点名");
+  await snap(bob, "bob-模拟通知");
+  ok("bob 的模拟通知收到 alice 确认后的点名");
 
+  // 「我」页"换成队友"的例子只挑有 agent 令牌的队友。自动化里 alice 也有令牌；本地试用里她只在演示数据里，
+  // 没有令牌。去掉她的 agent 标记，让截图和本地试用看到的一样（例子是 carol），而不是用户投诉过的 alice
+  await bob.route("**/api/v1/web/me", async (r) => {
+    const res = await r.fetch();
+    const body = await res.json();
+    body.members = body.members.map((m) => (m.h === "alice" ? { h: m.h, name: m.name } : m));
+    await r.fulfill({ response: res, json: body });
+  });
   await bob.goto(`http://localhost:${PORT}/me`);
+  await bob.getByText("想换成队友的身份（以 carol 为例）").waitFor();
   await snap(bob, "bob-我");
+  await bob.unroute("**/api/v1/web/me");
+  ok("「我」页换成队友的例子挑能模拟的队友（carol），不挑只在演示数据里的 alice");
 
   // 登出
   await bob.getByRole("button", { name: "登出" }).click();
@@ -493,7 +513,7 @@ try {
     await page.unroute("**/api/v1/web/me");
     // 最窄的手机（320px）上逐页自查，不截图
     await page.setViewportSize({ width: 320, height: 568 });
-    for (const path of ["/", "/tasks?view=all", "/task?w=team&id=T-52", "/blocker?w=team&id=B-7", "/new", "/wechat", "/me"]) {
+    for (const path of ["/", "/tasks?view=all", "/task?w=team&id=T-52", "/blocker?w=team&id=B-7", "/new", "/notifications", "/me"]) {
       await page.goto(BASE + path);
       await page.locator("main .page, main .detail").first().waitFor();
       await page.waitForTimeout(300);

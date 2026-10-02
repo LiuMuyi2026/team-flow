@@ -173,13 +173,13 @@ def _seg_to_accept(items, cap):
     shown = items[:cap]
     if len(items) == 1:
         src = _src(items[0])
-        inner = ("来自 %s，" % src if src else "") + "需您本人在手机上接受"
+        inner = ("来自 %s，" % src if src else "") + "需您本人在 Team Flow 网页上接受"
         return "待您接受 %s（%s）" % (items[0]["id"], inner)
     parts = []
     for it in shown:
         src = _src(it)
         parts.append(it["id"] + ("（来自 %s）" % src if src else ""))
-    return "待您接受 %s%s，均需您本人在手机上接受" % (_join(parts), _more(len(shown), len(items)))
+    return "待您接受 %s%s，均需您本人在 Team Flow 网页上接受" % (_join(parts), _more(len(shown), len(items)))
 
 
 def _seg_help(items, cap):
@@ -203,7 +203,7 @@ def _proposal(it):
 
 def _seg_proposed(items, cap):
     shown = items[:cap]
-    return "%s%s（等您在手机上确认）" % (
+    return "%s%s（等您在 Team Flow 网页上确认）" % (
         "；".join(_proposal(it) for it in shown),
         _more(len(shown), len(items)),
     )
@@ -259,7 +259,7 @@ def need_me_keys(data: dict) -> dict:
         out["todo:" + i] = "您已接受 %s，可以 claim_task 开始" % i
     for it in data.get("to_accept") or []:
         src = _src(it)
-        out["acc:" + it["id"]] = "待您接受 %s%s，需您本人在手机上接受" % (
+        out["acc:" + it["id"]] = "待您接受 %s%s，需您本人在 Team Flow 网页上接受" % (
             it["id"],
             "（来自 %s）" % src if src else "",
         )
@@ -272,7 +272,7 @@ def need_me_keys(data: dict) -> dict:
         n = it.get("n") or 1
         out["fwd:%s:%d" % (it["id"], n)] = "%s 有评论 %d 条待您转发" % (it["id"], n)
     for it in data.get("proposed") or []:
-        out["prop:%s:%s" % (it["id"], it.get("h") or "")] = _proposal(it) + "，等您在手机上确认"
+        out["prop:%s:%s" % (it["id"], it.get("h") or "")] = _proposal(it) + "，等您在 Team Flow 网页上确认"
     return out
 
 

@@ -43,10 +43,10 @@ def test_envelope_format_and_trust_values(svc):
 def test_gate_withholds_peer_body_until_accept(svc):
     bob = agent("bob", "codex")
     item = svc.get_item(bob, "T-52")
-    assert item["withheld"] == "needs_accept"
+    assert item["withheld"] == "not_accepted"
     assert "content" not in item
     assert item["t"]["trust"] == "peer_agent"  # 标题默认可见（团队信任档），但在信封里
-    # 人在手机上接受（版本、sha、seq 一致）
+    # 人在网页上接受（版本、sha、seq 一致）
     svc.human_accept(
         human("bob"), "T-52", v=item["v"], sha=svc.tasks["T-52"].content_sha256, seq=item["assign"]["seq"], through=svc.page_view("T-52")["through"]
     )
@@ -69,12 +69,12 @@ def test_accept_with_stale_version_conflicts(svc):
 def test_gate_on_blocker_and_peer_agent_comments(svc):
     alice = agent("alice", "claude_code")
     item = svc.get_item(alice, "B-7")
-    assert item["withheld"] == "needs_accept"
+    assert item["withheld"] == "not_accepted"
     held = [e for e in item["ev"] if e.get("withheld") == "peer_agent_text"]
     assert held == [{"withheld": "peer_agent_text", "by": "bob", "n": 1, "url": held[0]["url"]}]
     assert all("t" not in e for e in item["ev"])
     assert svc.inbox(alice)["fwd"] == [{"id": "B-7", "n": 1, "by": "bob"}]
-    # alice 在手机上认领这个困难（帮忙）：写 acceptance，through 到当前
+    # alice 在网页上认领这个困难（帮忙）：写 acceptance，through 到当前
     svc.human_help(human("alice"), "B-7", **vs(svc, "B-7"))
     item = svc.get_item(alice, "B-7")
     assert "withheld" not in item
@@ -95,11 +95,11 @@ def test_agent_claim_of_peer_pool_task_needs_human(svc):
     with pytest.raises(DomainError) as e:
         svc.claim_task(alice, "T-51")
     assert e.value.code == "needs_human"
-    assert "微信" in e.value.msg and "认领" in e.value.msg
+    assert "已通知您" in e.value.msg and "Team Flow 网页" in e.value.msg and "认领" in e.value.msg
     assert svc.tasks["T-51"].assignee is None
     asks = [n for n in svc.outbox if n["to"] == "alice" and n["kind"] == "agent_asks"]
     assert asks and asks[-1]["text"] == "您的 Claude Code 想开始 T-51，点这里认领"
-    # 人在手机上认领后，agent 再 claim 就能开始，并能读到正文
+    # 人在网页上认领后，agent 再 claim 就能开始，并能读到正文
     svc.human_claim(human("alice"), "T-51", **vs(svc, "T-51"))
     assert svc.tasks["T-51"].label == "todo"
     res = svc.claim_task(alice, "T-51")
@@ -111,7 +111,8 @@ def test_needs_accept_for_pending_assignment(svc):
     with pytest.raises(DomainError) as e:
         svc.claim_task(agent("bob", "codex"), "T-52")
     assert e.value.code == "needs_accept"
-    assert "接受" in e.value.msg
+    assert "接受" in e.value.msg and "Team Flow 网页" in e.value.msg
+    assert "已通知" not in e.value.msg  # 这次调用没有发通知，不能这么说
 
 
 def test_agent_cannot_accept_or_claim_as_human(svc):
@@ -164,7 +165,7 @@ def test_assign_to_peer_is_pending_and_notifies_without_free_text(svc):
 def test_agent_reported_need_is_only_a_proposal(svc):
     res = svc.report_blocker(agent("alice", "claude_code"), "要一个控制台权限", need="bob", tried="问过运维")
     assert res["need_state"] == "proposed" and res["st"] == "open"
-    assert {"h": "bob", "why": "solved_before"} in res["suggest"] or res["suggest"][0]["h"] == "bob"
+    assert "bob" not in [x["h"] for x in res["suggest"]]  # 已经点名的人不再出现在建议里
     assert svc.inbox(agent("alice", "claude_code"))["proposed"] == [{"id": res["id"], "h": "bob", "client": "claude_code"}]
     assert not [n for n in svc.outbox if n["subject"] == res["id"]]  # 没通知 bob
 
@@ -187,7 +188,7 @@ def test_proposed_need_stays_out_of_named_persons_feeds_until_owner_confirms(svc
     assert not [e for e in svc._relevant_events("alice", cur) if e.subject == bid]
     # 主人 bob 自己的增量和"待我处理"里有
     assert svc.inbox(bob, advance=False)["proposed"] == [{"id": bid, "h": "alice", "client": "codex"}]
-    # 主人在手机上确认后才进 alice 的增量、收件箱和 fwd
+    # 主人在网页上确认后才进 alice 的增量、收件箱和 fwd
     svc.human_ask(human("bob"), bid)
     d = svc.delta(alice, cur)
     assert {i["ty"] for i in d["items"] if i["id"] == bid} >= {"blocker.raised", "comment", "blocker.asked"}
@@ -221,10 +222,10 @@ async def test_mcp_errors_are_iserror_with_actionable_text(client):
     res = await m.call("claim_task", {"id": "T-51"})
     assert res["isError"] is True
     sc = res["structuredContent"]
-    assert sc["err"] == "needs_human" and "微信" in sc["msg"]
+    assert sc["err"] == "needs_human" and "已通知您" in sc["msg"] and "Team Flow 网页" in sc["msg"]
     # I5：出错时模型只看得到 content，content 要以错误码开头，instructions 的指令才对得上
     text = res["content"][0]["text"]
-    assert text.startswith("needs_human：") and "微信" in text
+    assert text.startswith("needs_human：") and "已通知您" in text
     res = await m.call("get_item", {"id": "T-999"})
     assert res["isError"] is True and res["structuredContent"]["err"] == "not_found"
     assert res["content"][0]["text"].startswith("not_found：")
@@ -249,7 +250,7 @@ async def test_mcp_withheld_and_accept_flow(client):
     bob = LegacyMcp(client, BOB)
     await bob.initialize()
     res = await bob.call("get_item", {"id": "T-52"})
-    assert res["isError"] is False and res["structuredContent"]["withheld"] == "needs_accept"
+    assert res["isError"] is False and res["structuredContent"]["withheld"] == "not_accepted"
     res = await bob.call("claim_task", {"id": "T-52"})
     assert res["isError"] is True and res["structuredContent"]["err"] == "needs_accept"
     page = (await client.get("/api/v1/dev/items/T-52", headers=dev_headers("bob"))).json()
@@ -320,3 +321,106 @@ async def test_rest_note_does_not_change_status(client, svc):
     r = await client.post("/api/v1/tasks/T-50:done", headers=h, json={"note": "PR #2 已合并"})
     assert r.status_code == 200 and r.json()["st"] == "done"
     assert svc.tasks["T-50"].done_at is not None
+
+
+# ---- 本地试用发现的问题（2026-10-02） ----
+
+
+def test_suggest_excludes_the_person_already_named(svc):
+    """report_blocker 的建议人选不含已经点名的人；没点名时同一个人照样会被建议。"""
+    for h in ("carol", "dan"):
+        svc.add_member(h, h)
+    a = agent("alice", "claude_code")
+    named = svc.report_blocker(a, "要一个控制台权限", need="bob", tried="问过运维")
+    hs = [x["h"] for x in named["suggest"]]
+    assert "bob" not in hs and "alice" not in hs and set(hs) == {"carol", "dan"}
+    free = svc.report_blocker(a, "测试账号被锁", tried="重置密码没用")
+    assert {x["h"] for x in free["suggest"]} == {"bob", "carol", "dan"}  # 没点名时 bob 照样在建议里
+
+
+def test_withheld_reason_is_not_an_error_code_and_reading_sends_nothing(svc):
+    """get_item 的扣留原因不和人类动作的错误码同名，读取也不发任何通知（本地试用：agent 读到 withheld 就说"已发到您的微信"）。"""
+    from teamflow_server.errors import HTTP_STATUS
+    from teamflow_server.service import WITHHELD_NOT_ACCEPTED, WITHHELD_PEER_AGENT_TEXT
+
+    assert WITHHELD_NOT_ACCEPTED == "not_accepted"
+    assert WITHHELD_NOT_ACCEPTED not in HTTP_STATUS and WITHHELD_PEER_AGENT_TEXT not in HTTP_STATUS
+    before = len(svc.outbox)
+    for who, oid in ((agent("bob", "codex"), "T-52"), (agent("alice", "claude_code"), "T-51"), (agent("alice", "claude_code"), "B-7")):
+        item = svc.get_item(who, oid)
+        assert item["withheld"] == WITHHELD_NOT_ACCEPTED, oid
+    assert len(svc.outbox) == before  # 读取不触发通知
+
+
+def test_agent_visible_text_does_not_name_a_channel(svc):
+    """agent 看得到的常量和错误说明不提具体通知渠道（D54、D60、D61：微信只是可选通知渠道，默认邮件；人的确认在网页上）。"""
+    from teamflow_server.mcp_server import DESCRIPTIONS, INSTRUCTIONS
+    from teamflow_server.service import HUMAN_ONLY_MSG
+
+    texts = [INSTRUCTIONS, *DESCRIPTIONS.values(), HUMAN_ONLY_MSG]
+    for fn, args in (
+        (svc.claim_task, (agent("alice", "claude_code"), "T-51")),  # needs_human
+        (svc.claim_task, (agent("bob", "codex"), "T-52")),  # needs_accept
+        (svc.claim_task, (agent("bob", "codex"), "T-54")),  # 已完成
+        (svc.human_accept, (agent("bob", "codex"), "T-52")),  # human_only
+    ):
+        with pytest.raises(DomainError) as e:
+            fn(*args, **({"v": 1, "sha": "x", "seq": 1, "through": 0} if fn == svc.human_accept else {}))
+        texts.append(e.value.msg)
+    for t in texts:
+        assert "微信" not in t and "手机" not in t, t
+    # withheld 单列一条、按值说：读取不会通知任何人，不能说已经通知；每个扣留原因都有对应的说法
+    from teamflow_server.service import WITHHELD_REASONS
+
+    rule = [line for line in INSTRUCTIONS.splitlines() if "withheld" in line]
+    assert len(rule) == 1 and "读取不会通知任何人" in rule[0] and "Team Flow 网页" in rule[0]
+    assert "needs_human" not in rule[0] and "needs_accept" not in rule[0]
+    for reason in WITHHELD_REASONS:
+        assert reason in rule[0], reason
+    assert "不要请他再确认一次" in rule[0]  # pending_effect：已经确认过，只是还没到生效时间
+    # "不替用户操作"单列一条，覆盖 needs_*、withheld、human_only（红队：原来只写在 needs_* 那一条里）
+    hands_off = [line for line in INSTRUCTIONS.splitlines() if "不要自己打开或操作 Team Flow 网页" in line]
+    assert len(hands_off) == 1 and "withheld" not in hands_off[0] and "needs_" not in hands_off[0]
+    for word in ("接受", "认领", "转发", "确认", "通行密钥", "设备密码", "PIN"):
+        assert word in hands_off[0], word
+    assert "不要替用户打开网页" in HUMAN_ONLY_MSG
+    assert len(INSTRUCTIONS) <= 1500
+
+
+# 网页上真有的按钮（「」里的词）→ 网页 API 的动作。评论在 /comments，不走 :action
+WEB_BUTTONS = {"接受": "accept", "拒绝": "decline", "认领": "claim", "开始": "start", "完成": "done",
+               "取消认领": "release", "转发": "forward", "帮忙": "help", "评论": None}
+
+
+def test_agent_texts_only_point_to_buttons_the_web_has(svc):
+    """红队：错误说明让用户去网页上"编辑""取消""重新打开"，本地网页没有这些按钮，用户去找会扑空。
+    agent 看得到的文字里「」引起来的按钮都要在网页上真有；不许笼统地说"在网页上操作 / 编辑"。"""
+    import inspect
+    import re
+
+    from teamflow_server import web
+    from teamflow_server.mcp_server import DESCRIPTIONS, INSTRUCTIONS
+    from teamflow_server.service import HUMAN_ONLY_MSG
+
+    src = inspect.getsource(web.web_task_action) + inspect.getsource(web.web_blocker_action)
+    for label, action in WEB_BUTTONS.items():
+        assert action is None or f'action == "{action}"' in src, label
+
+    texts = [INSTRUCTIONS, *DESCRIPTIONS.values(), HUMAN_ONLY_MSG]
+    bob = agent("bob", "codex")
+    t = svc.create_task(bob, title="小改动", assignee="alice")["id"]
+    svc.human_accept(human("alice"), t, **vs(svc, t, seq=True))  # alice 接受过：bob 的 agent 不能再改、不能取消
+    for fn, kw in (
+        (svc.claim_task, {"raw_id": "T-54"}),  # 已完成：不能重新打开
+        (svc.update_task, {"raw_id": t, "title": "改个标题"}),  # 已被接受：agent 不能编辑
+        (svc.update_task, {"raw_id": t, "status": "canceled", "note": "不做了"}),  # 已被接受：agent 不能取消
+    ):
+        with pytest.raises(DomainError) as e:
+            fn(bob if fn == svc.update_task else agent("alice", "claude_code"), **kw)
+        msg = e.value.msg
+        assert "转告用户本人处理" in msg and "还没有" in msg, msg
+        texts.append(msg)
+    for tx in texts:
+        for label in re.findall(r"「([^」]+)」", tx):
+            assert label in WEB_BUTTONS, (label, tx)
+        assert "网页上操作" not in tx and "网页上编辑" not in tx, tx

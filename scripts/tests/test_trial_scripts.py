@@ -3,7 +3,6 @@
 不起服务端、不碰 HOME、不碰仓库的 .local/。运行：.venv/bin/pytest -q scripts/tests
 """
 
-import json
 import os
 import shutil
 import stat
@@ -138,3 +137,47 @@ def test_sim_teammate_help_without_local_env(tmp_path):
     p = subprocess.run([sys.executable, str(d / "sim-teammate.py"), "status"], capture_output=True, text=True, timeout=30)
     assert p.returncode == 1
     assert "scripts/local-up.sh" in p.stderr
+
+
+def test_trial_texts_are_channel_neutral():
+    """本地试用脚本不提具体通知渠道（plan D54、D60、D61）：模拟通知的子命令叫 notifications，读 /api/v1/web/notifications；
+    人的动作写"在网页上"，不写"在手机上"。"""
+    src = open(os.path.join(SCRIPTS, "sim-teammate.py"), encoding="utf-8").read()
+    assert '("notifications", cmd_notifications' in src and "/api/v1/web/notifications" in src
+    assert '"wechat"' not in src and "/web/wechat" not in src
+    for n in ("sim-teammate.py", "local-up.sh", "login-link.sh"):
+        text = open(os.path.join(SCRIPTS, n), encoding="utf-8").read()
+        for bad in ("模拟微信", "手机上", "手机微信"):
+            assert bad not in text, (n, bad)
+
+
+def test_code_fingerprint_tracks_server_code_and_web_dist(tmp_path):
+    """local-up.sh 靠这个指纹判断在跑的服务端是不是旧代码（红队：拉了新代码重跑 local-up.sh，旧进程被保留，
+    网页是新的、接口和 agent 看到的文字是旧的）。只看内容：改 .py、改构建产物会变；改时间、改 __pycache__ 不变。"""
+    root = tmp_path / "repo"
+    pkg = root / "server" / "teamflow_server"
+    (pkg / "__pycache__").mkdir(parents=True)
+    (pkg / "web_dist" / "assets").mkdir(parents=True)
+    (root / "server" / "pyproject.toml").write_text("[project]\n")
+    (pkg / "app.py").write_text("A = 1\n")
+    (pkg / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"x")
+    (pkg / "web_dist" / "index.html").write_text("<script src=assets/index-1.js>")
+    (pkg / "web_dist" / "assets" / "index-1.js").write_text("1")
+    fp = _trial.code_fingerprint(str(root))
+    assert len(fp) == 16 and fp == _trial.code_fingerprint(str(root))
+    os.utime(pkg / "app.py", (1, 1))
+    (pkg / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"y")
+    assert _trial.code_fingerprint(str(root)) == fp
+    (pkg / "web_dist" / "assets" / "index-1.js").write_text("2")
+    fp2 = _trial.code_fingerprint(str(root))
+    assert fp2 != fp
+    (pkg / "app.py").write_text("A = 2\n")
+    assert _trial.code_fingerprint(str(root)) not in (fp, fp2)
+
+
+def test_local_up_restarts_a_server_running_old_code():
+    """local-up.sh 只在指纹对得上时保留在跑的服务端，启动后把指纹记进 local.env。"""
+    src = open(os.path.join(SCRIPTS, "local-up.sh"), encoding="utf-8").read()
+    assert 'OLD_CODE="$(tf_env_get "$CONF" TF_CODE)"' in src
+    assert '[ "$OLD_CODE" = "$CODE" ] && tf_health "$BASE"' in src
+    assert "printf 'TF_CODE=%s\\n' \"$CODE\" >>\"$CONF\"" in src

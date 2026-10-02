@@ -10,6 +10,10 @@
 - 一批最多 BATCH_MAX 条、编码后不超过 BATCH_BYTES：服务端和 nginx 的请求体上限都是 64KB，超了整批 413。
   万一还是 413（服务端上限更小），对半拆开重发；只有单条就超限的才进 dead/。
 - 心跳类记录 24 小时后丢弃，提交类记录保留 7 天。
+- 服务端逐条结果 ``st: "no_repo"``（重放时是 409 加 ``was: "no_repo"``）：这一回合的提交服务端认不出是哪个仓库
+  （仓库没有 origin），会话照常登记，提交一条没记。按仓库目录记到 notices/unrecorded.json（条数、目录、时间、原因），
+  teamflow doctor 逐个仓库报出来；同一个仓库之后带着仓库地址成功上报了提交，只清掉这个仓库的那一项。
+  Stop 发现补上的 origin 属于另一个 workspace 时，提交不发，也记在这里（原因 other_ws，见 hooks.stop）。
 """
 
 import os
@@ -28,6 +32,9 @@ LOCK_STALE = 600
 DEFAULT_BUDGET = 60.0
 MAX_RETRIES = 3
 RETRYABLE = (408, 425, 429)
+NOTICE_TTL = 7 * 24 * 3600
+NOTICE_MAX_DIRS = 20
+UNRECORDED_FILE = "unrecorded.json"
 
 
 def spool_dir() -> str:
@@ -74,6 +81,99 @@ def write(rec: dict) -> bool:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def notices_dir() -> str:
+    """提醒放在 spool 目录外面：spool 目录里的 *.json 都会被当成待上传的记录。"""
+    return os.path.join(common.state_dir(), "notices")
+
+
+def _unrecorded_path() -> str:
+    return os.path.join(notices_dir(), UNRECORDED_FILE)
+
+
+def _load_unrecorded(now: float) -> dict:
+    data = common.read_json(_unrecorded_path())
+    dirs = data.get("dirs") if isinstance(data, dict) else None
+    out = {}
+    for k, v in (dirs.items() if isinstance(dirs, dict) else ()):
+        if (isinstance(k, str) and k and isinstance(v, dict) and type(v.get("n")) is int and v["n"] > 0
+                and now - float(v.get("last") or 0) <= NOTICE_TTL):
+            out[k] = v
+    return out
+
+
+def _save_unrecorded(dirs: dict) -> None:
+    try:
+        if dirs:
+            common.write_json_atomic(os.path.join(common.ensure_dir(notices_dir()), UNRECORDED_FILE), {"v": 2, "dirs": dirs})
+        else:
+            os.unlink(_unrecorded_path())
+    except OSError:
+        pass
+
+
+def unrecorded(now: float | None = None) -> list:
+    """最近 7 天里没被服务端记下的提交，按仓库目录分开，最近的在前：
+    [{"dir", "name", "n", "first", "last", "why", "ws", "want_ws"}]。why 是 no_repo 或 other_ws。"""
+    now = time.time() if now is None else now
+    dirs = _load_unrecorded(now)
+    return [dict(v, dir=k) for k, v in sorted(dirs.items(), key=lambda kv: -float(kv[1].get("last") or 0))]
+
+
+def note_unrecorded(dir_key: str, name: str, n: int, why: str, now: float | None = None, ws=None, want_ws=None) -> None:
+    """记一笔没被服务端记下的提交（只有条数、目录、时间、workspace 名，不记提交标题）。"""
+    now = time.time() if now is None else now
+    if not isinstance(dir_key, str) or not dir_key or n <= 0:
+        return
+    dirs = _load_unrecorded(now)
+    old = dirs.get(dir_key) or {}
+    dirs[dir_key] = {
+        "name": (name if isinstance(name, str) else "")[:80],
+        "n": int(old.get("n") or 0) + int(n),
+        "first": old.get("first") or now,
+        "last": now,
+        "why": why,
+        "ws": ws if isinstance(ws, str) else None,
+        "want_ws": want_ws if isinstance(want_ws, str) else None,
+    }
+    if len(dirs) > NOTICE_MAX_DIRS:
+        for k, _ in sorted(dirs.items(), key=lambda kv: float(kv[1].get("last") or 0))[: len(dirs) - NOTICE_MAX_DIRS]:
+            del dirs[k]
+    _save_unrecorded(dirs)
+
+
+def clear_unrecorded(dir_key: str) -> None:
+    """这个仓库带着仓库地址成功上报了提交：只清它自己的那一项，别的仓库的提醒留着。"""
+    dirs = _load_unrecorded(time.time())
+    if dir_key in dirs:
+        del dirs[dir_key]
+        _save_unrecorded(dirs)
+
+
+def _rec_dir(rec) -> str:
+    """提醒按哪个目录记：Stop 写进记录的仓库根目录（只在本地，不上传）；旧记录没有就用目录名。"""
+    d = rec.get("dir")
+    if isinstance(d, str) and d:
+        return d
+    name = (rec.get("item") or {}).get("cwd_name")
+    return name if isinstance(name, str) and name else "?"
+
+
+def _note_no_repo(rec, dropped, now):
+    item = rec.get("item") or {}
+    name = item.get("cwd_name") if isinstance(item.get("cwd_name"), str) else ""
+    note_unrecorded(_rec_dir(rec), name, dropped, "no_repo", now, ws=rec.get("ws"))
+    common.log("spool: 服务端没记下 %d 个提交：仓库 %s 没有 origin，认不出是哪个仓库" % (dropped, name or "?"))
+
+
+def _commit_count(rec) -> int:
+    """这条记录里本人的提交数：发出去的（最多 5 条）加 own_more。"""
+    item = rec.get("item") or {}
+    commits = item.get("commits")
+    n = sum(1 for c in commits if isinstance(c, dict)) if isinstance(commits, list) else 0
+    more = item.get("own_more")
+    return n + more if n and type(more) is int and 0 < more <= 1000 else n
 
 
 def counts() -> dict:
@@ -305,11 +405,20 @@ def _send_group(d, cred, ws_slug, client, entries, now):
         if isinstance(resp, dict) and isinstance(resp.get("results"), list):
             for r in resp["results"]:
                 if isinstance(r, dict) and isinstance(r.get("key"), str) and type(r.get("status")) is int:
-                    results[r["key"]] = r["status"]
+                    results[r["key"]] = r
         for path, rec in chunk:
-            st = results.get(rec["key"], 200)  # 没有逐条结果：整批 2xx 视为都成功
+            r = results.get(rec["key"]) or {}
+            st = r.get("status", 200)  # 没有逐条结果：整批 2xx 视为都成功
             if 200 <= st < 300 or st == 409:  # 409：服务端已有这条（幂等重放）
                 _done(d, path, rec)
+                has_repo = bool((rec.get("item") or {}).get("repo"))
+                ncommits = _commit_count(rec)
+                # 409 重放：第一次的响应丢了。服务端会带回 was；旧服务端不带，但没有 repo 的提交服务端一定没记
+                if r.get("st") == "no_repo" or r.get("was") == "no_repo" or (st == 409 and ncommits and not has_repo):
+                    n = r.get("dropped")
+                    _note_no_repo(rec, n if type(n) is int and 0 < n <= 1100 else max(1, ncommits), now)
+                elif ncommits and has_repo:
+                    clear_unrecorded(_rec_dir(rec))  # 这个仓库带着地址的提交记下了：只清它自己的提醒
             elif st >= 500 or st in RETRYABLE:
                 _retry(path, rec, now, "item %d" % st)
             else:

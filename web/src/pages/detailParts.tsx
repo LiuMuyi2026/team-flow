@@ -27,7 +27,7 @@ export function StaleBanner({ kind, onShow }: { kind: Stale; onShow: () => void 
  */
 export function AgentLine({ content, how, what = "正文" }: { content: AgentView["content"]; how: string; what?: string }) {
   if (content === "visible") return <p className="agent-line">您的 agent 已经能读到这段{what}。</p>;
-  if (content === "needs_accept")
+  if (content === "not_accepted")
     return (
       <p className="agent-line">
         {how ? `您的 agent 现在还读不到这段${what}，要您${how}后才给。` : `您的 agent 读不到这段${what}：这件事现在不归您。`}
@@ -37,7 +37,7 @@ export function AgentLine({ content, how, what = "正文" }: { content: AgentVie
 }
 
 export function ForwardBlock(props: { n: number; content: AgentView["content"]; how: string; what?: string; busy: boolean; onForward: () => void }) {
-  const tail = props.content === "needs_accept" && props.how ? `；${props.what ?? "正文"}要您${props.how}后才给。` : "。";
+  const tail = props.content === "not_accepted" && props.how ? `；${props.what ?? "正文"}要您${props.how}后才给。` : "。";
   return (
     <div className="action">
       <button type="button" className="btn" disabled={props.busy} onClick={props.onForward}>

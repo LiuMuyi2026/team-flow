@@ -363,6 +363,27 @@ def stop(payload: dict, client: str, cred: str) -> None:
         st["head"] = cur
     if cwd != st.get("cwd"):
         st["cwd"] = cwd
+    top = (gitinfo.toplevel(cwd) or cwd) if own else None
+    if own and not st.get("repo"):
+        # 会话开始时仓库还没有 origin（本地试用常见）：有提交要报时再读一次，会话中途加上的 origin 也能用上。
+        # 但 workspace 是会话开始时按 cwd 和当时（空）的 remote 选的：补上的 origin 按 repo_patterns 归另一个
+        # workspace 时，这个仓库的提交、标题、地址不能发到会话开始时钉住的那个 workspace 的服务端。
+        # 这一回合的提交整条不报，记一条本地提醒（doctor 报出来，请用户重开会话）；会话继续用原 workspace，
+        # 只报心跳，不带仓库地址。
+        repo = gitinfo.session_info(cwd).get("repo")
+        if repo:
+            try:
+                want, _ = common.select_workspace(creds, cwd, repo)
+            except common.CredError:
+                want = None
+            if want == slug:
+                st["repo"] = repo
+            else:
+                n = own_total or len(own)
+                spool.note_unrecorded(top, os.path.basename(top.rstrip("/")), n, "other_ws", ws=slug, want_ws=want)
+                common.log("stop: 仓库 %s 补上的 origin 属于 workspace %s，不是这个会话的 %s：%d 个提交没上报，请重开会话"
+                           % (os.path.basename(top.rstrip("/")) or "?", want or "?", slug, n))
+                own, own_total = [], 0
 
     key = spool.idem_key(client, sid, "turn_end", turn)
     item = _base_item("turn_end", key, sid, client)
@@ -378,10 +399,11 @@ def stop(payload: dict, client: str, cred: str) -> None:
             "other_commits": other,
         }
     )
-    spool.write(
-        {"key": key, "kind": "commit" if own else "heartbeat", "created": time.time(), "attempts": 0,
-         "next_try": 0, "cred": cred, "ws": slug, "client": client, "item": item}
-    )
+    rec = {"key": key, "kind": "commit" if own else "heartbeat", "created": time.time(), "attempts": 0,
+           "next_try": 0, "cred": cred, "ws": slug, "client": client, "item": item}
+    if own:
+        rec["dir"] = top  # 只在本地：服务端回 no_repo 时按仓库记提醒，不上传
+    spool.write(rec)
     st["ws"] = slug
     save_state(client, sid, st)
     _spawn_flush(client, cred, slug, refresh=True)

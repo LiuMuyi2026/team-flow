@@ -94,7 +94,7 @@ def human(handle: str) -> Actor:
 
 
 def page(svc: Service, oid: str) -> dict[str, Any]:
-    """模拟手机详情页渲染时表单里带的值：v、sha、seq（任务）、through。"""
+    """模拟网页详情页渲染时表单里带的值：v、sha、seq（任务）、through。"""
     return svc.page_view(oid)
 
 

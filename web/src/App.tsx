@@ -7,10 +7,10 @@ import { Home } from "./pages/Home";
 import { NewTask } from "./pages/NewTask";
 import { TaskDetail } from "./pages/TaskDetail";
 import { Tasks } from "./pages/Tasks";
-import { Wechat } from "./pages/Wechat";
+import { Notifications } from "./pages/Notifications";
 import { Link, navigate, useLocation } from "./router";
 import type { Me } from "./types";
-import { markSeen, seen } from "./unread";
+import { markSeen, SEEN_EVENT, seen } from "./unread";
 
 type Auth =
   | { s: "loading" }
@@ -111,7 +111,7 @@ function Nav({ me }: { me: string }) {
     { to: "/", text: "首页", on: loc.path === "/" },
     { to: "/tasks", text: "任务", on: loc.path === "/tasks" || loc.path === "/task" },
     { to: "/new", text: "发布", on: loc.path === "/new" },
-    { to: "/wechat", text: unread ? `模拟微信（${unread}）` : "模拟微信", on: loc.path === "/wechat" },
+    { to: "/notifications", text: unread ? `模拟通知（${unread}）` : "模拟通知", on: loc.path === "/notifications" },
   ];
   return (
     <nav className="nav" aria-label="页面">
@@ -121,7 +121,7 @@ function Nav({ me }: { me: string }) {
           to={it.to}
           className="nav-item"
           aria-current={it.on ? "page" : undefined}
-          aria-label={it.to === "/wechat" && unread ? `模拟微信，${unread} 条新消息` : undefined}
+          aria-label={it.to === "/notifications" && unread ? `模拟通知，${unread} 条新通知` : undefined}
         >
           {it.text}
         </Link>
@@ -130,7 +130,7 @@ function Nav({ me }: { me: string }) {
   );
 }
 
-/** 「模拟微信」有几条新消息：每 30 秒看一次（正式版里这是手机上的微信提醒）。 */
+/** 「模拟通知」有几条新通知：每 30 秒看一次（正式版里通知按各人选的渠道发邮件或微信）。 */
 function useUnread(me: string): number {
   const [n, setN] = useState(0);
   const loc = useLocation();
@@ -139,7 +139,7 @@ function useUnread(me: string): number {
     const check = async () => {
       if (document.hidden) return;
       try {
-        const w = await api.wechat(50);
+        const w = await api.notifications(50);
         const last = w.items[0]?.n ?? 0;
         let s = seen(me);
         if (last < s) {
@@ -155,12 +155,12 @@ function useUnread(me: string): number {
     void check();
     const t = window.setInterval(() => void check(), POLL_MS);
     const onSeen = () => void check();
-    window.addEventListener("tf-wx-seen", onSeen);
+    window.addEventListener(SEEN_EVENT, onSeen);
     document.addEventListener("visibilitychange", onSeen);
     return () => {
       alive = false;
       window.clearInterval(t);
-      window.removeEventListener("tf-wx-seen", onSeen);
+      window.removeEventListener(SEEN_EVENT, onSeen);
       document.removeEventListener("visibilitychange", onSeen);
     };
   }, [me, loc.path]);
@@ -181,8 +181,8 @@ function Routes() {
       return <BlockerDetail key={id} id={id} />;
     case "/new":
       return <NewTask />;
-    case "/wechat":
-      return <Wechat />;
+    case "/notifications":
+      return <Notifications />;
     case "/me":
       return <MePage />;
     default:
@@ -207,12 +207,21 @@ function MePage() {
               <dt>登录到期</dt>
               <dd>{me.expires.slice(5, 16).replace("T", " ")}（12 小时）</dd>
             </dl>
-            <SwitchHelp example={me.members.find((m) => m.h !== me.me)?.h} />
+            <SwitchHelp example={switchExample(me)} />
           </div>
         )
       }
     </MeContext.Consumer>
   );
+}
+
+/**
+ * "换成队友"的例子：挑一位有 agent 令牌的队友（本地试用里就是 scripts/sim-teammate.py 能模拟的人），
+ * 不挑只在演示数据里出现的人（比如 alice：她没有模拟命令，换成她也走不了手册里的场景）。
+ */
+export function switchExample(me: Me): string | undefined {
+  const others = me.members.filter((m) => m.h !== me.me);
+  return (others.find((m) => m.agent) ?? others[0])?.h;
 }
 
 function SwitchHelp({ example = "bob" }: { example?: string }) {
@@ -233,7 +242,7 @@ function LoggedOut({ why }: { why: "none" | "expired" | "bye" }) {
   return (
     <div className="page login-help">
       <h1 className="page-title">{head}</h1>
-      <p>本地试用里，这个网页扮演“手机上的您”：接受、认领、转发这些只有您本人能做的事，在这里点。</p>
+      <p>接受、认领、确认、转发这些只有您本人能做的事，都在这个网页上点。</p>
       <p>请在您自己的终端（不要让 agent 替您运行）里运行：</p>
       <pre className="cmd">scripts/login-link.sh</pre>
       <p>打开它给出的链接，点「登录」。链接 10 分钟内有效，只能用一次。</p>

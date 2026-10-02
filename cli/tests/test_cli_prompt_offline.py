@@ -98,7 +98,7 @@ def test_prompt_paths_never_spawn(env, stub, monkeypatch, no_network, client, na
         return
     text = json.loads(out)["hookSpecificOutput"]["additionalContext"] if client == "claude" else out.decode()
     assert text.startswith(inbox.SENTINEL)
-    assert "待您接受 T-55（来自 li 的 Codex），需您本人在手机上接受" in text
+    assert "待您接受 T-55（来自 li 的 Codex），需您本人在 Team Flow 网页上接受" in text
     assert "B-7" not in text  # 已经通知过
     st = json.load(open(os.path.join(env.state, "sessions", "%s-%s.json" % (client, SID[client]))))
     assert st["announced"] == ["acc:T-55", "help:B-7"]

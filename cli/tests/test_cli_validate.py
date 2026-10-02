@@ -81,8 +81,28 @@ def test_malicious_server_response_end_to_end(env, stub):
 
 
 def test_delta_limit_200():
-    segs = ["待您接受 T-%d（来自 someone_long_name 的 Claude Code），需您本人在手机上接受" % (100000 + i) for i in range(10)]
+    segs = ["待您接受 T-%d（来自 someone_long_name 的 Claude Code），需您本人在 Team Flow 网页上接受" % (100000 + i) for i in range(10)]
     text = inbox.render_delta(segs)
     assert len(text) <= 200
     assert text.startswith(inbox.SENTINEL)
     assert "用 inbox 查看" in text
+
+
+def test_templates_do_not_name_a_notification_channel():
+    """注入模板不提具体通知渠道：人的确认在 Team Flow 网页上做，通知按各人选的渠道发（plan D54、D60、D61）。"""
+    from teamflow import board_cmd
+
+    data = inbox.validate({
+        "me": "zhao", "doing": ["T-1"], "todo": ["T-2"],
+        "to_accept": [{"id": "T-3", "by": "li", "bk": "agent", "client": "codex"}, {"id": "T-4", "by": "li", "bk": "human"}],
+        "help_me": [{"id": "B-1", "by": "li"}], "fwd": [{"id": "B-1", "n": 2, "by": "li"}],
+        "proposed": [{"id": "B-2", "h": "li", "client": "claude_code"}], "pool_new": 1,
+    })
+    one = inbox.validate({"me": "zhao", "to_accept": [{"id": "T-3", "by": "li", "bk": "agent", "client": "codex"}]})
+    texts = [inbox.render_session_start(data), inbox.render_session_start(one), inbox.render_delta(list(inbox.need_me_keys(data).values())),
+             *inbox.need_me_keys(data).values(), *board_cmd.ERROR_TEXT.values()]
+    for t in texts:
+        assert "微信" not in t and "手机" not in t, t
+    assert "Team Flow 网页" in texts[0] and "Team Flow 网页" in texts[1]
+    # 兜底文字只在服务端没给说明时用，CLI 不知道有没有发通知：一律不说"已通知"
+    assert not any("已通知" in t for t in board_cmd.ERROR_TEXT.values())

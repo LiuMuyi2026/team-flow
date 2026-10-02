@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, ApiError, CONFLICT_TEXT, humanMessage, setCsrf } from "../src/api";
+import { api, ApiError, CONFLICT_TEXT, humanMessage, setCsrf, STALE_SERVER_TEXT } from "../src/api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -22,6 +22,10 @@ describe("错误变人话", () => {
     expect(humanMessage(401, "unauthorized", {})).toContain("scripts/login-link.sh");
     expect(humanMessage(403, "csrf", {})).toContain("刷新");
     expect(humanMessage(404, "not_found", {})).toContain("没有找到");
+    // 没有这个接口：在跑的服务端是旧代码（新服务端带 no_route，旧服务端只有 Starlette 默认的 "Not Found"）
+    expect(humanMessage(404, "not_found", { message: "Not Found", no_route: true })).toBe(STALE_SERVER_TEXT);
+    expect(humanMessage(404, "not_found", { message: "Not Found" })).toContain("scripts/local-up.sh");
+    expect(humanMessage(404, "not_found", { message: "没有 T-99。" })).toContain("没有找到");
     expect(humanMessage(500, "http_500", {})).toContain("服务端出错了");
   });
 });

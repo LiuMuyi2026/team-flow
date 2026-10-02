@@ -179,7 +179,7 @@ def _build_parser():
 
     b = sub.add_parser("block", help="报告困难（MCP 不可用时的兜底）",
                        description="报告困难：卡住超过 20 分钟，或需要别人做决定、给权限。"
-                       "--need 只是提议请谁帮忙，用户在手机上确认后才通知对方。"
+                       "--need 只是提议请谁帮忙，用户在 Team Flow 网页上确认后才通知对方。"
                        "例：teamflow block --task T-42 --title \"测试库连不上\" --need zhang")
     b.add_argument("--title", required=True, help="一句话说清卡在哪（最多 120 字）")
     b.add_argument("--task", help="相关任务编号，如 T-42")

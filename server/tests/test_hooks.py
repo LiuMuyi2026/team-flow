@@ -152,7 +152,53 @@ async def test_log_has_session_header_and_handle(client, log_path):
     assert rec["sess"] == "cc-sess-1" and rec["h"] == "alice" and rec["st"] == 200 and rec["path"] == "/api/v1/me/inbox"
 
 
-async def test_dev_outbox_lists_simulated_wechat(client):
+async def test_dev_outbox_lists_simulated_notifications(client):
     r = await client.get("/api/v1/dev/outbox", headers=dev_headers("alice"), params={"to": "bob"})
     texts = [x["text"] for x in r.json()["items"]]
     assert "alice 的 Claude Code 请您协作（T-52）" in texts
+
+
+async def test_commits_without_repo_are_reported_not_silently_dropped(client, svc):
+    """本地试用：演示仓库没有 origin 时，turn_end 里的提交被悄悄丢掉、还返回 200 ok。
+    现在会话照常登记，提交不记，逐条结果是 200 st=no_repo 加 dropped，CLI 据此报出来。"""
+    sha = "ab" * 20
+    items = [
+        {"key": "nr1", "type": "turn_end", "client": "claude", "session_id": "nr-s", "ts": 1,
+         "commits": [{"sha": sha, "title": "接口联调"}, {"sha": "cd" * 20, "title": "补测试"}]},
+        {"key": "nr2", "type": "turn_end", "client": "claude", "session_id": "nr-s", "ts": 2},  # 没有提交的心跳不受影响
+        {"key": "nr3", "type": "turn_end", "client": "claude", "session_id": "nr-s", "ts": 3, "repo": "example.com/demo/tf-demo.git",
+         "commits": [{"sha": "ef" * 32, "title": "SHA-256 仓库的提交"}]},
+        {"key": "nr4", "type": "commit", "client": "claude", "session_id": "nr-s", "sha": sha, "title": "旧写法"},
+    ]
+    r = await client.post("/api/v1/hooks/batch", headers=auth(ALICE), json={"v": 1, "items": items})
+    res = r.json()["results"]
+    assert res[0] == {"key": "nr1", "status": 200, "st": "no_repo", "dropped": 2}
+    assert res[1] == {"key": "nr2", "status": 200, "st": "ok"}
+    assert res[2] == {"key": "nr3", "status": 200, "st": "ok"}
+    assert res[3]["status"] == 422 and res[3]["err"] == "repo"
+    assert svc.sessions[("claude_code", "nr-s")].handle == "alice"  # 会话照常登记
+    commits = {e.data["sha"] for e in svc.events if e.type == "commit"}
+    assert sha not in commits and "ef" * 32 in commits
+    assert [a for a in svc.audit if a["action"] == "hook.commits_no_repo"][-1]["n"] == 2
+
+
+async def test_no_repo_survives_a_lost_response_and_counts_own_more(client, svc):
+    """红队：第一次的响应在路上丢了，CLI 重试拿到 409 dup，原来结果里没有 no_repo，提醒又被悄悄吞掉。
+    现在重放时带回 was=no_repo 和 dropped；本人超过 5 条的提交（own_more）同样没记，一并算进 dropped。"""
+    commits = [{"sha": ("%02x" % i) * 20, "title": "提交 %d" % i} for i in range(5)]
+    item = {"key": "lost1", "type": "turn_end", "client": "claude", "session_id": "nr-lost", "ts": 1,
+            "commits": commits, "own_more": 3}
+    body = {"v": 1, "items": [item]}
+    first = (await client.post("/api/v1/hooks/batch", headers=auth(ALICE), json=body)).json()["results"][0]
+    assert first == {"key": "lost1", "status": 200, "st": "no_repo", "dropped": 8}
+    again = (await client.post("/api/v1/hooks/batch", headers=auth(ALICE), json=body)).json()["results"][0]
+    assert again == {"key": "lost1", "status": 409, "st": "dup", "was": "no_repo", "dropped": 8}
+    # 带着仓库地址记下的条目，重放时只是 dup，不带 was
+    ok = {**item, "key": "lost2", "repo": "example.com/demo/tf-demo.git"}
+    await client.post("/api/v1/hooks/batch", headers=auth(ALICE), json={"v": 1, "items": [ok]})
+    dup = (await client.post("/api/v1/hooks/batch", headers=auth(ALICE), json={"v": 1, "items": [ok]})).json()["results"][0]
+    assert dup == {"key": "lost2", "status": 409, "st": "dup"}
+    # own_more 超出范围的不算
+    bad = {**item, "key": "lost3", "own_more": 10**6}
+    r = (await client.post("/api/v1/hooks/batch", headers=auth(ALICE), json={"v": 1, "items": [bad]})).json()["results"][0]
+    assert r["dropped"] == 5

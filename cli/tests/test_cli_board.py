@@ -52,7 +52,7 @@ def test_block_all_fields(env, stub):
     assert p.returncode == 0, p.stderr.decode()
     out = p.stdout.decode()
     assert out.startswith("已报告困难 B-9。")
-    assert "请 zhang 帮忙只是提议，等您在手机上确认后才会通知对方。" in out
+    assert "请 zhang 帮忙只是提议，等您在 Team Flow 网页上确认后才会通知对方。" in out
     (r,) = _req(stub, "/api/v1/blockers")
     assert r["body"] == {"title": "测试库连不上", "detail": "连接超时", "tried": "重启过", "task": "T-42", "need": "zhang"}
     # 只有标题也行；没给的字段不发
@@ -84,7 +84,7 @@ def test_error_code_first(env, stub, body):
     "status,body,code,text",
     [
         (401, b"", "unauthorized", "token 无效或已吊销"),
-        (403, {"error": "human_only"}, "human_only", "只能由本人在手机微信里完成"),
+        (403, {"error": "human_only"}, "human_only", "只能由本人在 Team Flow 网页上完成"),
         (422, {"error": "secret_detected"}, "secret_detected", "像是有密钥或个人信息"),
         (502, b"<html>bad gateway</html>", "server_error", "服务端返回 502"),
         (404, {"error": "Not Found!"}, "not_found", "找不到这一项"),  # 不合格的错误码按状态码归类

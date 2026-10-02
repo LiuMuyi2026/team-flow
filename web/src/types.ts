@@ -15,6 +15,8 @@ export interface Envelope {
 export interface Member {
   h: string;
   name: string;
+  /** 有 agent 令牌（本地试用里就是您和 scripts/sim-teammate.py 能模拟的队友） */
+  agent?: boolean;
 }
 
 export interface Project {
@@ -106,7 +108,7 @@ export interface PageVals {
 }
 
 export interface AgentView {
-  content: "visible" | "needs_accept" | "none";
+  content: "visible" | "not_accepted" | "none";
   through: number;
   unforwarded: number;
 }
@@ -150,7 +152,7 @@ export interface BlockerItem extends ItemBase {
 
 export type Item = TaskItem | BlockerItem;
 
-export interface WechatItem {
+export interface NoticeItem {
   n: number;
   kind: string;
   kind_text: string;
@@ -161,7 +163,7 @@ export interface WechatItem {
   path: string | null;
 }
 
-export interface Wechat {
-  items: WechatItem[];
+export interface Notifications {
+  items: NoticeItem[];
   total: number;
 }

@@ -339,7 +339,7 @@ WEB_CALLS = [
     ("GET", "/api/v1/web/tasks"),
     ("GET", "/api/v1/web/tasks/T-52"),
     ("GET", "/api/v1/web/blockers/B-7"),
-    ("GET", "/api/v1/web/wechat"),
+    ("GET", "/api/v1/web/notifications"),
     ("POST", "/api/v1/web/tasks"),
     ("POST", "/api/v1/web/tasks/T-52:accept"),
     ("POST", "/api/v1/web/tasks/T-53:claim"),
@@ -409,13 +409,23 @@ async def test_web_writes_need_csrf_and_origin(web_as, svc, method, path):
 async def test_web_get_needs_no_csrf_and_has_no_side_effects(web_as, svc):
     c, _ = await web_as("bob")
     before = (svc.latest_event_id(), dict(svc.acceptances), len(svc.outbox))
-    for path in ("/api/v1/web/me", "/api/v1/web/home", "/api/v1/web/tasks?view=all", "/api/v1/web/tasks/T-52", "/api/v1/web/blockers/B-7", "/api/v1/web/wechat"):
+    for path in ("/api/v1/web/me", "/api/v1/web/home", "/api/v1/web/tasks?view=all", "/api/v1/web/tasks/T-52", "/api/v1/web/blockers/B-7", "/api/v1/web/notifications"):
         r = await c.get(path)
         assert r.status_code == 200, (path, r.text)
         assert r.headers["cache-control"] == "no-store" and r.headers["x-content-type-options"] == "nosniff"
     assert (svc.latest_event_id(), dict(svc.acceptances), len(svc.outbox)) == before
     # bob 在网页上看过 T-52 的正文，他的 agent 仍然拿不到（看不等于接受）
-    assert svc.get_item(agent("bob", "codex"), "T-52")["withheld"] == "needs_accept"
+    assert svc.get_item(agent("bob", "codex"), "T-52")["withheld"] == "not_accepted"
+
+
+async def test_unknown_web_route_says_no_route(web_as):
+    """没有这个接口（比如旧地址 /api/v1/web/wechat）和"没有这一项"分开：路由级 404 带 no_route，
+    网页据此提示"在跑的服务端是旧代码，重新运行 scripts/local-up.sh"（红队：原来提示"编号不对或服务端刚重启过"）。"""
+    c, _ = await web_as("bob")
+    r = await c.get("/api/v1/web/wechat")
+    assert r.status_code == 404 and r.json()["error"] == "not_found" and r.json()["no_route"] is True
+    r = await c.get("/api/v1/web/tasks/T-999")
+    assert r.status_code == 404 and "no_route" not in r.json()
 
 
 async def test_web_cookie_never_authenticates_pat_endpoints(web_as):
@@ -465,7 +475,7 @@ async def test_web_body_limit_after_session(web_as, app):
 async def test_web_accept_stale_version_409_and_missing_400(web_as, svc):
     c, h = await web_as("bob")
     d = (await c.get("/api/v1/web/tasks/T-52")).json()
-    assert d["can"][:2] == ["accept", "decline"] and d["agent"]["content"] == "needs_accept"
+    assert d["can"][:2] == ["accept", "decline"] and d["agent"]["content"] == "not_accepted"
     assert d["content"]["label"] == "alice 的 Claude Code" and d["assign"]["bk"] == "agent"
     full = page_fields(d, "v", "sha", "seq", "through")
     for drop in ("v", "sha", "seq", "through"):
@@ -513,17 +523,17 @@ async def test_web_claim_stale_version_409_then_taken(web_as, svc):
 
 
 async def test_scenario1_agent_asks_then_human_claims(web_as, client, svc):
-    """场景 1：bob 的 Codex 发布 T-51；alice 的 agent 认领 → needs_human + 模拟微信；alice 在网页上认领后 agent 接手。"""
+    """场景 1：bob 的 Codex 发布 T-51；alice 的 agent 认领 → needs_human + 模拟通知；alice 在网页上认领后 agent 接手。"""
     r = await client.post("/api/v1/tasks/T-51:claim", headers=auth(ALICE))
     assert r.status_code == 403 and r.json()["error"] == "needs_human"
     c, h = await web_as("alice")
-    wx = (await c.get("/api/v1/web/wechat")).json()
+    wx = (await c.get("/api/v1/web/notifications")).json()
     top = wx["items"][0]
     assert top["kind"] == "agent_asks" and top["text"] == "您的 Claude Code 想开始 T-51，点这里认领"
     assert top["path"] == f"/task?w=team&id=T-51&n={top['n']}" and top["kind_text"] == "您的 agent 需要您确认"
     assert all(n["to"] == "alice" for n in svc.outbox if n["text"] in {i["text"] for i in wx["items"]})
     d = (await c.get("/api/v1/web/tasks/T-51")).json()
-    assert "claim" in d["can"] and d["agent"]["content"] == "needs_accept"
+    assert "claim" in d["can"] and d["agent"]["content"] == "not_accepted"
     assert d["t"]["label"] == "bob 的 Codex" and d["content"]["t"].startswith("首屏在 4G 下")
     r = await c.post("/api/v1/web/tasks/T-51:claim", headers=h, json=page_fields(d, "v", "sha", "through"))
     assert r.status_code == 200 and r.json()["st"] == "todo"
@@ -538,7 +548,7 @@ async def test_forward_only_releases_what_the_page_showed(web_as, svc):
     alice_cc = agent("alice", "claude_code")
     c, h = await web_as("alice")
     d = (await c.get("/api/v1/web/blockers/B-7")).json()
-    assert d["agent"] == {"content": "needs_accept", "through": 0, "unforwarded": 1}
+    assert d["agent"] == {"content": "not_accepted", "through": 0, "unforwarded": 1}
     assert set(d["can"]) >= {"help", "forward", "comment"}
     comment = [e for e in d["ev"] if e["ty"] == "comment"][0]
     assert comment["agent"] is False and comment["label"] == "bob 的 Codex" and comment["what"] == "评论"
@@ -549,7 +559,7 @@ async def test_forward_only_releases_what_the_page_showed(web_as, svc):
     r = await c.post("/api/v1/web/blockers/B-7:forward", headers=h, json={"through": seen})
     assert r.status_code == 200 and r.json()["through"] == seen
     item = svc.get_item(alice_cc, "B-7", 10)
-    assert item["withheld"] == "needs_accept"  # 转发不授予正文
+    assert item["withheld"] == "not_accepted"  # 转发不授予正文
     texts = [e.get("t") for e in item["ev"] if e.get("ty") == "comment"]
     assert texts == ["已确认是安全组规则的问题，需要有控制台权限的人加一条入站规则。"]
     assert [e for e in item["ev"] if e.get("withheld") == "peer_agent_text"][0]["n"] == 1
@@ -576,7 +586,7 @@ async def test_decline(web_as, svc):
     t = svc.tasks["T-52"]
     assert (t.assignee, t.assign_state, t.status) == ("alice", "accepted", "open")
     ca, _ = await web_as("alice")
-    wx = (await ca.get("/api/v1/web/wechat")).json()["items"]
+    wx = (await ca.get("/api/v1/web/notifications")).json()["items"]
     assert wx[0]["text"] == "bob 没接 T-52" and wx[0]["kind"] == "task_reply"
     ev = [e for e in (await ca.get("/api/v1/web/tasks/T-52")).json()["ev"] if e["ty"] == "task.declined"][0]
     assert ev["t"] == "这周排满了" and ev["what"] == "拒绝了" and ev["label"] == "bob"
@@ -627,7 +637,7 @@ async def test_create_task_and_comments(web_as, svc):
     assert r.json()["st"] == "pending" and r.json()["path"] == f"/task?w=team&id={tid}"
     assert svc.tasks[tid].title == "看一下 支付对账"  # 人写的标题折成一行
     cb, hb = await web_as("bob")
-    wx = (await cb.get("/api/v1/web/wechat")).json()["items"][0]
+    wx = (await cb.get("/api/v1/web/notifications")).json()["items"][0]
     assert wx["text"] == f"alice 请您协作：看一下 支付对账（{tid}）" and wx["kind"] == "task_assigned"
     r = await ca.post("/api/v1/web/tasks", headers=ha, json={"title": "补监控", "assignee": ""})
     assert r.status_code == 201 and r.json()["st"] == "pool"
@@ -667,7 +677,7 @@ async def test_blocker_ask_help_resolve(web_as, svc):
     r = await cb.post(f"/api/v1/web/blockers/{bid}:ask", headers=hb, json={})
     assert r.status_code == 200 and r.json()["need_state"] == "asked"
     ca, ha = await web_as("alice")
-    wx = (await ca.get("/api/v1/web/wechat")).json()["items"][0]
+    wx = (await ca.get("/api/v1/web/notifications")).json()["items"][0]
     assert wx["text"] == f"bob 请您帮忙看 {bid}" and wx["path"].startswith(f"/blocker?w=team&id={bid}&n=")
     d = (await ca.get(f"/api/v1/web/blockers/{bid}")).json()
     r = await ca.post(f"/api/v1/web/blockers/{bid}:help", headers=ha, json=page_fields(d, "v", "sha", "through"))
@@ -696,7 +706,7 @@ async def test_home_and_lists(web_as):
     r = await c.get("/api/v1/web/tasks", params={"view": "nope"})
     assert r.status_code == 400
     me = (await c.get("/api/v1/web/me")).json()
-    assert me["members"] == [{"h": "alice", "name": "Alice"}, {"h": "bob", "name": "Bob"}] and me["mode"] == "dev"
+    assert me["members"] == [{"h": "alice", "name": "Alice", "agent": True}, {"h": "bob", "name": "Bob", "agent": True}] and me["mode"] == "dev"
     assert (await c.get("/api/v1/web/tasks/T-999")).status_code == 404
     assert (await c.get("/api/v1/web/blockers/T-52")).status_code == 404
 
@@ -847,6 +857,9 @@ async def test_token_handles_become_members_and_lead_the_banner(monkeypatch, cap
             await login(c, "yang")
             home = (await c.get("/api/v1/web/home")).json()
             assert home["me"] == "yang" and home["mine"]["to_accept"] == []
+            # 有令牌的成员带 agent: true；只在演示数据里的 alice 没有（「我」页"换成队友"的例子不挑她）
+            members = {m["h"]: m.get("agent", False) for m in (await c.get("/api/v1/web/me")).json()["members"]}
+            assert members == {"alice": False, "bob": True, "carol": True, "yang": True}
     # dev/reset 重新播种后成员还在
     svc.reset()
     from teamflow_server.seed import seed

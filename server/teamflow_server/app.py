@@ -78,7 +78,9 @@ def create_app(service: Service | None = None, *, with_seed: bool = True) -> Fas
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, f"http_{exc.status_code}")
-        return JSONResponse(rest_error(code, str(exc.detail)), status_code=exc.status_code, headers=getattr(exc, "headers", None))
+        # no_route：没有这个接口（不是"没有这一项"）。本地试用里多半是网页更新了、在跑的服务端还是旧代码，网页据此提示重跑 local-up.sh
+        extra = {"no_route": True} if exc.status_code == 404 else {}
+        return JSONResponse(rest_error(code, str(exc.detail), **extra), status_code=exc.status_code, headers=getattr(exc, "headers", None))
 
     app.include_router(router)
     app.include_router(web)

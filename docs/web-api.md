@@ -2,7 +2,7 @@
 
 给做前端的人照着做。服务端代码在 `server/teamflow_server/web.py`、`webauth.py`、`devlogin.py`，测试在 `server/tests/test_web.py`。
 
-本地试用版里，网页扮演"手机上的人"：浏览器里登录成某个成员，做接受、拒绝、认领、转发、帮忙这些只有人能做的动作。正式版里人的身份来自手机微信（plan 7.2），这一层到 M1 换掉；接口路径和 JSON 形状不变。
+本地试用版里，浏览器登录成某个成员，以本人的身份做接受、拒绝、认领、转发、帮忙这些只有人能做的动作。正式版里人用通行密钥登录，每个人类动作再当场验证一次通行密钥（plan D54、D55），这一层到 M1 换掉：接口路径不变，按钮请求另带一次通行密钥断言。通知（邮件或微信，plan D61）只做提醒，不授予任何权限。
 
 ## 1. 先说清楚的几条规则
 
@@ -105,7 +105,7 @@ cookie：
 | POST | `/api/v1/web/blockers/{id}:resolve` | 已解决 `{body}` |
 | POST | `/api/v1/web/blockers/{id}:forward` | 转发给我的 agent `{through}` |
 | POST | `/api/v1/web/blockers/{id}/comments` | 评论 `{body}` |
-| GET | `/api/v1/web/wechat` | 模拟微信：我会收到的通知 |
+| GET | `/api/v1/web/notifications` | 模拟通知：我会收到的通知 |
 | POST | `/api/v1/web/logout` | 登出 |
 
 所有 `/api/v1/web/*` 共有的错误：401 `unauthorized`（没登录或过期）、403 `human_only`（带了 Authorization）、403 `csrf`（写请求）、404 `not_found`（不是本地开发模式、不是本机来源、对象不存在）、413 `too_large`、422 `invalid`（请求体类型不对，带 `field`）。下面每个端点只列它特有的。
@@ -119,12 +119,14 @@ cookie：
   "csrf": "ipFEAOv6LIR7StpJUmuX3wwbSIyfpb2g",
   "mode": "dev",
   "expires": "2026-10-03T12:42:47+08:00",
-  "members": [{"h": "alice", "name": "Alice"}, {"h": "bob", "name": "Bob"}],
+  "members": [{"h": "alice", "name": "Alice"}, {"h": "bob", "name": "Bob", "agent": true}],
   "projects": [{"key": "pay", "name": "支付"}, {"key": "tf", "name": "Team Flow"}]
 }
 ```
 
 页面顶部要一直显示"您现在是 bob"：同时扮演两个人时很容易点错。
+
+`members[].agent` 只在为 `true` 时出现：这个成员有 agent 令牌（`TEAMFLOW_DEV_TOKENS` 里有他）。本地试用里就是您本人和 `scripts/sim-teammate.py` 能模拟的队友；只在演示数据里出现的人（比如 alice）没有。「我」页"换成队友"的例子从带 `agent` 的队友里挑。
 
 ### GET /api/v1/web/home
 
@@ -216,7 +218,7 @@ plan 7.1 首页的四块。只放 ID，标题在 `titles` 里按 ID 取。**列�
   ],
   "url": "http://127.0.0.1:8100/task?w=team&id=T-52",
   "page": {"id": "T-52", "v": 1, "sha": "40b06df599a76d0d1d91c2b9027b784930974c0169c876fa9613ba5a5624c09f", "through": 9, "seq": 1},
-  "agent": {"content": "needs_accept", "through": 0, "unforwarded": 1},
+  "agent": {"content": "not_accepted", "through": 0, "unforwarded": 1},
   "created": "2026-10-02T22:42:47+08:00",
   "can": ["accept", "decline", "forward", "comment"],
   "path": "/task?w=team&id=T-52"
@@ -226,7 +228,7 @@ plan 7.1 首页的四块。只放 ID，标题在 `titles` 里按 ID 取。**列�
 - `content`：给人看的清洗后正文，**就是 agent 接受后会拿到的那段**（plan 3.2 场景 2），没有正文时不给。显示时醒目标注 `content.label`。
 - `ev`：全部动态（不分页），旧的在前。`what` 是可直接显示的中文（"指派给了您""拒绝了""取消认领，放回待认领"……），按看页面的人写：动态里提到的人（`to`、`need`）是本人时写「您」，别人写 handle（同一条指派，bob 看是"指派给了您"，alice 看是"指派给了 bob"）；有文字的动态带 `t`，并带 `agent`：您的 agent 现在能不能读到这条。`data` 只有 handle、编号和枚举（`to`、`need`、`reason`、`v`、`through`）。
 - `page`：按钮要原样带回的值（见第 1 节）。
-- `agent`：您的 agent 现在能看到什么。`content` = `visible`（能读正文）/ `needs_accept`（要您接受或认领后才给）/ `none`（没有正文）；`through` 已转发到的动态编号；`unforwarded` 别人的 agent 写的、还没转发的文字条数。
+- `agent`：您的 agent 现在能看到什么。`content` = `visible`（能读正文）/ `not_accepted`（要您接受或认领后才给；和 agent 读到的 `withheld: "not_accepted"` 是同一个值）/ `none`（没有正文）；`through` 已转发到的动态编号；`unforwarded` 别人的 agent 写的、还没转发的文字条数。
   按钮旁边的话照 plan 7.1、7.2："转发后，您的 Claude Code / Codex 才能读到这些评论"；没接受过正文时加一句"正文要您点「接受」或「认领」后才给"。
 - `can`：该显示哪些按钮（只是提示，服务端照样会拒）：`accept`、`decline`、`claim`、`start`、`done`、`release`、`forward`、`comment`。
 - `assign` 只在待接受时有；`urgent` 只在紧急时有（`true`）。
@@ -266,7 +268,7 @@ plan 7.1 首页的四块。只放 ID，标题在 `titles` 里按 ID 取。**列�
 - 拒绝：任务回到发布人手里（待开始），发布人收到"bob 没接 T-52"；原因记在动态里。拒绝框下面写"说一句原因，对方好另做安排"（plan 7.1）。
 - 认领：同时完成认领和接受当前版本，之后是"待开始"，由您或您的 agent 开始。
 - 取消认领：缺省只是把进行中改回待开始（负责人不变）；`to_pool: true` 放回待认领（负责人清空）。
-- 转发：只推进"已看到的动态位置"，**不授予正文**：没接受过正文的，转发后 agent 拿到的正文仍是 withheld。
+- 转发：只推进"已看到的动态位置"，**不授予正文**：没接受过正文的，转发后 agent 拿到的正文仍是 `withheld: "not_accepted"`。
 - 未知 action：404 `not_found`。
 
 ### POST /api/v1/web/tasks/{id}/comments、/api/v1/web/blockers/{id}/comments
@@ -316,7 +318,7 @@ plan 7.1 首页的四块。只放 ID，标题在 `titles` 里按 ID 取。**列�
   ],
   "url": "http://127.0.0.1:8100/blocker?w=team&id=B-7",
   "page": {"id": "B-7", "v": 1, "sha": "9574c43abb3a3e85b77be09cc1efdfd3182e5915d52b1f4293796eef0aae7004", "through": 15},
-  "agent": {"content": "needs_accept", "through": 0, "unforwarded": 1},
+  "agent": {"content": "not_accepted", "through": 0, "unforwarded": 1},
   "created": "2026-10-02T23:42:47+08:00",
   "can": ["help", "forward", "comment"],
   "path": "/blocker?w=team&id=B-7"
@@ -335,11 +337,11 @@ plan 7.1 首页的四块。只放 ID，标题在 `titles` 里按 ID 取。**列�
 | `forward` | `{"through": 15}` | `{"id": "B-7", "through": 15}` | 400 |
 
 - 「认领」（帮忙）同时接受当前版本的详情，提出人收到"alice 来帮忙看 B-7 了"。
-- 「确认」：agent 提议的点名要主人确认，确认后被点名的人才收到微信。按钮旁边写"确认后，bob 会收到微信：alice 请您帮忙看 B-8"（plan 3.2 场景 4）。
+- 「确认」：agent 提议的点名要主人确认，确认后被点名的人才收到通知。按钮旁边写"确认后，bob 会收到通知「alice 请您帮忙看 B-8」"（plan 3.2 场景 4）。
 
-### GET /api/v1/web/wechat?limit=50
+### GET /api/v1/web/notifications?limit=50
 
-模拟微信：本人会收到的模板消息（plan 7.2），新的在前。正式版里这些发到手机微信；这里给本地试用看"手机上会弹什么"。
+模拟通知：本人会收到的通知（plan 7.2），新的在前。正式版按本人选的渠道（邮件或微信，plan D61）发出，只做提醒；这里给本地试用看"会收到什么"。2026-10-02 前叫 `/api/v1/web/wechat`，改名后旧路径不再提供。
 
 ```json
 {
@@ -384,7 +386,7 @@ plan 7.1 首页的四块。只放 ID，标题在 `titles` 里按 ID 取。**列�
 | 403 | `human_only` | 请求带了 `Authorization` 头 |
 | 403 | `csrf` | 写请求缺 `X-CSRF-Token` 或不一致，`Origin` 缺失或不是本站（`why` = `missing` / `mismatch` / `origin`） |
 | 403 | `not_allowed` | 不是负责人、不是提出人等 |
-| 404 | `not_found` | 不是本地开发模式、不是本机来源、对象或按钮不存在 |
+| 404 | `not_found` | 不是本地开发模式、不是本机来源、对象或按钮不存在。没有这个接口（路由级 404）时另带 `no_route: true`，网页据此提示"在跑的服务端是旧代码，重新运行 scripts/local-up.sh"（旧服务端不带这个字段，`message` 是 Starlette 默认的 `Not Found`，网页也认） |
 | 409 | `conflict` | 页面上的版本已经旧了（`v`、`sha`、`seq` 变了），或对象已经不在那个状态；带当前的 `v`、`seq` |
 | 409 | `taken` | 已被别人认领（`by`、`at`） |
 | 409 | `needs_accept` | 要先接受（或接受后正文又改了，要重新接受）才能开始、完成 |
@@ -397,7 +399,7 @@ plan 7.1 首页的四块。只放 ID，标题在 `titles` 里按 ID 取。**列�
 ## 6. 静态页面与前端约束
 
 - 服务端在 `/` 提供 `server/teamflow_server/web_dist/` 下的构建产物。前端 `vite build` 的输出放进这个目录（随仓库提交，运行时不需要 Node）。源码在 `web/`，页面清单和开发方法见 `web/README.md`。
-- 路由：`/`、`/tasks`、`/task?w=team&id=T-42`、`/blocker?w=team&id=B-7`、`/new`、`/wechat`（模拟微信）、`/me`（plan 7.1、4.3 用查询参数路由）。任何不是 `/api`、`/mcp`、`/dev`、`/healthz` 开头、最后一段不带扩展名的 GET 都回退到 `index.html`；带扩展名但文件不存在的返回 404。
+- 路由：`/`、`/tasks`、`/task?w=team&id=T-42`、`/blocker?w=team&id=B-7`、`/new`、`/notifications`（模拟通知）、`/me`（plan 7.1、4.3 用查询参数路由）。任何不是 `/api`、`/mcp`、`/dev`、`/healthz` 开头、最后一段不带扩展名的 GET 都回退到 `index.html`；带扩展名但文件不存在的返回 404。
 - CSP：`default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`。所以：
   - 不能有内联 `<script>`，也不能有 `<style>` 标签和 HTML 里的 `style="..."` 属性（React 的 `style={{}}` 走 DOM API，不受影响）；CSS 打包成文件；
   - 不能从 CDN 加载字体、脚本；图片只能本站或 `data:`；
@@ -408,6 +410,6 @@ plan 7.1 首页的四块。只放 ID，标题在 `titles` 里按 ID 取。**列�
 ## 7. 一个人模拟两个人：典型走法
 
 1. 启动服务端（本地开发模式），终端里有 alice、bob 两条登录链接。alice 的在 `127.0.0.1`，bob 的在 `localhost`，各开一个标签页。
-2. 场景 2（请求协作）：seed 数据里 T-52 是 alice 的 Claude Code 指派给 bob 的。bob 的标签页：首页"待我处理"有 T-52 → 查看更多 → 看正文（标注"alice 的 Claude Code"）→ 接受。alice 的标签页"模拟微信"里出现"bob 接受了 T-52"。
-3. 场景 1（发布待认领、人认领、agent 接手）：让 alice 的真实 Claude Code 调 `claim_task(T-51)`（bob 的 Codex 发布的），它会得到 `needs_human`；alice 的"模拟微信"出现"您的 Claude Code 想开始 T-51，点这里认领"→ 点进去 → 认领 → 回到 Claude Code 让它再 claim，就能开始并读到正文。
+2. 场景 2（请求协作）：seed 数据里 T-52 是 alice 的 Claude Code 指派给 bob 的。bob 的标签页：首页"待我处理"有 T-52 → 查看更多 → 看正文（标注"alice 的 Claude Code"）→ 接受。alice 的标签页"模拟通知"里出现"bob 接受了 T-52"。
+3. 场景 1（发布待认领、人认领、agent 接手）：让 alice 的真实 Claude Code 调 `claim_task(T-51)`（bob 的 Codex 发布的），它会得到 `needs_human`；alice 的"模拟通知"出现"您的 Claude Code 想开始 T-51，点这里认领"→ 点进去 → 认领 → 回到 Claude Code 让它再 claim，就能开始并读到正文。
 4. 场景 4（困难与转发）：B-7 上有 bob 的 Codex 写的评论。alice 打开 B-7，`agent.unforwarded` 是 1 → 转发给我的 agent → alice 的 agent 才读得到这条评论；正文要点「认领」（帮忙）后才给。

@@ -30,7 +30,7 @@ def test_session_start_claude_json(env, stub):
     assert text.startswith(inbox.SENTINEL)
     assert len(text) <= 500
     assert "您（zhao）：进行中 T-42、T-45｜待开始 T-50" in text
-    assert "待您接受 T-52（来自 li 的 Claude Code，需您本人在手机上接受）" in text
+    assert "待您接受 T-52（来自 li 的 Claude Code，需您本人在 Team Flow 网页上接受）" in text
     assert "请您帮忙 B-7（来自 zhang）" in text
     assert "待您转发 B-7 的评论 1 条" in text
     assert "新的待认领 3 个" in text
@@ -97,7 +97,7 @@ def test_prompt_outputs_delta_after_interval(env, stub, client):
     assert text.startswith(inbox.SENTINEL)
     assert len(text) <= 200
     assert "待您接受 T-60（来自 wang）" in text
-    assert "您的 Codex 想请 zhang 看 B-9，等您在手机上确认" in text
+    assert "您的 Codex 想请 zhang 看 B-9，等您在 Team Flow 网页上确认" in text
     assert "T-52" not in text  # 已经在 SessionStart 里给过
     assert "T-99" not in text and "aws" not in text  # prompt 内容完全被忽略
     # 同样的条目不再重复输出

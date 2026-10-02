@@ -198,6 +198,49 @@ def check_codex(r: Report, paths: setup_cmd.Paths, bin_path: str):
         r.info("仓库级 .codex", "交互会话里仓库级 hooks 可能不触发（openai/codex#17532），teamflow 只装用户级")
 
 
+def check_no_repo(r: Report, isolated: bool = False, now=None):
+    """没被服务端记下的提交，按仓库逐个报（本地试用发现：仓库没有 origin 时提交被悄悄丢掉）。
+
+    - no_repo：服务端回过 st=no_repo，仓库没有 origin，服务端认不出是哪个仓库。已经补上 origin 的只给提示：
+      要等下一次提交上报后这一项才消失，在那之前不算失败，免得像是修了没用。
+    - other_ws：会话中途补上的 origin 属于另一个 workspace，Stop 没有把提交发出去（hooks.stop），要重开会话。
+    """
+    from teamflow import gitinfo
+
+    items = spool.unrecorded(now)
+    if not items:
+        r.ok("没有漏记的提交")
+        return
+    for it in items:
+        name = it.get("name") or os.path.basename(str(it.get("dir") or "").rstrip("/")) or "?"
+        where = name
+        if isinstance(it.get("dir"), str) and os.path.isabs(it["dir"]):
+            where = "%s（%s）" % (name, it["dir"])
+        title = "仓库 %s%s最近 7 天有 %d 个提交没被服务端记下" % (where, "" if where.endswith("）") else " ", it["n"])
+        if it.get("why") == "other_ws":
+            r.fail(
+                title,
+                "这个会话开始时仓库还没有 origin，用的是 workspace %s；后来补上的 origin 属于 workspace %s，"
+                "所以提交没有发给 %s。请在这个仓库里重开会话（退出 Claude Code 或 Codex 再进来），之后的提交会报到 %s。"
+                "已经漏掉的不会补报。"
+                % (it.get("ws") or "?", it.get("want_ws") or "（凭据里没有匹配的）", it.get("ws") or "?", it.get("want_ws") or "对应的 workspace"),
+            )
+            continue
+        d = it.get("dir")
+        has_origin = isinstance(d, str) and os.path.isabs(d) and bool(gitinfo.session_info(d).get("repo"))
+        if has_origin:
+            r.info(title, "已经补上 origin。下一次提交上报后这一条自动消失；已经漏掉的不会补报。")
+            continue
+        fix = (
+            "仓库没有 origin 远程地址，服务端认不出是哪个仓库。在仓库里运行 git remote add origin <地址>，"
+            "地址用和队友 clone 时同一个，之后的提交就会记下；已经漏掉的不会补报。"
+            "补上之后，这一条要等下一次提交上报才消失。"
+        )
+        if isolated:
+            fix += "本地试用的仓库没有远程的话，按 docs/local-trial.md 第 0 步写一个带上您 handle 和仓库名的假地址，不要对它 push。"
+        r.fail(title, fix)
+
+
 def _setup_hint(paths: setup_cmd.Paths) -> str:
     if paths.isolated:
         return "scripts/local-up.sh（或 teamflow setup --isolated %s）" % shlex.quote(paths.isolated)
@@ -296,6 +339,7 @@ def run(ns) -> int:
         r.fail("dead-letter %d 条" % c["dead"], "查看 %s 和日志 %s" % (os.path.join(spool.spool_dir(), "dead"), os.path.join(common.state_dir(), "log")))
     else:
         r.ok("dead-letter 0 条")
+    check_no_repo(r, isolated=bool(isolated))
     r._p("\n%s" % ("全部通过" if not r.failed else "%d 项失败" % r.failed))
     sys.stdout.flush()
     return 0 if not r.failed else 1

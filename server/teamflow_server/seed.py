@@ -3,11 +3,11 @@
 结果（以 alice 视角）：
 - T-49 bob 自己的任务，bob 的 Codex 在做；B-7 挂在上面，点名 alice（已确认）。
 - T-50 alice 在做（她的 Claude Code 写过一条进度）。
-- T-51 待认领，bob 的 Codex 发布：alice 的 agent 认领会得到 needs_human；正文对 alice withheld。
-- T-52 alice 的 Claude Code 指派给 bob，待 bob 接受：bob 的 agent 读正文得到 withheld，认领得到 needs_accept。
+- T-51 待认领，bob 的 Codex 发布：alice 的 agent 认领会得到 needs_human；正文对 alice 是 withheld（not_accepted）。
+- T-52 alice 的 Claude Code 指派给 bob，待 bob 接受：bob 的 agent 读正文得到 withheld（not_accepted），认领得到 needs_accept。
 - T-53 待认领，alice 的 Claude Code 发布：alice 的 agent 可以直接认领。
 - T-54 bob 已完成。
-- B-7 bob 的 Codex 报告的困难，bob 在手机上确认了点名 alice；上面有 bob 的 Codex 写的一条评论（对 alice 是 peer_agent，待转发）。
+- B-7 bob 的 Codex 报告的困难，bob 本人在网页上确认了点名 alice；上面有 bob 的 Codex 写的一条评论（对 alice 是 peer_agent，待转发）。
 
 TEAMFLOW_DEV_TOKENS 里出现、但上面没有的 handle（比如本地试用时您自己的 handle 和模拟的队友）也登记成成员，
 名字就用 handle；他们一开始没有任何任务。

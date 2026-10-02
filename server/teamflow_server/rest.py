@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, ValidationError
 from . import __version__, config
 from .errors import DomainError, rest_error
 from .seed import seed
-from .service import Actor, Service
+from .service import HUMAN_ONLY_MSG, Actor, Service
 
 router = APIRouter()
 
@@ -59,7 +59,7 @@ def agent_actor(request: Request) -> Actor:
 
 
 def human_only(request: Request) -> None:
-    raise DomainError("human_only", "这个操作只能由本人在手机微信里完成，agent 和命令行都不行。")
+    raise DomainError("human_only", HUMAN_ONLY_MSG)
 
 
 def with_idem(request: Request, actor: Actor, payload: Any, fn: Callable[[], dict[str, Any]], status: int = 200) -> Response:
@@ -298,7 +298,7 @@ def hook_batch(request: Request, payload: dict[str, Any] = Body(...)) -> dict[st
 
 
 # ---------------------------------------------------------------------------
-# DEV ONLY：模拟"人在手机微信里操作"。M1 上线前删除。
+# DEV ONLY：模拟"本人在网页上操作"。M1 上线前删除。
 # 默认关闭（TEAMFLOW_DEV_ENDPOINTS 缺省为 0）；打开时还要带 X-Teamflow-Dev-Secret，值等于 TEAMFLOW_DEV_SECRET，
 # 未设置密钥则一律 404（gateway 先挡一次，这里再查一次）。带任何 Authorization（PAT）一律 403 human_only。
 # 人类动作必须带页面上看到的值：接受 v、sha、seq、through；认领、帮忙 v、sha、through；转发 through（I1、复审新问题 1）。
@@ -320,7 +320,7 @@ def dev_human(request: Request) -> Actor:
     if request.client is None or request.client.host not in ("127.0.0.1", "::1", "localhost"):
         raise DomainError("not_found", "没有这个端点。")
     if request.headers.get("authorization"):
-        raise DomainError("human_only", "DEV ONLY：这是模拟手机上本人操作的端点，PAT 不能调用。")
+        raise DomainError("human_only", "DEV ONLY：这是模拟本人在网页上操作的端点，PAT 不能调用。")
     h = (request.headers.get("x-teamflow-dev-human") or "").strip().lower()
     if not h or h not in svc_of(request).members:
         raise DomainError("human_only", "DEV ONLY：缺少模拟的人类会话（X-Teamflow-Dev-Human: <handle>）。")
@@ -329,7 +329,7 @@ def dev_human(request: Request) -> Actor:
 
 @router.get("/api/v1/dev/items/{oid}")
 def dev_item(request: Request, oid: str) -> dict[str, Any]:
-    """模拟手机详情页：表单里会带的 v、sha、seq（任务）和 through（页面渲染时最大的动态编号）。
+    """模拟网页详情页：表单里会带的 v、sha、seq（任务）和 through（页面渲染时最大的动态编号）。
 
     接受、认领、帮忙、转发都要把这里的 through 原样带回：页面渲染之后才出现的动态编号比它大，
     不会算作本人已看到，也就不会放给本人的 agent。"""
@@ -339,7 +339,7 @@ def dev_item(request: Request, oid: str) -> dict[str, Any]:
 
 @router.get("/api/v1/dev/home")
 def dev_home(request: Request) -> dict[str, Any]:
-    """模拟手机首页（7.1）的结构化数据。「大家在做什么」里精确归属到会话的任务带会话短标签。"""
+    """模拟网页首页（7.1）的结构化数据。「大家在做什么」里精确归属到会话的任务带会话短标签。"""
     actor = dev_human(request)
     return svc_of(request).home(actor.handle)
 

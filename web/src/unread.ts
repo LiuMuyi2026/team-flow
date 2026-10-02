@@ -1,5 +1,6 @@
-// 「模拟微信」的未读数：只是本浏览器里记一下看到的最新编号，读写失败就当没有。
-const KEY = (h: string) => `tf_wx_seen:${h}`;
+// 「模拟通知」的未读数：只是本浏览器里记一下看到的最新编号，读写失败就当没有。
+const KEY = (h: string) => `tf_notice_seen:${h}`;
+export const SEEN_EVENT = "tf-notice-seen";
 
 export function seen(handle: string): number {
   try {
@@ -13,7 +14,7 @@ export function seen(handle: string): number {
 export function markSeen(handle: string, n: number, force = false): void {
   try {
     if (force || n > seen(handle)) window.localStorage.setItem(KEY(handle), String(n));
-    window.dispatchEvent(new Event("tf-wx-seen"));
+    window.dispatchEvent(new Event(SEEN_EVENT));
   } catch {
     // 私密窗口等读写不了 localStorage：不影响使用
   }

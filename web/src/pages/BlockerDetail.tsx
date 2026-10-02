@@ -37,7 +37,7 @@ export function BlockerDetail({ id }: { id: string }) {
 
   const help = () =>
     d.run("help", () => api.blockerAction(b.id, "help", { v: page.v, sha: page.sha, through: page.through }), `已认领。${pad(person(raiser, me.me))}会收到通知：您来帮忙了。`);
-  const ask = () => d.run("ask", () => api.blockerAction(b.id, "ask", {}), `已确认，${pad(person(b.need, me.me))}会收到微信。`);
+  const ask = () => d.run("ask", () => api.blockerAction(b.id, "ask", {}), `已确认，${pad(person(b.need, me.me))}会收到通知。`);
   const forward = () =>
     d.run("forward", () => api.blockerAction(b.id, "forward", { through: page.through }), "已转发。您的 agent 下一回合就能读到这些评论。");
 
@@ -106,7 +106,7 @@ export function BlockerDetail({ id }: { id: string }) {
               确认
             </button>
             <p className="hint">
-              确认后，{b.need} 会收到微信「{me.me} 请您帮忙看 {b.id}」。不确认的话，对方不会被打扰。
+              确认后，{b.need} 会收到通知「{me.me} 请您帮忙看 {b.id}」。不确认的话，对方不会被打扰。
             </p>
           </div>
         )}
@@ -116,7 +116,7 @@ export function BlockerDetail({ id }: { id: string }) {
               认领
             </button>
             <p className="hint">
-              认领就是来帮忙：{raiser} 会收到微信「{me.me} 来帮忙看 {b.id} 了」，您的 agent 也能读到上面的详情。
+              认领就是来帮忙：{raiser} 会收到通知「{me.me} 来帮忙看 {b.id} 了」，您的 agent 也能读到上面的详情。
             </p>
           </div>
         )}

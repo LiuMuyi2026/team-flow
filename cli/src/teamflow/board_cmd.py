@@ -37,11 +37,13 @@ ST_LABEL = {
     "canceled": "已取消",
 }
 
-# 服务端没给说明时用的兜底文字（错误码见 server/teamflow_server/errors.py）
+# 服务端没给说明时用的兜底文字（错误码见 server/teamflow_server/errors.py）。不提具体通知渠道：
+# 通知按各人选的渠道（邮件或微信）发，只做提醒；本人的确认在 Team Flow 网页上做（plan D54、D55、D61）。
+# 兜底文字一律不说"已通知"：只有服务端没给说明时才用，CLI 不知道这次到底有没有发通知。
 ERROR_TEXT = {
-    "needs_human": "这个操作要您本人在手机微信里处理，已发到您的微信。",
-    "needs_accept": "要等本人在手机上接受后才能继续，已发到微信。",
-    "human_only": "这个操作只能由本人在手机微信里完成，agent 和命令行都不行。",
+    "needs_human": "这个操作要您本人决定，请在 Team Flow 网页上处理。",
+    "needs_accept": "要等本人在 Team Flow 网页上接受后才能继续。",
+    "human_only": "这个操作只能由本人在 Team Flow 网页上完成，agent 和命令行都不行。请您本人操作。",
     "not_allowed": "您的 agent 没有权限做这个操作。",
     "not_found": "找不到这一项。",
     "invalid": "请求内容不合法。",
@@ -359,7 +361,7 @@ def run(ns) -> int:
         bid = f.get("id")
         line = "已报告困难 %s。" % bid if bid else "已报告困难。"
         if body.get("need"):
-            line += "请 %s 帮忙只是提议，等您在手机上确认后才会通知对方。" % body["need"]
+            line += "请 %s 帮忙只是提议，等您在 Team Flow 网页上确认后才会通知对方。" % body["need"]
         return line
 
     return _emit(cmd, res, as_json, blocked)

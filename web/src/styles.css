@@ -775,15 +775,15 @@ select {
   border-radius: 6px;
 }
 
-/* ---------- 模拟微信 ---------- */
+/* ---------- 模拟通知 ---------- */
 
-.wx-list {
+.ntf-list {
   list-style: none;
   margin: 16px 0 0;
   padding: 0;
 }
 
-.wx {
+.ntf {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 12px 14px 4px;
@@ -791,26 +791,26 @@ select {
   background: var(--paper);
 }
 
-.wx-head {
+.ntf-head {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
   gap: 10px;
 }
 
-.wx-at {
+.ntf-at {
   flex: none;
   font-size: 13px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
 
-.wx-text {
+.ntf-text {
   margin-top: 6px;
   overflow-wrap: anywhere;
 }
 
-.wx-foot {
+.ntf-foot {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -819,7 +819,7 @@ select {
   border-top: 1px solid var(--line);
 }
 
-.wx-path {
+.ntf-path {
   font-size: 13px;
   color: var(--muted);
   min-width: 0;

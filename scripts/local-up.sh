@@ -3,6 +3,7 @@
 #
 # 只写仓库里的 .local/（已在 .gitignore），绝不改 ~/.claude、~/.claude.json、~/.codex。
 # 可以重复执行：已经在跑的服务端会保留（内存里的看板数据也保留），要重启加 --restart。
+# 例外：仓库代码更新过（服务端代码或网页构建产物变了），在跑的还是旧代码，会自动重启，免得新旧两套说法混在一起。
 set -euo pipefail
 
 # shellcheck source=scripts/_lib.sh
@@ -21,7 +22,8 @@ usage() {
                      免得改变您平时跑命令的方式；正式版默认是加的
   --no-codex-import  不从您平时的 Codex 配置里抄模型、服务商设置
   --skip-install     不重装 Python 包（离线时重启用）
-  --restart          服务端已经在跑也重启（内存里的看板数据会清空）
+  --restart          服务端已经在跑也重启（内存里的看板数据会清空）。
+                     更新过代码时不用加，脚本发现在跑的是旧代码会自动重启
   -h, --help         显示这段说明
 
 handle 要求：小写字母开头，2–16 位小写字母、数字或下划线。
@@ -93,7 +95,7 @@ chmod 700 "$TF_LOCAL"
 say "Team Flow 本地试用：准备环境（只写 $TF_LOCAL）"
 
 # 在 agent 里运行（Claude Code 的 Bash 设 CLAUDECODE，Codex 的 shell 设 CODEX_THREAD_ID / CODEX_SANDBOX）：
-# 登录链接就等于"手机上的您"，不打印给 agent 看
+# 登录链接就等于您本人的身份，不打印给 agent 看
 IN_AGENT=0
 if [ -n "${CLAUDECODE:-}${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}" ]; then
   IN_AGENT=1
@@ -103,6 +105,7 @@ fi
 # ---------------------------------------------------------------- 端口与已有的服务端
 
 OLD_PORT="$(tf_env_get "$CONF" TF_PORT)"
+OLD_CODE="$(tf_env_get "$CONF" TF_CODE)"
 RUNNING_PID="$(tf_server_pid || true)"
 [ -n "$RUNNING_PID" ] || rm -f "$TF_PIDFILE"
 # 端口上是我们自己的试用服务端就不算占用；换端口时先查新端口，免得停了旧的才发现新的用不了
@@ -219,6 +222,7 @@ else
 fi
 [ -x "$TF_LOCAL/venv/bin/teamflow" ] || die "安装后没找到 $TF_LOCAL/venv/bin/teamflow，请看上面的报错"
 TRIAL=("$TF_VPY" "$TF_ROOT/scripts/_trial.py")
+CODE="$("${TRIAL[@]}" code-fingerprint)" || die "没能算出代码指纹（见上面的报错）"
 
 # ---------------------------------------------------------------- 令牌（只在第一次或成员变了时生成）
 
@@ -280,11 +284,16 @@ stop_ours() {
 
 START=1
 if [ -n "$RUNNING_PID" ]; then
-  if [ "$RESTART" = 0 ] && [ "$TOKENS_CHANGED" = 0 ] && [ "$OLD_PORT" = "$PORT" ] && tf_health "$BASE"; then
+  if [ "$RESTART" = 0 ] && [ "$TOKENS_CHANGED" = 0 ] && [ "$OLD_PORT" = "$PORT" ] && [ "$OLD_CODE" = "$CODE" ] && tf_health "$BASE"; then
     START=0
     say "  服务端已经在 $BASE 运行（进程 $RUNNING_PID），保留它和内存里的数据；要重启加 --restart"
   else
-    say "  重启服务端（进程 $RUNNING_PID）"
+    if [ "$RESTART" = 0 ] && [ "$OLD_CODE" != "$CODE" ]; then
+      # 旧进程会把磁盘上的新网页送出去，接口和 agent 看到的文字却还是旧的
+      say "  代码更新过，在跑的服务端（进程 $RUNNING_PID）还是旧代码：重启它让新代码生效（看板数据会清空，和 --restart 一样）"
+    else
+      say "  重启服务端（进程 $RUNNING_PID）"
+    fi
     stop_ours "$RUNNING_PID"
     if tf_port_listening "$PORT"; then
       die "端口 $PORT 被别的程序占用了，脚本不会去结束它。换一个：scripts/local-up.sh --port $((PORT + 1))"
@@ -329,6 +338,8 @@ if [ "$START" = 1 ]; then
   fi
   RUNNING_PID="$SERVER_PID"
 fi
+# 在跑的服务端是哪一版代码：下次重跑对不上就重启
+printf 'TF_CODE=%s\n' "$CODE" >>"$CONF"
 
 # ---------------------------------------------------------------- 隔离配置
 
@@ -385,7 +396,7 @@ cat <<EOF
   成员    $ME（您）、$(printf '%s' "$MATES" | sed 's/,/、/g')（模拟队友）
   配置    $TF_LOCAL（您的 ~/.claude、~/.codex 没有任何改动）
 
-1. 在浏览器里登录，扮演"手机上的您"：
+1. 在浏览器里以您本人的身份登录（接受、认领、确认、转发都在网页上点）：
 EOF
 if [ -n "$ME_LINK" ]; then
   say "     $ME_LINK"
