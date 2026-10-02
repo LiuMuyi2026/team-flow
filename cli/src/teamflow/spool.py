@@ -317,8 +317,7 @@ def flush(budget: float | None = None, max_retries: int = MAX_RETRIES) -> dict:
 # ---------------------------------------------------------------- cache
 
 
-def cache_path(ws_slug: str, client: str) -> str:
-    return os.path.join(common.state_dir(), "cache", common.safe_name(ws_slug), client + ".json")
+cache_path = common.cache_path
 
 
 def save_cache(ws_slug: str, client: str, data: dict, etag=None, cursor=None) -> None:

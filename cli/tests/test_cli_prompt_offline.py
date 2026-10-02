@@ -4,13 +4,14 @@ import io
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 
 import pytest
-from tfhelpers import stdin_for
+from tfhelpers import SID, stdin_for
 
-from teamflow import cli
+from teamflow import cli, inbox
 
 
 class _NoNet(Exception):
@@ -46,32 +47,106 @@ def _run_inproc(monkeypatch, args, payload):
 @pytest.mark.parametrize("client", ["claude", "codex"])
 def test_prompt_never_touches_network(env, stub, monkeypatch, no_network, client):
     env.write_cred(stub.url)
-    # 没有缓存、也没有会话状态：照样不联网，只是拉起（这里被 TEAMFLOW_NO_SPAWN 拦下的）分离刷新
+    # 没有缓存、也没有会话状态：不联网，也不拉起任何子进程
     rc, out = _run_inproc(
         monkeypatch, ["hook", "prompt", "--client", client, "--cred", env.cred], stdin_for(client, "prompt", "/tmp")
     )
     assert rc == 0 and out == b""
     assert no_network == []
     assert stub.requests == []
-    assert any("flush --refresh --client %s" % client in s for s in env.spawned())
+    assert env.spawned() == []
+
+
+def _write_cache(env, client, age, data):
+    os.makedirs(os.path.join(env.state, "cache", "team"), exist_ok=True)
+    with open(os.path.join(env.state, "cache", "team", client + ".json"), "w") as f:
+        json.dump({"fetched_at": time.time() - age, "data": data}, f)
+
+
+def _write_state(env, client, announced, last_out):
+    os.makedirs(os.path.join(env.state, "sessions"), exist_ok=True)
+    with open(os.path.join(env.state, "sessions", "%s-%s.json" % (client, SID[client])), "w") as f:
+        json.dump({"ws": "team", "announced": announced, "last_out": last_out, "turns": 0}, f)
+
+
+BASE = {"v": 1, "me": "zhao", "doing": ["T-42"], "help_me": [{"id": "B-7", "by": "zhang"}]}
+NEW = dict(BASE, to_accept=[{"id": "T-55", "by": "li", "bk": "agent", "client": "codex"}])
+# (名字, 缓存年龄秒, 缓存数据, 是否应有输出)：S4 只测了第一条；I3 要求另外三条
+PATHS = [
+    ("fresh", 5, BASE, False),
+    ("stale", 120, BASE, False),
+    ("emit", 5, NEW, True),
+    ("stale-emit", 120, NEW, True),
+]
 
 
 @pytest.mark.parametrize("client", ["claude", "codex"])
-def test_prompt_with_stale_cache_spawns_refresh_once(env, stub, monkeypatch, no_network, client):
+@pytest.mark.parametrize("name,age,data,emits", PATHS, ids=[p[0] for p in PATHS])
+def test_prompt_paths_never_spawn(env, stub, monkeypatch, no_network, client, name, age, data, emits):
+    """缓存过期也不拉起 refresh（Stop 每回合已经拉起 flush --refresh）；有新条目照样输出。"""
     env.write_cred(stub.url)
-    os.makedirs(os.path.join(env.state, "cache", "team"), exist_ok=True)
-    cache_path = os.path.join(env.state, "cache", "team", client + ".json")
-    json.dump({"fetched_at": time.time() - 120, "data": {"me": "zhao", "todo": ["T-50"]}}, open(cache_path, "w"))
-    args = ["hook", "prompt", "--client", client, "--cred", env.cred]
-    rc, out = _run_inproc(monkeypatch, args, stdin_for(client, "prompt", "/tmp"))
+    _write_cache(env, client, age, data)
+    _write_state(env, client, ["help:B-7"], 0)
+    rc, out = _run_inproc(
+        monkeypatch, ["hook", "prompt", "--client", client, "--cred", env.cred], stdin_for(client, "prompt", "/tmp")
+    )
     assert rc == 0
-    text = out.decode()
-    assert "您已接受 T-50，可以 claim_task 开始" in text  # 没有会话状态：缓存里的「需要我」都算新
-    assert "T-99" not in text
-    # 60 秒内再来一次：不再重复拉起刷新
-    _run_inproc(monkeypatch, args, stdin_for(client, "prompt", "/tmp"))
-    assert len([s for s in env.spawned() if "--refresh" in s]) == 1
+    assert env.spawned() == []
     assert no_network == [] and stub.requests == []
+    if not emits:
+        assert out == b""
+        return
+    text = json.loads(out)["hookSpecificOutput"]["additionalContext"] if client == "claude" else out.decode()
+    assert text.startswith(inbox.SENTINEL)
+    assert "待您接受 T-55（来自 li 的 Codex），需您本人在手机上接受" in text
+    assert "B-7" not in text  # 已经通知过
+    st = json.load(open(os.path.join(env.state, "sessions", "%s-%s.json" % (client, SID[client]))))
+    assert st["announced"] == ["acc:T-55", "help:B-7"]
+    assert st["last_out"] > time.time() - 60
+
+
+_PROBE = r"""
+import sys
+before = set(sys.modules)
+import io
+from teamflow import cli
+sys.stdin = io.TextIOWrapper(io.BytesIO(sys.argv[1].encode()), encoding="utf-8")
+buf = io.BytesIO()
+wrapper = io.TextIOWrapper(buf, encoding="utf-8")
+sys.stdout = wrapper
+rc = cli.main(sys.argv[2:])
+wrapper.flush()
+out = buf.getvalue().decode()
+sys.stdout = sys.__stdout__
+loaded = sorted(m for m in ("json", "subprocess", "re", "argparse", "threading", "teamflow.spool", "teamflow.detach")
+                if m in sys.modules and m not in before)
+import json
+print(json.dumps({"rc": rc, "out": out, "loaded": loaded}))
+"""
+
+
+@pytest.mark.parametrize("client", ["claude", "codex"])
+@pytest.mark.parametrize("name,age,data,emits", PATHS, ids=[p[0] for p in PATHS])
+def test_prompt_paths_import_nothing_heavy(env, stub, client, name, age, data, emits):
+    """四条路径都不导入 json / subprocess / re / argparse / threading，也不导入 spool / detach：
+    输出用手写的最小 JSON，缓存路径在 common 里（每少一个模块省约 0.3ms 冷启动）。"""
+    env.write_cred(stub.url)
+    _write_cache(env, client, age, data)
+    _write_state(env, client, ["help:B-7"], 0)
+    payload = json.dumps(stdin_for(client, "prompt", "/tmp"))
+    p = subprocess.run(
+        [sys.executable, "-c", _PROBE, payload, "hook", "prompt", "--client", client, "--cred", env.cred],
+        capture_output=True, env=env.environ(), timeout=30,
+    )
+    assert p.returncode == 0, p.stderr.decode()
+    res = json.loads(p.stdout)
+    assert res["rc"] == 0
+    assert res["loaded"] == [], res
+    assert bool(res["out"]) == emits
+    if emits and client == "claude":
+        obj = json.loads(res["out"])
+        assert list(obj) == ["hookSpecificOutput"]
+        assert obj["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
 
 
 def test_prompt_subprocess_no_requests(env, stub):

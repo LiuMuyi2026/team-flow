@@ -162,3 +162,25 @@ def test_session_start_truncates_to_500(env, stub):
     assert out.startswith(inbox.SENTINEL)
     assert len(out) <= 500
     assert "等 10 个" in out
+
+
+def test_codex_session_id_is_hook_session_id_verbatim(env, stub):
+    """服务端用 hook 输入的 session_id 匹配 Codex tools/call 的 _meta["x-codex-turn-metadata"].session_id；
+    两者都来自 Codex 的 sess.session_id()（hook_runtime.rs、session/turn_context.rs → TurnMetadataState）。
+    所以 CLI 必须原样上报 hook 的 session_id：不换成 CODEX_THREAD_ID / turn_id，不做任何变形。"""
+    sid = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"  # Codex SessionId：UUIDv7 的连字符小写形式
+    decoys = {"CODEX_THREAD_ID": "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f9999", "CODEX_SESSION_ID": "019a2b3c-0000-7000-8000-000000000000"}
+    env.write_cred(stub.url)
+    assert env.hook("session-start", "codex", stdin_for("codex", "session-start", CWD, session_id=sid), **decoys).returncode == 0
+    (req,) = [r for r in stub.requests if r["path"] == "/api/v1/hooks/session-start"]
+    assert req["body"]["session_id"] == sid
+    assert req["headers"]["X-Teamflow-Session"] == sid
+    env.hook("stop", "codex", stdin_for("codex", "stop", CWD, session_id=sid, turn_id="turn-7"), **decoys)
+    env.hook("session-end", "codex", stdin_for("codex", "session-end", CWD, session_id=sid), **decoys)
+    items = {r["item"]["type"]: r["item"] for r in env.spool_records()}
+    assert items["turn_end"]["session_id"] == sid and items["turn_end"]["turn"] == "turn-7"
+    assert items["end"]["session_id"] == sid
+    assert all(i["client"] == "codex" for i in items.values())
+    blob = json.dumps(env.spool_records()) + json.dumps(stub.requests)
+    for v in decoys.values():
+        assert v not in blob

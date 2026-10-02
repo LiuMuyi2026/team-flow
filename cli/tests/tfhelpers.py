@@ -84,7 +84,7 @@ class Env:
 
     def environ(self, **extra):
         env = dict(os.environ)
-        for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "CODEX_THREAD_ID"):
+        for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CODEX_SESSION_ID", "CODEX_THREAD_ID", "NO_COLOR"):
             env.pop(k, None)
         env.update(self.vars)
         env["HOME"] = self.home  # 子进程里也绝不碰真实 HOME

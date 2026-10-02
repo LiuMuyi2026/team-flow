@@ -1,8 +1,8 @@
 """快速路径共用的小工具：状态目录、错误日志、凭据、原子写文件。
 
-只导入 os / sys / time。连 json 都不在模块级导入：`import json` 会带进 re、enum，
-冷启动要多花约 9ms，而 UserPromptSubmit 的目标是 p95 ≤ 30ms。读 JSON 直接用 C 实现的
-_json 扫描器（json.loads 内部用的就是它），写 JSON 时才按需导入 json。
+只导入 os / sys / time。连 json 都不导入：`import json` 会带进 re、enum，冷启动要多花约 9ms，
+而 UserPromptSubmit 的目标是 p95 ≤ 30ms。读 JSON 直接用 C 实现的 _json 扫描器（json.loads 内部用的就是它），
+写 JSON 用下面手写的 dumps（快速路径只写 dict/list/str/数字/bool/None）。
 """
 
 import os
@@ -97,12 +97,46 @@ def loads(data):
     return obj
 
 
-def dumps(obj, **kw) -> str:
-    import json
+def _str(s: str) -> str:
+    # 与 json.dumps(ensure_ascii=False) 相同，另外把 U+2028/2029、DEL 和孤立代理项转成 \u 转义：
+    # 前者让 JS 系解析器也安全，后者否则在 encode("utf-8") 时抛错（"\ud800" 这种输入能从 JSON 里解出来）。
+    out = ['"']
+    for c in s:
+        o = ord(c)
+        if c == '"' or c == "\\":
+            out.append("\\" + c)
+        elif o < 0x20 or o == 0x7F or 0xD800 <= o <= 0xDFFF or o == 0x2028 or o == 0x2029:
+            out.append("\\u%04x" % o)
+        else:
+            out.append(c)
+    out.append('"')
+    return "".join(out)
 
-    kw.setdefault("ensure_ascii", False)
-    kw.setdefault("separators", (",", ":"))
-    return json.dumps(obj, **kw)
+
+def dumps(obj) -> str:
+    """紧凑 JSON 编码，不导入 json。只认 dict / list / tuple / str / int / float / bool / None。
+
+    hook 输出、会话状态、spool、请求体都只用这几种类型。键一律转成 str；
+    非有限浮点数写成 null（JSON 没有 NaN）；其他类型抛 TypeError。
+    """
+    t = type(obj)
+    if t is str:
+        return _str(obj)
+    if obj is None:
+        return "null"
+    if obj is True:
+        return "true"
+    if obj is False:
+        return "false"
+    if t is int:
+        return str(obj)
+    if t is float:
+        return repr(obj) if obj - obj == 0 else "null"
+    if t is dict:
+        return "{" + ",".join("%s:%s" % (_str(str(k)), dumps(v)) for k, v in obj.items()) + "}"
+    if t is list or t is tuple:
+        return "[" + ",".join([dumps(v) for v in obj]) + "]"
+    raise TypeError("dumps 不支持 %s" % t.__name__)
 
 
 def read_json(path: str, default=None):
@@ -128,6 +162,11 @@ def write_json_atomic(path: str, data, mode: int = 0o600) -> None:
         except OSError:
             pass
         raise
+
+
+def cache_path(ws_slug: str, client: str) -> str:
+    """收件箱缓存文件。放在 common 里：UserPromptSubmit 只读缓存，不必为一个路径导入 spool。"""
+    return os.path.join(state_dir(), "cache", safe_name(ws_slug), client + ".json")
 
 
 def safe_name(s: str, limit: int = 64) -> str:

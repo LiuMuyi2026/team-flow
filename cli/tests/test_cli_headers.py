@@ -19,18 +19,31 @@ def test_headers_json(env, client, wire):
     assert all(isinstance(k, str) and isinstance(v, str) for k, v in obj.items())
 
 
-@pytest.mark.parametrize("client,var", [("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_SESSION_ID")])
-def test_session_header_from_env(env, client, var):
+@pytest.mark.parametrize("client", ["claude", "codex"])
+def test_never_sends_session_header(env, client):
+    """M0 S3：helper 环境里的会话变量是从父进程继承来的（嵌套运行时是外层会话），两端都不发 X-Teamflow-Session。"""
     env.write_cred("http://127.0.0.1:8100")
-    p = env.run(["mcp-headers", "--client", client, "--cred", env.cred], **{var: "abc-123"})
-    assert json.loads(p.stdout)["X-Teamflow-Session"] == "abc-123"
-    # 只认本客户端的变量
-    other = "CODEX_SESSION_ID" if client == "claude" else "CLAUDE_CODE_SESSION_ID"
-    p = env.run(["mcp-headers", "--client", client, "--cred", env.cred], **{other: "zzz"})
-    assert "X-Teamflow-Session" not in json.loads(p.stdout)
-    # 不合法的值（可做头注入）直接丢弃
-    p = env.run(["mcp-headers", "--client", client, "--cred", env.cred], **{var: "a b\tc"})
-    assert "X-Teamflow-Session" not in json.loads(p.stdout)
+    inherited = {
+        "CLAUDE_CODE_SESSION_ID": "1a6941c0-21de-5c92-8067-c298f2345b24",  # S3 里外层容器会话的 ID
+        "CLAUDECODE": "1",
+        "CODEX_SESSION_ID": "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b",
+        "CODEX_THREAD_ID": "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5c",
+    }
+    p = env.run(["mcp-headers", "--client", client, "--cred", env.cred], **inherited)
+    assert p.returncode == 0, p.stderr
+    obj = json.loads(p.stdout)
+    assert set(obj) == {"Authorization", "X-Teamflow-Client"}
+    assert not any(v in p.stdout.decode() for v in inherited.values() if v != "1")
+
+
+def test_debug_log_records_inherited_session_but_not_value(env):
+    env.write_cred("http://127.0.0.1:8100")
+    sid = "1a6941c0-21de-5c92-8067-c298f2345b24"
+    p = env.run(["mcp-headers", "--client", "claude", "--cred", env.cred], CLAUDE_CODE_SESSION_ID=sid, TEAMFLOW_DEBUG="1")
+    assert p.returncode == 0
+    log = env.log_text()
+    assert "session_env=yes (not sent)" in log
+    assert sid not in log and "tf_pat" not in log
 
 
 def test_refuses_tty(env):

@@ -4,7 +4,9 @@
 - Claude Code：<home>/.claude/settings.json（hooks 用 exec form：command + args）、
   <home>/.claude.json 顶层 mcpServers.teamflow（user scope，type http，headersHelper）；
 - Codex：<home>/.codex/config.toml 的 [mcp_servers.teamflow]，<home>/.codex/hooks.json
-  （顶层只有 description 和 hooks；我们的组追加在每个事件数组末尾）；
+  （顶层只有 description 和 hooks）；
+- 两端的 hook 组：已有 teamflow 组就原地替换，没有才追加到事件数组末尾。Codex 的信任键里带着组序号
+  （codex-rs/hooks/src/lib.rs hook_key），挪动位置会让我们和别人的组都要重新信任；
 - 无头：<home>/.config/teamflow/claude-headless-settings.json 与 claude-mcp.json。
 
 --home 必须能指向临时目录；测试绝不写真实 HOME。改已有文件前先备份。
@@ -126,11 +128,22 @@ def _is_teamflow_group(g) -> bool:
     return isinstance(g, dict) and any(_is_teamflow_handler(h) for h in (g.get("hooks") or []))
 
 
-def _append_groups(hooks: dict, groups: dict) -> dict:
+def _upsert_groups(hooks: dict, groups: dict) -> dict:
+    """已有 teamflow 组：原地替换第一组（多出来的重复组去掉）；没有：追加到末尾。
+
+    不挪动任何组的位置：Codex 记信任时键里带组序号（hooks/src/lib.rs hook_key），
+    位置一变，我们的组和被挪动的别人的组都要重新信任。
+    """
     for event, grp in groups.items():
         arr = hooks.get(event)
-        arr = [g for g in arr if not _is_teamflow_group(g)] if isinstance(arr, list) else []
-        arr.append(grp)
+        arr = list(arr) if isinstance(arr, list) else []
+        idx = [i for i, g in enumerate(arr) if _is_teamflow_group(g)]
+        if idx:
+            arr[idx[0]] = grp
+            for i in reversed(idx[1:]):
+                del arr[i]
+        else:
+            arr.append(grp)
         hooks[event] = arr
     return hooks
 
@@ -142,20 +155,33 @@ def _add_unique(lst: list, items):
     return lst
 
 
+# 会把 token 打到输出里的子命令：mcp-headers 输出请求头；setup --dry-run 打印写入计划（已遮蔽，仍一并拦下，
+# 也免得 agent 自己重跑 setup 改 hooks 和权限）。
+SECRET_SUBCOMMANDS = ("mcp-headers", "setup")
+
+
+def deny_rules(paths: Paths, bin_path: str) -> list:
+    """Claude Code 的 deny 规则（cc_perm.md）。
+
+    `Bash(<前缀>:*)` 与 `Bash(<前缀> *)` 等价，也匹配不带参数的裸命令；deny 规则能越过开头的环境变量赋值
+    和 timeout / nice 等包装命令。Bash 规则只按命令文本匹配，不是安全边界（`sh -c '…'`、换个解释器路径都
+    拦不住），所以这里只覆盖常见写法，真正的屏障是沙箱的 credentials 屏蔽。
+    """
+    cred_dir = paths.tilde(os.path.dirname(paths.cred))
+    out = ["Read(%s/**)" % cred_dir, "Grep(%s/**)" % cred_dir]
+    for sub in SECRET_SUBCOMMANDS:
+        for prefix in ("teamflow", bin_path, "python -m teamflow", "python3 -m teamflow"):
+            out.append("Bash(%s %s:*)" % (prefix, sub))
+    return out
+
+
 def merge_claude_settings(existing: dict | None, paths: Paths, bin_path: str, hardening: bool = True) -> dict:
     s = copy.deepcopy(existing) if isinstance(existing, dict) else {}
     perms = s.get("permissions") if isinstance(s.get("permissions"), dict) else {}
     s["permissions"] = perms
     perms["allow"] = _add_unique(perms.get("allow") if isinstance(perms.get("allow"), list) else [], [MCP_ALLOW])
     if hardening:
-        cred_dir = paths.tilde(os.path.dirname(paths.cred))
-        deny = [
-            "Read(%s/**)" % cred_dir,
-            "Grep(%s/**)" % cred_dir,
-            "Bash(teamflow mcp-headers:*)",
-            "Bash(%s mcp-headers:*)" % bin_path,
-        ]
-        perms["deny"] = _add_unique(perms.get("deny") if isinstance(perms.get("deny"), list) else [], deny)
+        perms["deny"] = _add_unique(perms.get("deny") if isinstance(perms.get("deny"), list) else [], deny_rules(paths, bin_path))
         sb = s.get("sandbox") if isinstance(s.get("sandbox"), dict) else {}
         s["sandbox"] = sb
         sb.setdefault("enabled", True)  # 用户明确关掉的不改
@@ -168,7 +194,7 @@ def merge_claude_settings(existing: dict | None, paths: Paths, bin_path: str, ha
                 files.append({"path": p, "mode": "deny"})
         cr["files"] = files
     hooks = s.get("hooks") if isinstance(s.get("hooks"), dict) else {}
-    s["hooks"] = _append_groups(hooks, claude_hook_groups(bin_path, paths.cred))
+    s["hooks"] = _upsert_groups(hooks, claude_hook_groups(bin_path, paths.cred))
     return s
 
 
@@ -188,7 +214,7 @@ def merge_codex_hooks(existing, bin_path: str, cred: str) -> tuple[dict, list]:
         warnings.append("hooks.json 里有 Codex 不认的顶层键 %s，已去掉（否则整个文件加载失败）" % extra)
     desc = ex.get("description") if isinstance(ex.get("description"), str) and ex.get("description") else CODEX_HOOKS_DESC
     hooks = ex.get("hooks") if isinstance(ex.get("hooks"), dict) else {}
-    hooks = _append_groups(copy.deepcopy(hooks), codex_hook_groups(bin_path, cred))
+    hooks = _upsert_groups(copy.deepcopy(hooks), codex_hook_groups(bin_path, cred))
     return {"description": desc, "hooks": hooks}, warnings
 
 
@@ -241,21 +267,49 @@ def _git_email(home: str):
     return e or None
 
 
+TOKEN_PREFIX = "tf_pat_"
+MASK = TOKEN_PREFIX + "****"
+
+
+def mask_token(v):
+    """tf_pat_ 开头的只留前缀；空串原样（让人看出还没填）；其他非空值整段遮掉。"""
+    if not isinstance(v, str) or not v:
+        return v
+    return MASK if v.startswith(TOKEN_PREFIX) else "****"
+
+
+def masked_creds(creds: dict) -> dict:
+    """凭据的展示版：所有 workspace 的 tokens 都遮蔽。"""
+    out = copy.deepcopy(creds)
+    for ws in (out.get("workspaces") or {}).values():
+        if isinstance(ws, dict) and isinstance(ws.get("tokens"), dict):
+            ws["tokens"] = {k: mask_token(v) for k, v in ws["tokens"].items()}
+    return out
+
+
+def scrub_tokens(text: str) -> str:
+    """兜底：任何地方漏出来的 tf_pat_xxx 都换成 tf_pat_****。"""
+    import re
+
+    return re.sub(r"tf_pat_(?!\*\*\*\*)[A-Za-z0-9_.\-]*", MASK, text)
+
+
 class Plan:
-    """收集要写的文件，dry-run 只打印。"""
+    """收集要写的文件，dry-run 只打印（打印的是遮蔽过 token 的展示版）。"""
 
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
-        self.items = []  # (path, text, mode)
+        self.items = []  # (path, text, mode, shown)
 
-    def add(self, path, text, mode=0o644):
-        self.items.append((path, text, mode))
+    def add(self, path, text, mode=0o644, shown=None):
+        """shown：dry-run 时打印的版本（含凭据的文件必须给遮蔽过的）。"""
+        self.items.append((path, text, mode, text if shown is None else shown))
 
     def apply(self, out=sys.stdout):
         stamp = time.strftime("%Y%m%d%H%M%S")
-        for path, text, mode in self.items:
+        for path, text, mode, shown in self.items:
             if self.dry_run:
-                out.write("=== 将写入 %s ===\n%s\n" % (path, text.rstrip("\n")))
+                out.write(scrub_tokens("=== 将写入 %s ===\n%s\n" % (path, shown.rstrip("\n"))))
                 continue
             common.ensure_dir(os.path.dirname(path))
             if os.path.exists(path):
@@ -327,7 +381,7 @@ def run(ns) -> int:
             ws["git_emails"] = emails + [email]
             new_creds = True
     if new_creds:
-        plan.add(paths.cred, _dump(creds), 0o600)
+        plan.add(paths.cred, _dump(creds), 0o600, shown=_dump(masked_creds(creds)))
     elif not ns.dry_run:
         try:
             os.chmod(paths.cred, 0o600)

@@ -14,6 +14,13 @@ from teamflow_server.seed import seed
 
 ALICE = "tf_pat_dev_alice"
 BOB = "tf_pat_dev_bob"
+ALICE2 = "tf_pat_dev_alice_two"  # alice 的第二枚 Claude Code token（另一台机器）
+BOB_CC = "tf_pat_dev_bob_cc"  # bob 的 Claude Code token
+BOB_CX2 = "tf_pat_dev_bob_cx2"  # bob 的第二枚 Codex token
+TOKENS = (
+    f"{ALICE}:alice:claude_code,{BOB}:bob:codex,{ALICE2}:alice:claude_code,{BOB_CC}:bob:claude_code,{BOB_CX2}:bob:codex"
+)
+DEV_SECRET = "dev-secret-for-tests-only"
 ACCEPT = "application/json, text/event-stream"
 
 PV_KEY = "io.modelcontextprotocol/protocolVersion"
@@ -24,9 +31,11 @@ CI_KEY = "io.modelcontextprotocol/clientInfo"
 @pytest.fixture(autouse=True)
 def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("TEAMFLOW_LOG", str(tmp_path / "server.log.jsonl"))
-    monkeypatch.setenv("TEAMFLOW_DEV_TOKENS", "tf_pat_dev_alice:alice:claude_code,tf_pat_dev_bob:bob:codex")
+    monkeypatch.setenv("TEAMFLOW_DEV_TOKENS", TOKENS)
     monkeypatch.delenv("TEAMFLOW_FAULT_DELAY_MS", raising=False)
-    monkeypatch.delenv("TEAMFLOW_DEV_ENDPOINTS", raising=False)
+    # DEV 端点默认关闭；测试里显式打开，并配上密钥（B1）
+    monkeypatch.setenv("TEAMFLOW_DEV_ENDPOINTS", "1")
+    monkeypatch.setenv("TEAMFLOW_DEV_SECRET", DEV_SECRET)
     monkeypatch.delenv("TEAMFLOW_ALLOWED_ORIGINS", raising=False)
     yield
 
@@ -79,6 +88,20 @@ def agent(handle: str, client: str) -> Actor:
 
 def human(handle: str) -> Actor:
     return Actor(handle, "human", None, None, "dev")
+
+
+def page(svc: Service, oid: str) -> dict[str, Any]:
+    """模拟手机详情页渲染时表单里带的值：v、sha、seq（任务）、through。"""
+    return svc.page_view(oid)
+
+
+def vs(svc: Service, oid: str, *, seq: bool = False) -> dict[str, Any]:
+    """human_* 需要的版本参数（页面上看到的当前值）。"""
+    p = svc.page_view(oid)
+    out = {"v": p["v"], "sha": p["sha"]}
+    if seq:
+        out["seq"] = p["seq"]
+    return out
 
 
 def parse_body(r: httpx.Response) -> Any:
@@ -175,8 +198,11 @@ class ModernMcp:
         return parse_body(r)["result"]
 
 
-def dev_headers(handle: str) -> dict[str, str]:
-    return {"x-teamflow-dev-human": handle}
+def dev_headers(handle: str, secret: str | None = DEV_SECRET) -> dict[str, str]:
+    h = {"x-teamflow-dev-human": handle}
+    if secret is not None:
+        h["x-teamflow-dev-secret"] = secret
+    return h
 
 
 def auth(token: str) -> dict[str, str]:

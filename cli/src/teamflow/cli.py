@@ -124,6 +124,15 @@ def default_cred(home: str | None = None) -> str:
 # ---------------------------------------------------------------- argparse 慢路径
 
 
+def _common_opts(p, ws=True):
+    p.add_argument("--client", choices=("claude", "codex"),
+                   help="用哪个 agent 的 token（默认按环境判断：在 Codex 里是 codex，其余是 claude）")
+    p.add_argument("--cred", help="credentials.json 的绝对路径")
+    if ws:
+        p.add_argument("--ws", help="指定 workspace（默认按当前目录匹配，匹配不到用 default）")
+        p.add_argument("--json", action="store_true", help="输出一行机器可读的 JSON")
+
+
 def _build_parser():
     import argparse
 
@@ -153,8 +162,30 @@ def _build_parser():
     f.add_argument("--ws")
 
     i = sub.add_parser("inbox", help="在终端查看与您有关的看板事项（只显示编号和计数）")
-    i.add_argument("--client", choices=("claude", "codex"), default="claude")
-    i.add_argument("--cred", help="credentials.json 的绝对路径")
+    _common_opts(i, ws=False)
+
+    n = sub.add_parser("note", help="给任务写一句进度（MCP 不可用时的兜底）",
+                       description="给任务写一句进度，200 字以内为宜（最多 500 字）。例：teamflow note T-42 \"接口联调通过\"")
+    n.add_argument("task", help="任务编号，如 T-42")
+    n.add_argument("text", help="一句话进度")
+    _common_opts(n)
+
+    dn = sub.add_parser("done", help="把任务标记为完成，附一句说明（MCP 不可用时的兜底）",
+                        description="把任务标记为完成。例：teamflow done T-42 \"做了什么 + PR 链接\"")
+    dn.add_argument("task", help="任务编号，如 T-42")
+    dn.add_argument("text", help="做了什么，最好带上 PR 链接")
+    _common_opts(dn)
+
+    b = sub.add_parser("block", help="报告困难（MCP 不可用时的兜底）",
+                       description="报告困难：卡住超过 20 分钟，或需要别人做决定、给权限。"
+                       "--need 只是提议请谁帮忙，用户在手机上确认后才通知对方。"
+                       "例：teamflow block --task T-42 --title \"测试库连不上\" --need zhang")
+    b.add_argument("--title", required=True, help="一句话说清卡在哪（最多 120 字）")
+    b.add_argument("--task", help="相关任务编号，如 T-42")
+    b.add_argument("--need", help="想请谁帮忙（对方的 handle）；只是提议")
+    b.add_argument("--detail", help="详情（最多 2000 字）")
+    b.add_argument("--tried", help="已经试过什么（最多 1000 字）")
+    _common_opts(b)
 
     c = sub.add_parser("claude-flags", help="输出无头运行 claude -p 需要的参数")
     c.add_argument("--home", help="用这个目录代替 HOME（测试用）")
@@ -190,9 +221,14 @@ def _slow(argv) -> int:
     if ns.cmd == "flush":
         return _flush(argv[1:])
     if ns.cmd == "inbox":
-        from teamflow import inbox_cmd
+        from teamflow import board_cmd, inbox_cmd
 
-        return inbox_cmd.run(ns.client, ns.cred or default_cred())
+        return inbox_cmd.run(ns.client or board_cmd.detect_client(), ns.cred or default_cred())
+    if ns.cmd in ("note", "done", "block"):
+        from teamflow import board_cmd
+
+        ns.cred = ns.cred or default_cred()
+        return board_cmd.run(ns)
     if ns.cmd == "claude-flags":
         from teamflow import setup_cmd
 

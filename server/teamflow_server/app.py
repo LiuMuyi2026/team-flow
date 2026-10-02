@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__, config
-from .errors import DomainError
+from .errors import DomainError, rest_error
 from .gateway import Gateway
 from .mcp_server import build_mcp
 from .rest import router
@@ -41,9 +43,23 @@ def create_app(service: Service | None = None, *, with_seed: bool = True) -> Fas
     app.state.svc = svc
     app.state.mcp = mcp
 
+    # REST 错误一律 {"error": code, "message": ...}（跨包约定），包括请求体校验失败和路由级 404/405
     @app.exception_handler(DomainError)
     async def _domain_error(request: Request, exc: DomainError) -> JSONResponse:
-        return JSONResponse(exc.to_dict(), status_code=exc.http_status)
+        return JSONResponse(exc.to_rest(), status_code=exc.http_status)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        errs = exc.errors()
+        first = errs[0] if errs else {}
+        loc = ".".join(str(x) for x in first.get("loc", ()) if x != "body")
+        msg = f"请求体不合法：{loc} {first.get('msg', '')}".strip()
+        return JSONResponse(rest_error("invalid", msg, field=loc or None), status_code=422)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, f"http_{exc.status_code}")
+        return JSONResponse(rest_error(code, str(exc.detail)), status_code=exc.status_code, headers=getattr(exc, "headers", None))
 
     app.include_router(router)
     app.mount("/mcp", mcp_app)

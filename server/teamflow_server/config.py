@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_TOKENS = "tf_pat_dev_alice:alice:claude_code,tf_pat_dev_bob:bob:codex"
@@ -14,14 +16,18 @@ CLIENTS = ("claude_code", "codex", "cli", "cloud")
 
 @dataclass(frozen=True)
 class TokenRec:
-    token: str
+    token: str = field(repr=False)  # 明文 token 永不出现在 repr / 日志里
     handle: str
     client: str
 
     @property
     def token_id(self) -> str:
-        # 不把明文 token 写进日志或事件；用短前缀作 token_id。
-        return "tok_" + self.token[-6:]
+        """日志、事件、会话里用的 token 标识：sha256 前缀，不含 token 的任何明文片段（plan 8.3 服务端只存哈希）。"""
+        return token_id_of(self.token)
+
+
+def token_id_of(token: str) -> str:
+    return "tok_" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
 
 def parse_tokens(raw: str | None) -> dict[str, TokenRec]:
@@ -57,8 +63,29 @@ def fault_delay_ms() -> int:
 
 
 def dev_endpoints_enabled() -> bool:
-    """DEV ONLY 端点（模拟"人在手机上操作"）。M0 默认开启；M1 上线前必须删除。"""
-    return os.environ.get("TEAMFLOW_DEV_ENDPOINTS", "1") not in ("0", "false", "no")
+    """DEV ONLY 端点（模拟"人在手机上操作"）。默认关闭，只在 TEAMFLOW_DEV_ENDPOINTS=1 时打开；M1 上线前整组删除。"""
+    return os.environ.get("TEAMFLOW_DEV_ENDPOINTS", "0").strip().lower() in ("1", "true", "yes")
+
+
+def dev_secret() -> str | None:
+    """DEV 端点的共享密钥（TEAMFLOW_DEV_SECRET）。未设置或为空时 DEV 端点一律 404。"""
+    v = os.environ.get("TEAMFLOW_DEV_SECRET", "")
+    return v or None
+
+
+def dev_access_ok(header_value: str | None) -> tuple[bool, str]:
+    """DEV 端点的门：开关打开、配置了密钥、请求头 X-Teamflow-Dev-Secret 与之相等（常量时间比较）。
+
+    返回 (是否放行, 原因)。原因只写进观测日志，不返回给调用方（调用方一律看到 404）。
+    """
+    if not dev_endpoints_enabled():
+        return False, "closed"
+    secret = dev_secret()
+    if secret is None:
+        return False, "no_secret"
+    if not header_value or not hmac.compare_digest(header_value.encode("utf-8"), secret.encode("utf-8")):
+        return False, "bad_secret"
+    return True, "ok"
 
 
 def public_url() -> str:

@@ -6,6 +6,10 @@
 - 新代 2026-07-28：server/discover → tools/list → tools/call（无 initialize；_meta 带版本/能力/clientInfo；
   头带 MCP-Protocol-Version、Mcp-Method、Mcp-Name），断言 tools/list 有 ttlMs 和 cacheScope
 断言：9 个工具、名字与顺序、annotations、alwaysLoad、所有请求都不出现 3xx、两代 tools/list 完全一致。
+另外断言评审修复后的协议行为：
+- 能力宣告只有 tools，两代都不宣告 listChanged（m6）；discover 与 -32022 的 supported 同时列出两代版本（m6）；
+- 业务错误的 content 文本以错误码开头（I5）；
+- /mcp 请求体超过 64KB 返回 413，不带令牌的大请求体直接 401（先鉴权再读请求体，m7）。
 再用官方 mcp 2.2.0 客户端（auto 与 legacy 两种模式）交叉验证一次，并记录它见到的所有 HTTP 状态码。
 
 用法：
@@ -40,6 +44,8 @@ EXPECTED_TOOLS = [
 READ_TOOLS = {"inbox", "list_tasks", "get_item", "team_status"}
 ALWAYS_LOAD = {"inbox", "update_task"}
 ACCEPT = "application/json, text/event-stream"
+LEGACY_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
+MAX_MCP_BODY = 64 * 1024
 PV_KEY = "io.modelcontextprotocol/protocolVersion"
 CAPS_KEY = "io.modelcontextprotocol/clientCapabilities"
 CI_KEY = "io.modelcontextprotocol/clientInfo"
@@ -140,6 +146,8 @@ async def legacy_flow(raw: Raw, rep: Report, url: str, version: str = "2025-06-1
     rep.check(f"{tag} instructions present", bool(res.get("instructions")), len(res.get("instructions") or ""))
     sid = r.headers.get("mcp-session-id")
     rep.check(f"{tag} stateless (no Mcp-Session-Id)", sid is None, sid)
+    caps = res.get("capabilities")
+    rep.check(f"{tag} capabilities only tools, no listChanged", caps == {"tools": {}}, caps)
     h = {**base_h, "mcp-protocol-version": version}
     if sid:
         h["mcp-session-id"] = sid
@@ -156,6 +164,8 @@ async def legacy_flow(raw: Raw, rep: Report, url: str, version: str = "2025-06-1
     r = await raw.post(tag, url, {"jsonrpc": "2.0", "id": raw.nid(), "method": "tools/call", "params": {"name": "get_item", "arguments": {"id": "T-999999"}}}, h)
     res = ((parse_body(r) or {}).get("result")) or {}
     rep.check(f"{tag} tools/call business error is isError", res.get("isError") is True and (res.get("structuredContent") or {}).get("err") == "not_found", res.get("structuredContent"))
+    text = ((res.get("content") or [{}])[0]).get("text") or ""
+    rep.check(f"{tag} error content starts with code", text.startswith("not_found："), text[:40])
     return tools
 
 
@@ -176,6 +186,8 @@ async def modern_flow(raw: Raw, rep: Report, url: str) -> list[dict[str, Any]] |
     res = ((parse_body(r) or {}).get("result")) or {}
     rep.check(f"{tag} server/discover 200", r.status_code == 200, r.status_code)
     rep.check(f"{tag} discover supportedVersions has 2026-07-28", "2026-07-28" in (res.get("supportedVersions") or []), res.get("supportedVersions"))
+    rep.check(f"{tag} discover supportedVersions lists legacy too", LEGACY_VERSIONS <= set(res.get("supportedVersions") or []), res.get("supportedVersions"))
+    rep.check(f"{tag} discover capabilities only tools", res.get("capabilities") == {"tools": {}}, res.get("capabilities"))
     rep.check(f"{tag} discover instructions present", bool(res.get("instructions")), len(res.get("instructions") or ""))
     rep.check(f"{tag} no Mcp-Session-Id", r.headers.get("mcp-session-id") is None, r.headers.get("mcp-session-id"))
     r = await raw.post(tag, url, {"jsonrpc": "2.0", "id": raw.nid(), "method": "tools/list", "params": {"_meta": modern_meta()}}, hdr("tools/list"))
@@ -197,6 +209,16 @@ async def modern_flow(raw: Raw, rep: Report, url: str) -> list[dict[str, Any]] |
     r = await raw.post(tag, url, {"jsonrpc": "2.0", "id": raw.nid(), "method": "tools/call", "params": {"name": "inbox", "arguments": {}, "_meta": modern_meta()}}, hdr("tools/call", "get_item"))
     err = ((parse_body(r) or {}).get("error")) or {}
     rep.check(f"{tag} Mcp-Name mismatch → 400 HeaderMismatch", r.status_code == 400 and err.get("code") == -32020, {"status": r.status_code, "code": err.get("code")})
+    bad_meta = {**modern_meta(), PV_KEY: "2099-01-01"}
+    h = {**hdr("tools/list"), "mcp-protocol-version": "2099-01-01"}
+    r = await raw.post(tag, url, {"jsonrpc": "2.0", "id": raw.nid(), "method": "tools/list", "params": {"_meta": bad_meta}}, h)
+    err = ((parse_body(r) or {}).get("error")) or {}
+    supported = (err.get("data") or {}).get("supported") or []
+    rep.check(
+        f"{tag} unsupported version → -32022 listing both eras",
+        r.status_code == 400 and err.get("code") == -32022 and "2026-07-28" in supported and LEGACY_VERSIONS <= set(supported),
+        {"status": r.status_code, "code": err.get("code"), "supported": supported},
+    )
     return tools
 
 
@@ -204,6 +226,13 @@ async def negative_auth(raw: Raw, rep: Report, url: str) -> None:
     r = await raw.c.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}, headers={"accept": ACCEPT, "mcp-protocol-version": "2025-06-18"})
     raw.rep.http.append({"label": "no-token", "url": url, "method": "tools/list", "status": r.status_code, "location": r.headers.get("location")})
     rep.check(f"no token {url} → 401 + WWW-Authenticate", r.status_code == 401 and r.headers.get("www-authenticate", "").startswith("Bearer"), {"status": r.status_code, "www": r.headers.get("www-authenticate")})
+    big = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": {"pad": "x" * (MAX_MCP_BODY + 1)}}}
+    r = await raw.c.post(url, json=big, headers={"accept": ACCEPT, "mcp-protocol-version": "2025-06-18"})
+    raw.rep.http.append({"label": "no-token-big", "url": url, "method": "tools/list", "status": r.status_code, "location": r.headers.get("location")})
+    rep.check(f"no token + 64KB+ body {url} → 401 (auth before body)", r.status_code == 401, r.status_code)
+    r = await raw.c.post(url, json=big, headers={"accept": ACCEPT, "mcp-protocol-version": "2025-06-18", "authorization": f"Bearer {raw.token}"})
+    raw.rep.http.append({"label": "big-body", "url": url, "method": "tools/list", "status": r.status_code, "location": r.headers.get("location")})
+    rep.check(f"64KB+ body {url} → 413", r.status_code == 413, r.status_code)
 
 
 async def official_client(rep: Report, url: str, token: str, mode: str) -> dict[str, Any]:

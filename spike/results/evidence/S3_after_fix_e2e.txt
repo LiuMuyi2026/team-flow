@@ -1,0 +1,17 @@
+# 修复后复测（2026-10-02 12:28，Claude Code 2.1.287，端口 8194，非 editable 安装的 teamflow）。
+# 嵌套 claude -p 故意保留外层 CLAUDE_CODE_SESSION_ID=1a6941c0-…（模拟在 Claude Code 的 Bash 里再跑 claude）。
+## CLI 调试日志（TEAMFLOW_DEBUG=1）：helper 环境里有继承来的外层会话 ID，但不再发送
+  2026-10-02T04:28:26 pid=28917 mcp-headers client=claude session_env=yes (not sent)
+  2026-10-02T04:29:23 pid=29117 mcp-headers client=claude session_env=yes (not sent)
+## 服务端日志（e2e1：SessionStart 注入、inbox、claim_task×2、get_item、Stop/SessionEnd 上报）
+  {"m": "POST", "path": "/mcp/", "rpc": "server/discover", "pv": "2026-07-28", "tf_client": "claude_code", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/list", "pv": "2026-07-28", "tf_client": "claude_code", "st": 200}
+  {"m": "POST", "path": "/api/v1/hooks/session-start", "sess": "e2e00001-0000-4000-8000-000000000001", "tf_client": "claude_code", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "inbox", "pv": "2026-07-28", "tf_client": "claude_code", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "claim_task", "pv": "2026-07-28", "tf_client": "claude_code", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "claim_task", "pv": "2026-07-28", "tf_client": "claude_code", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "get_item", "pv": "2026-07-28", "tf_client": "claude_code", "st": 200}
+  {"m": "POST", "path": "/api/v1/hooks/batch", "tf_client": "claude_code", "st": 200}
+  {"m": "POST", "path": "/api/v1/hooks/batch", "tf_client": "claude_code", "st": 200}
+  {"m": "GET", "path": "/api/v1/me/delta", "tf_client": "claude_code", "st": 200}
+  → 只有 /api/v1/hooks/session-start 带会话（值来自 hook 输入）；所有 /mcp/ 请求都没有 sess，MCP 调用按成员级归属。

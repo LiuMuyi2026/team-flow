@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from teamflow_server.mcp_server import INSTRUCTIONS, TOOL_ORDER
@@ -98,7 +100,9 @@ async def test_modern_discover_list_call(client, path, log_path):
     call = [x for x in log if x.get("rpc") == "tools/call"][-1]
     assert call["tool"] == "team_status" and call["h_name"] == "team_status"
     assert call["call_id"] == "call_123"
-    assert call["codex_turn"] == turn  # 原样记录
+    # m2：x-codex-turn-metadata 只留 session_id、thread_id、turn_id，repo_root 等丢弃
+    assert call["codex_turn"] == {"session_id": "019a-sess", "thread_id": "019a-thread", "turn_id": "019a-turn"}
+    assert "/x" not in json.dumps(log, ensure_ascii=False)
     assert "x-codex-turn-metadata" in call["meta_keys"]
     assert call["ci"] == {"name": "pytest-modern", "version": "1"}
     assert call["h"] == "bob" and call["tok_client"] == "codex"
@@ -182,3 +186,70 @@ async def test_official_client_both_modes(app):
                 res = await c.call_tool("get_item", {"id": "T-50"})
                 assert res.is_error is False
                 assert res.structured_content["id"] == "T-50"
+
+
+# ---- m6：两代协议的能力宣告与版本列表 ----
+
+LEGACY_VERSIONS = {"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
+
+
+def _no_list_changed(obj) -> bool:
+    if isinstance(obj, dict):
+        return "listChanged" not in obj and all(_no_list_changed(v) for v in obj.values())
+    if isinstance(obj, list):
+        return all(_no_list_changed(v) for v in obj)
+    return True
+
+
+@pytest.mark.parametrize("version", ["2025-06-18", "2025-11-25"])
+async def test_legacy_initialize_capabilities_only_tools_no_list_changed(client, version):
+    m = LegacyMcp(client, ALICE, version=version)
+    caps = parse_body(await m.initialize())["result"]["capabilities"]
+    assert caps == {"tools": {}}
+    assert _no_list_changed(caps)
+    # GET（通知流）仍是 405：所以不能宣告 listChanged
+    r = await client.get("/mcp/", headers={"accept": "text/event-stream", "authorization": f"Bearer {ALICE}", "mcp-protocol-version": version})
+    assert r.status_code == 405
+
+
+async def test_modern_discover_lists_both_eras_and_only_tools(client):
+    m = ModernMcp(client, BOB)
+    res = parse_body(await m.rpc("server/discover"))["result"]
+    assert res["supportedVersions"][0] == "2026-07-28"
+    assert LEGACY_VERSIONS <= set(res["supportedVersions"])
+    caps = res["capabilities"]
+    assert caps == {"tools": {}}
+    for k in ("logging", "prompts", "resources", "extensions", "completions", "experimental"):
+        assert k not in caps
+
+
+async def test_unsupported_version_lists_both_eras(client, log_path):
+    h = {"accept": "application/json, text/event-stream", "authorization": f"Bearer {ALICE}", "mcp-protocol-version": "2099-01-01"}
+    meta = {"io.modelcontextprotocol/protocolVersion": "2099-01-01", "io.modelcontextprotocol/clientCapabilities": {}}
+    # 请求
+    r = await client.post("/mcp/", headers={**h, "mcp-method": "tools/list"}, json={"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {"_meta": meta}})
+    assert r.status_code == 400
+    assert int(r.headers["content-length"]) == len(r.content)  # 改写后长度正确
+    err = r.json()["error"]
+    assert err["code"] == -32022 and r.json()["id"] == 9
+    assert err["data"]["supported"][0] == "2026-07-28" and LEGACY_VERSIONS <= set(err["data"]["supported"])
+    assert err["data"]["requested"] == "2099-01-01"
+    rec = read_log(log_path)[-1]
+    assert rec["st"] == 400 and rec["rpc_err"] == -32022
+    # 通知（没有 id）
+    r = await client.post("/mcp/", headers={**h, "mcp-method": "notifications/initialized"}, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert r.status_code == 400
+    assert LEGACY_VERSIONS <= set(r.json()["error"]["data"]["supported"])
+    # 其他 400（-32020 头不一致）原样转发
+    m = ModernMcp(client, ALICE)
+    r = await m.rpc("tools/call", {"name": "inbox", "arguments": {}}, name="get_item")
+    assert r.status_code == 400 and r.json()["error"]["code"] == -32020 and int(r.headers["content-length"]) == len(r.content)
+
+
+def test_augment_unsupported_version_only_touches_32022():
+    from teamflow_server.gateway import augment_unsupported_version
+
+    assert augment_unsupported_version(b'{"jsonrpc":"2.0","id":1,"error":{"code":-32020,"message":"x"}}') is None
+    assert augment_unsupported_version(b"not json") is None
+    out = json.loads(augment_unsupported_version(b'{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"x","data":{"supported":["2026-07-28"],"requested":"x"}}}'))
+    assert out["error"]["data"]["supported"] == ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]

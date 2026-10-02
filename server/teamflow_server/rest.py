@@ -1,6 +1,14 @@
 """REST 适配层（/api/v1，权威接口）。MCP 和 CLI 都映射到同一个 service。
 
 端点都是同步函数：FastAPI 把它们放进线程池执行，service 的锁因此真正参与并发控制。
+
+错误一律是 4xx JSON ``{"error": "<code>", "message": "..."}``（跨包约定），可能附带 id、by、rule 等结构化字段。
+
+CLI 兜底命令（MCP 不可用时，plan 6.8）用到的三个端点：
+- ``POST /api/v1/tasks/{id}:note``  ``{"note": "..."}`` → 200 ``{"id", "st", "new"}``
+- ``POST /api/v1/tasks/{id}:done``  ``{"note": "..."}`` → 200 ``{"id", "st", "new"}``
+- ``POST /api/v1/blockers`` ``{"title", "detail?", "tried?", "task?", "need?"}`` → 201 ``{"id", "st", "need_state", "suggest"}``
+鉴权同其他 REST：``Authorization: Bearer tf_pat_…`` + ``X-Teamflow-Client``。
 """
 
 from __future__ import annotations
@@ -14,8 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, config
-from .errors import DomainError
-from .sanitize import ident_or_hash
+from .errors import DomainError, rest_error
 from .seed import seed
 from .service import Actor, Service
 
@@ -31,20 +38,24 @@ def svc_of(request: Request) -> Service:
     return request.app.state.svc
 
 
-def agent_actor(request: Request) -> Actor:
-    """PAT 一律按 agent 记账（H1）。gateway 已经校验过 token。"""
+def token_actor(request: Request, via: str = "rest") -> Actor:
+    """PAT 一律按 agent 记账（H1）。gateway 已经校验过 token。不做会话归属（读接口和 hooks 用）。"""
     tok = (request.scope.get("state") or {}).get("tf_ident")
     if tok is None:
         raise DomainError("not_allowed", "未鉴权。")
-    svc = svc_of(request)
-    session, attribution = None, "member"
+    return Actor(tok.handle, "agent", tok.client, tok.token_id, via)
+
+
+def agent_actor(request: Request) -> Actor:
+    """写接口用：token 身份 + X-Teamflow-Session 头的会话归属（统一走 resolve_session：存在、未结束、同 token、
+    同 client；不成立就是成员级并写审计）。读接口不产生事件，不做归属，免得每次读都写一条审计。"""
+    actor = token_actor(request)
     sess = request.headers.get("x-teamflow-session")
     if sess:
-        sid = ident_or_hash(sess)
-        s = svc.sessions.get((tok.client, sid or ""))
-        if s and s.handle == tok.handle and s.ended_at is None:
-            session, attribution = sid, "exact"
-    return Actor(tok.handle, "agent", tok.client, tok.token_id, "rest", session, attribution)
+        s = svc_of(request).resolve_session(actor.handle, actor.client, actor.token_id, sess, source="header", via="rest")
+        if s is not None:
+            return Actor(actor.handle, "agent", actor.client, actor.token_id, "rest", s.external_id, "exact")
+    return actor
 
 
 def human_only(request: Request) -> None:
@@ -67,11 +78,11 @@ def with_idem(request: Request, actor: Actor, payload: Any, fn: Callable[[], dic
     if state == "in_flight":
         raise DomainError("conflict", "同一个 Idempotency-Key 的请求还在处理中。")
     if state == "mismatch":
-        return JSONResponse({"err": "invalid", "msg": "Idempotency-Key 重复但请求内容不同。"}, status_code=422)
+        return JSONResponse(rest_error("invalid", "Idempotency-Key 重复但请求内容不同。"), status_code=422)
     try:
         data = fn()
     except DomainError as e:
-        svc.idem_finish("rest", owner, key, e.http_status, e.to_dict())
+        svc.idem_finish("rest", owner, key, e.http_status, e.to_rest())
         raise
     except Exception:
         svc.idem_abort("rest", owner, key)
@@ -97,13 +108,13 @@ def healthz(request: Request) -> dict[str, Any]:
 
 @router.get("/api/v1/me/inbox")
 def me_inbox(request: Request, limit: int = Query(10, ge=1, le=20)) -> dict[str, Any]:
-    return svc_of(request).inbox(agent_actor(request), limit=limit)
+    return svc_of(request).inbox(token_actor(request), limit=limit)
 
 
 @router.get("/api/v1/me/delta")
 def me_delta(request: Request, response: Response, cursor: int = Query(0, ge=0)) -> Any:
     svc = svc_of(request)
-    data = svc.delta(agent_actor(request), cursor)
+    data = svc.delta(token_actor(request), cursor)
     snap = {k: v for k, v in data.items() if k not in ("items", "more", "cursor")}
     digest = hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()[:12]
     etag = f'W/"{data["cursor"]}-{digest}"'
@@ -122,26 +133,26 @@ def tasks_list(
     limit: int = Query(20, ge=1, le=50),
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    return svc_of(request).list_tasks(agent_actor(request), view, project, q, limit, cursor)
+    return svc_of(request).list_tasks(token_actor(request), view, project, q, limit, cursor)
 
 
 @router.get("/api/v1/tasks/{tid}")
 def task_get(request: Request, tid: str, events: int = Query(5, ge=0, le=10)) -> dict[str, Any]:
     if not tid.upper().startswith("T-"):
         raise DomainError("not_found", f"{tid} 不是任务编号。")
-    return svc_of(request).get_item(agent_actor(request), tid, events)
+    return svc_of(request).get_item(token_actor(request), tid, events)
 
 
 @router.get("/api/v1/blockers/{bid}")
 def blocker_get(request: Request, bid: str, events: int = Query(5, ge=0, le=10)) -> dict[str, Any]:
     if not bid.upper().startswith("B-"):
         raise DomainError("not_found", f"{bid} 不是困难编号。")
-    return svc_of(request).get_item(agent_actor(request), bid, events)
+    return svc_of(request).get_item(token_actor(request), bid, events)
 
 
 @router.get("/api/v1/status")
 def team_status(request: Request, project: str | None = None) -> dict[str, Any]:
-    return svc_of(request).team_status(agent_actor(request), project)
+    return svc_of(request).team_status(token_actor(request), project)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +208,9 @@ def task_command(request: Request, tid: str, action: str, payload: dict[str, Any
     try:
         p = UpdateIn.model_validate(payload or {}).model_dump()
     except ValidationError as e:
-        raise DomainError("invalid", f"请求体不合法：{e.errors()[0].get('loc')} {e.errors()[0].get('msg')}") from None
+        first = e.errors()[0]
+        loc = ".".join(str(x) for x in first.get("loc", ()))
+        raise DomainError("invalid", f"请求体不合法：{loc} {first.get('msg')}", status=422) from None
     fixed = {"start": "in_progress", "done": "done", "release": "open", "cancel": "canceled"}
     status = fixed[action] if action in fixed else (p.get("status") if action == "update" else None)
 
@@ -272,7 +285,8 @@ def blocker_comment(request: Request, bid: str, payload: CommentIn) -> Response:
 
 @router.post("/api/v1/hooks/session-start")
 def hook_session_start(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    return svc_of(request).hook_session_start(agent_actor(request), payload)
+    # hooks 自己登记会话，不按请求头做会话归属（会话可能还没登记）
+    return svc_of(request).hook_session_start(token_actor(request, "hook"), payload)
 
 
 @router.post("/api/v1/hooks/batch")
@@ -280,14 +294,14 @@ def hook_batch(request: Request, payload: dict[str, Any] = Body(...)) -> dict[st
     items = payload.get("items")
     if not isinstance(items, list):
         raise DomainError("invalid", "items 必须是数组。")
-    actor = agent_actor(request)
-    return svc_of(request).hook_batch(Actor(actor.handle, "agent", actor.client, actor.token_id, "hook"), items)
+    return svc_of(request).hook_batch(token_actor(request, "hook"), items)
 
 
 # ---------------------------------------------------------------------------
 # DEV ONLY：模拟"人在手机微信里操作"。M1 上线前删除。
-# 只认 X-Teamflow-Dev-Human 头；带任何 Authorization（PAT）一律 403 human_only。
-# TEAMFLOW_DEV_ENDPOINTS=0 时整组返回 404。
+# 默认关闭（TEAMFLOW_DEV_ENDPOINTS 缺省为 0）；打开时还要带 X-Teamflow-Dev-Secret，值等于 TEAMFLOW_DEV_SECRET，
+# 未设置密钥则一律 404（gateway 先挡一次，这里再查一次）。带任何 Authorization（PAT）一律 403 human_only。
+# 人类动作必须带页面上看到的版本：接受 v、sha、seq；认领、帮忙 v、sha；转发 through（I1）。
 # ---------------------------------------------------------------------------
 
 
@@ -299,16 +313,24 @@ class DevActionIn(BaseModel):
 
 
 def dev_human(request: Request) -> Actor:
-    if not config.dev_endpoints_enabled():
-        raise DomainError("not_found", "DEV 端点已关闭。")
+    ok, _ = config.dev_access_ok(request.headers.get("x-teamflow-dev-secret"))
+    if not ok:
+        raise DomainError("not_found", "没有这个端点。")
     if request.client is None or request.client.host not in ("127.0.0.1", "::1", "localhost"):
-        raise DomainError("not_found", "DEV 端点只对本机开放。")
+        raise DomainError("not_found", "没有这个端点。")
     if request.headers.get("authorization"):
         raise DomainError("human_only", "DEV ONLY：这是模拟手机上本人操作的端点，PAT 不能调用。")
     h = (request.headers.get("x-teamflow-dev-human") or "").strip().lower()
     if not h or h not in svc_of(request).members:
         raise DomainError("human_only", "DEV ONLY：缺少模拟的人类会话（X-Teamflow-Dev-Human: <handle>）。")
     return Actor(h, "human", None, None, "dev")
+
+
+@router.get("/api/v1/dev/items/{oid}")
+def dev_item(request: Request, oid: str) -> dict[str, Any]:
+    """模拟手机详情页：表单里会带的 v、sha、seq（任务）和 through（页面渲染时最大的动态编号）。"""
+    dev_human(request)
+    return svc_of(request).page_view(oid)
 
 
 @router.post("/api/v1/dev/tasks/{tid}:{action}")
@@ -319,7 +341,7 @@ def dev_task(request: Request, tid: str, action: str, payload: DevActionIn | Non
     if action == "accept":
         return svc.human_accept(actor, tid, v=p.v, sha=p.sha, seq=p.seq, through=p.through)
     if action == "claim":
-        return svc.human_claim(actor, tid, v=p.v)
+        return svc.human_claim(actor, tid, v=p.v, sha=p.sha, through=p.through)
     if action == "forward":
         return svc.human_forward(actor, tid, through=p.through)
     raise DomainError("not_found", f"DEV 没有 :{action}。")
@@ -331,7 +353,7 @@ def dev_blocker(request: Request, bid: str, action: str, payload: DevActionIn | 
     svc = svc_of(request)
     p = payload or DevActionIn()
     if action == "help":
-        return svc.human_help(actor, bid)
+        return svc.human_help(actor, bid, v=p.v, sha=p.sha, through=p.through)
     if action == "ask":
         return svc.human_ask(actor, bid)
     if action == "forward":
@@ -352,6 +374,7 @@ def dev_outbox(request: Request, to: str | None = None) -> dict[str, Any]:
 
 @router.post("/api/v1/dev/reset")
 def dev_reset(request: Request) -> dict[str, Any]:
+    """清空并重新播种。受同一个开关和密钥管。"""
     dev_human(request)
     svc = svc_of(request)
     seed(svc)

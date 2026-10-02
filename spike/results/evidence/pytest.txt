@@ -1,0 +1,5 @@
+# 本轮验证的 pytest 结果（重新 uv pip install -e server -e cli 之后）
+$ .venv/bin/pytest -q server cli
+  382 passed in 69.59s (0:01:09)
+$ .venv/bin/pytest -q server cli（本轮加入 cli/tests/test_codex_check_static.py 之后）
+  385 passed in 70.40s (0:01:10)

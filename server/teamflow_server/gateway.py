@@ -1,12 +1,18 @@
 """HTTP 层网关（纯 ASGI 中间件）。REST 和 MCP 共用，agent 绕过 MCP 直接 curl 也走这里。
 
-按顺序做五件事：
+按顺序做这几件事：
 1. 路径规范化：``/mcp`` 在应用内改写成 ``/mcp/``（等价于 nginx 的内部改写），两者都不返回 3xx。
-2. 鉴权：``Authorization: Bearer tf_pat_…``，来自 TEAMFLOW_DEV_TOKENS；缺失或错误返回 401 并带 WWW-Authenticate。
+2. DEV 端点的门（B1）：``/api/v1/dev/*`` 默认关闭；打开（TEAMFLOW_DEV_ENDPOINTS=1）时还要带
+   ``X-Teamflow-Dev-Secret``，值等于 TEAMFLOW_DEV_SECRET；未设置密钥、密钥不对、开关没开，一律 404。
+3. 鉴权：``Authorization: Bearer tf_pat_…``，来自 TEAMFLOW_DEV_TOKENS；缺失或错误返回 401 并带 WWW-Authenticate。
    ``/mcp/`` 和 ``/api/v1/hooks`` 完全忽略 Cookie 头；``/mcp/`` 上出现不在白名单的 Origin 返回 403。
-3. 故障注入：TEAMFLOW_FAULT_DELAY_MS 让 ``/api/v1/hooks/*`` 和 ``/api/v1/me/*`` 延迟返回。
-4. 把鉴权结果和解析出的 JSON-RPC 信息放进 ``scope["state"]``，供 REST 依赖和 MCP 工具读取。
-5. 观测日志：每个请求往 TEAMFLOW_LOG 追加一行 JSON（不记请求体和查询串，只记协议元数据）。
+   **先鉴权再读请求体**（m7）：未鉴权的请求一个字节的请求体都不读。
+4. /mcp 请求体上限 64KB：Content-Length 超了直接 413，分块传输读到超过也 413。
+5. 故障注入：TEAMFLOW_FAULT_DELAY_MS 让 ``/api/v1/hooks/*`` 和 ``/api/v1/me/*`` 延迟返回。
+6. 把鉴权结果和解析出的 JSON-RPC 信息放进 ``scope["state"]``，供 REST 依赖和 MCP 工具读取。
+7. 新代 -32022（版本不支持）的 ``data.supported`` 补上旧代版本：SDK 的传输层写死只列新代（m6）。
+8. 观测日志：每个请求往 TEAMFLOW_LOG 追加一行 JSON（不记请求体和查询串，只记协议元数据；
+   x-codex-turn-metadata 只留 session_id、thread_id、turn_id）。
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSI
 from starlette.datastructures import Headers
 
 from . import config
+from .errors import rest_error
 from .service import TZ
 
 PV_KEY = "io.modelcontextprotocol/protocolVersion"
@@ -32,8 +39,9 @@ CODEX_TURN_KEY = "x-codex-turn-metadata"
 _log_lock = threading.Lock()
 _last_init: dict[str, dict[str, Any]] = {}  # token_id → 最近一次 initialize 的 {pv, ci}（旧代后续请求不再带 clientInfo）
 _MAX_CAPTURE = 256 * 1024
-_MAX_BODY = 4 * 1024 * 1024  # 与 SDK 的默认请求体上限一致；鉴权前就要读请求体，所以先设上限
+MAX_MCP_BODY = 64 * 1024  # /mcp 请求体上限：9 个工具的参数最长 4000 字，64KB 绰绰有余（SDK 默认 4MB）
 _MAX_LOG_VALUE = 4096
+UNSUPPORTED_PROTOCOL_VERSION = -32022
 
 
 def _cap(value: Any) -> Any:
@@ -111,11 +119,48 @@ def parse_rpc(body: bytes, headers: Headers) -> dict[str, Any]:
     if meta is not None:
         info["meta_keys"] = sorted(meta.keys())
         if CODEX_TURN_KEY in meta:
-            info["codex_turn"] = meta[CODEX_TURN_KEY]  # 原样记录
+            info["codex_turn"] = codex_turn_fields(meta[CODEX_TURN_KEY])  # 只留 session_id、thread_id、turn_id
         if "callId" in meta:
             info["call_id"] = meta["callId"]
         info["meta"] = meta  # 只放进 scope，不写日志
     return info
+
+
+def codex_turn_fields(turn: Any) -> dict[str, Any] | None:
+    """plan 6.5：x-codex-turn-metadata（对象或 JSON 字符串）只保留 session_id、thread_id、turn_id，
+    repo_root 等其余字段丢弃。日志和 MCP 归属共用。"""
+    if isinstance(turn, str):
+        try:
+            turn = json.loads(turn)
+        except (ValueError, RecursionError):
+            return None
+    if not isinstance(turn, dict):
+        return None
+    return {k: str(turn[k])[:128] for k in ("session_id", "thread_id", "turn_id") if isinstance(turn.get(k), (str, int))}
+
+
+def augment_unsupported_version(body: bytes) -> bytes | None:
+    """-32022 的 data.supported 补上旧代（握手代）版本，新代在前。不是 -32022 就返回 None（原样转发）。
+
+    规范示例里双代服务端列出两代（basic/versioning：``"supported": ["2026-07-28", "2025-11-25"]``）；
+    mcp 2.2.0 的 streamable HTTP 传输层写死只列 MODERN_PROTOCOL_VERSIONS，没有配置项，所以在网关里补。
+    """
+    try:
+        obj = json.loads(body)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("error"), dict):
+        return None
+    err = obj["error"]
+    data = err.get("data")
+    if err.get("code") != UNSUPPORTED_PROTOCOL_VERSION or not isinstance(data, dict) or not isinstance(data.get("supported"), list):
+        return None
+    merged = list(data["supported"])
+    for v in (*reversed(MODERN_PROTOCOL_VERSIONS), *reversed(HANDSHAKE_PROTOCOL_VERSIONS)):
+        if v not in merged:
+            merged.append(v)
+    data["supported"] = merged
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def _summarize_response(ctype: str, body: bytes) -> dict[str, Any]:
@@ -151,8 +196,8 @@ def _summarize_response(ctype: str, body: bytes) -> dict[str, Any]:
             out["pv_resp"] = res["protocolVersion"]
         if "supportedVersions" in res:
             out["supported"] = res["supportedVersions"]
-    if "err" in obj and isinstance(obj.get("err"), str):
-        out["tf_err"] = obj["err"]
+    if isinstance(obj.get("error"), str):  # REST：{"error": code, "message": ...}
+        out["tf_err"] = obj["error"]
     return out
 
 
@@ -213,13 +258,67 @@ class Gateway:
             if v is not None:
                 rec[rk] = v[:200]
 
+        def done(st: int, **more: Any) -> None:
+            rec.update({"st": st, "ms": round((time.perf_counter() - t0) * 1000, 1), **more})
+            write_log(rec)
+
         # /mcp/ 与 /api/v1/hooks 完全忽略 Cookie
         if is_mcp or path.startswith("/api/v1/hooks"):
             scope["headers"] = [(k, v) for k, v in scope["headers"] if k.lower() != b"cookie"]
 
-        # MCP 请求体要先读出来解析，再原样回放给下游
-        body = b""
+        # DEV 端点的门（B1）：开关、密钥任一不满足都 404，和"没有这个端点"无法区分
+        if is_dev:
+            ok, why = config.dev_access_ok(headers.get("x-teamflow-dev-secret"))
+            if not ok:
+                await _send_json(send, 404, rest_error("not_found", "没有这个端点。"))
+                done(404, dev=why)
+                return
+            dh = headers.get("x-teamflow-dev-human")
+            if dh:
+                rec["dev_human"] = dh[:32]
+
+        # 鉴权：先于读请求体（m7）
+        tok_rec = None
+        needs_auth = (is_mcp or is_api) and not is_dev
+        if needs_auth:
+            tok = _bearer(headers)
+            tok_rec = config.tokens().get(tok) if tok else None
+            if tok_rec is None:
+                if tok is None:
+                    www = 'Bearer realm="teamflow"'
+                    msg = "缺少令牌：请求头需要 Authorization: Bearer tf_pat_…"
+                else:
+                    www = 'Bearer realm="teamflow", error="invalid_token", error_description="unknown or revoked token"'
+                    msg = "令牌无效或已停用，请运行 teamflow doctor 检查。"
+                if is_mcp:
+                    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": msg}}
+                else:
+                    payload = rest_error("unauthorized", msg)
+                await _send_json(send, 401, payload, ((b"www-authenticate", www.encode()),))
+                done(401, auth="missing" if tok is None else "invalid")
+                return
+            state["tf_ident"] = tok_rec
+            rec["h"] = tok_rec.handle
+            rec["tok_client"] = tok_rec.client
+
+        if is_mcp:
+            origin = headers.get("origin")
+            if origin and origin.rstrip("/") not in config.allowed_origins():
+                await _send_json(send, 403, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Origin not allowed"}})
+                done(403)
+                return
+
+        # MCP 请求体：鉴权通过后才读，读出来解析，再原样回放给下游；上限 64KB
         if is_mcp and method == "POST":
+            too_large = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Request body too large (max 64KB)"}}
+            try:
+                declared = int(headers.get("content-length") or 0)
+            except ValueError:
+                declared = 0
+            if declared > MAX_MCP_BODY:
+                await _send_json(send, 413, too_large)
+                done(413, body_limit="content-length")
+                return
             chunks: list[bytes] = []
             more = True
             total = 0
@@ -229,10 +328,9 @@ class Gateway:
                     return
                 chunk = message.get("body", b"")
                 total += len(chunk)
-                if total > _MAX_BODY:
-                    await _send_json(send, 413, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Request body too large"}})
-                    rec.update({"st": 413, "ms": round((time.perf_counter() - t0) * 1000, 1)})
-                    write_log(rec)
+                if total > MAX_MCP_BODY:
+                    await _send_json(send, 413, too_large)
+                    done(413, body_limit="stream")
                     return
                 chunks.append(chunk)
                 more = message.get("more_body", False)
@@ -250,49 +348,11 @@ class Gateway:
             rpc = parse_rpc(body, headers)
             state["tf_rpc"] = rpc
             rec.update({k: (_cap(v) if k in ("ci", "codex_turn", "call_id") else v) for k, v in rpc.items() if k != "meta"})
-
-        # 鉴权
-        tok_rec = None
-        needs_auth = (is_mcp or is_api) and not is_dev
-        if needs_auth:
-            tok = _bearer(headers)
-            tok_rec = config.tokens().get(tok) if tok else None
-            if tok_rec is None:
-                if tok is None:
-                    www = 'Bearer realm="teamflow"'
-                    msg = "缺少令牌：请求头需要 Authorization: Bearer tf_pat_…"
-                else:
-                    www = 'Bearer realm="teamflow", error="invalid_token", error_description="unknown or revoked token"'
-                    msg = "令牌无效或已停用，请运行 teamflow doctor 检查。"
-                if is_mcp:
-                    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": msg}}
-                else:
-                    payload = {"err": "unauthorized", "msg": msg}
-                await _send_json(send, 401, payload, ((b"www-authenticate", www.encode()),))
-                rec.update({"st": 401, "ms": round((time.perf_counter() - t0) * 1000, 1), "auth": "missing" if tok is None else "invalid"})
-                write_log(rec)
-                return
-            state["tf_ident"] = tok_rec
-            rec["h"] = tok_rec.handle
-            rec["tok_client"] = tok_rec.client
-            if is_mcp:
-                rpc = state.get("tf_rpc") or {}
+            if tok_rec is not None:
                 if rpc.get("rpc") == "initialize":
                     _last_init[tok_rec.token_id] = {"pv": rpc.get("pv"), "ci": rpc.get("ci")}
                 elif "ci" not in rpc and tok_rec.token_id in _last_init:
                     rec["ci_last"] = _last_init[tok_rec.token_id]
-        elif is_dev:
-            dh = headers.get("x-teamflow-dev-human")
-            if dh:
-                rec["dev_human"] = dh[:32]
-
-        if is_mcp:
-            origin = headers.get("origin")
-            if origin and origin.rstrip("/") not in config.allowed_origins():
-                await _send_json(send, 403, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Origin not allowed"}})
-                rec.update({"st": 403, "ms": round((time.perf_counter() - t0) * 1000, 1)})
-                write_log(rec)
-                return
 
         # 故障注入
         if path.startswith("/api/v1/hooks/") or path.startswith("/api/v1/me/"):
@@ -305,6 +365,7 @@ class Gateway:
         captured: list[bytes] = []
         size = 0
         capture = is_mcp or is_api
+        held: dict[str, Any] = {"start": None, "body": []}  # /mcp 的 400 JSON 响应先扣下，可能要改写 -32022
 
         async def send_wrapper(message: dict[str, Any]) -> None:
             nonlocal size
@@ -318,10 +379,33 @@ class Gateway:
                         status_box["resp_session"] = v.decode("latin-1")[:64]
                     elif lk == b"location":
                         status_box["location"] = v.decode("latin-1")[:200]
-            elif message["type"] == "http.response.body" and capture and size < _MAX_CAPTURE:
-                chunk = message.get("body", b"")
-                captured.append(chunk[: _MAX_CAPTURE - size])
-                size += len(chunk)
+                if is_mcp and message["status"] == 400 and "application/json" in status_box["ctype"]:
+                    held["start"] = message
+                    return
+            elif message["type"] == "http.response.body":
+                if held["start"] is not None:
+                    held["body"].append(message.get("body", b""))
+                    if message.get("more_body", False):
+                        return
+                    raw = b"".join(held["body"])
+                    new = augment_unsupported_version(raw)
+                    start_msg = held["start"]
+                    held["start"] = None
+                    if new is not None:
+                        raw = new
+                        hdrs = [(k, v) for k, v in start_msg.get("headers", []) if k.lower() != b"content-length"]
+                        hdrs.append((b"content-length", str(len(raw)).encode()))
+                        start_msg = {**start_msg, "headers": hdrs}
+                    if capture:
+                        captured.append(raw[:_MAX_CAPTURE])
+                        size += len(raw)
+                    await send(start_msg)
+                    await send({"type": "http.response.body", "body": raw, "more_body": False})
+                    return
+                if capture and size < _MAX_CAPTURE:
+                    chunk = message.get("body", b"")
+                    captured.append(chunk[: _MAX_CAPTURE - size])
+                    size += len(chunk)
             await send(message)
 
         try:

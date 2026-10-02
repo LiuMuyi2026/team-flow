@@ -1,0 +1,34 @@
+# spike/smoke_mcp.py --base http://127.0.0.1:8194（2026-10-02 本轮验证）
+passed=55 failed=[] tools_sha256=14d1cf180399567f3690a98042e5ea262017b1b3cf33ec268d8bd79042a7c4ef
+ok    healthz
+ok    legacy[2025-06-18] /mcp initialize 200
+ok    legacy[2025-06-18] /mcp initialize protocolVersion
+ok    legacy[2025-06-18] /mcp instructions present
+ok    legacy[2025-06-18] /mcp stateless (no Mcp-Session-Id)
+ok    legacy[2025-06-18] /mcp capabilities only tools, no listChanged
+ok    legacy[2025-06-18] /mcp notifications/initialized 202
+ok    legacy[2025-06-18] /mcp tools/list 9 tools + annotations
+ok    legacy[2025-06-18] /mcp tools/call inbox
+ok    legacy[2025-06-18] /mcp tools/call business error is isError
+ok    legacy[2025-06-18] /mcp error content starts with code
+ok    modern[2026-07-28] /mcp server/discover 200
+ok    modern[2026-07-28] /mcp discover supportedVersions has 2026-07-28
+ok    modern[2026-07-28] /mcp discover supportedVersions lists legacy too
+ok    modern[2026-07-28] /mcp discover capabilities only tools
+ok    modern[2026-07-28] /mcp discover instructions present
+ok    modern[2026-07-28] /mcp no Mcp-Session-Id
+ok    modern[2026-07-28] /mcp tools/list 9 tools + annotations
+ok    modern[2026-07-28] /mcp tools/list ttlMs + cacheScope
+ok    modern[2026-07-28] /mcp tools/call get_item
+ok    modern[2026-07-28] /mcp Mcp-Name mismatch → 400 HeaderMismatch
+ok    modern[2026-07-28] /mcp unsupported version → -32022 listing both eras
+ok    no token /mcp → 401 + WWW-Authenticate
+ok    no token + 64KB+ body /mcp → 401 (auth before body)
+ok    64KB+ body /mcp → 413
+ok    tools/list identical across eras and URLs
+ok    no 3xx on any raw request
+ok    official mcp client mode=auto /mcp
+ok    official mcp client mode=legacy /mcp
+ok    official mcp client mode=auto /mcp/
+ok    official mcp client mode=legacy /mcp/
+（带尾斜杠的 /mcp/ 同样 26 项全部通过，从略）

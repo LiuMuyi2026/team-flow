@@ -1,0 +1,57 @@
+# S4 hook 延迟复测（2026-10-02，修复后 CLI，独立 venv 非 editable 安装，Python 3.11.15，4 核）。服务端：慢 3 秒（TEAMFLOW_FAULT_DELAY_MS=3000）。
+# 命令：$V/bin/python spike/bench_hooks.py --api <地址> --n 50 --clients <c> --shell <exec|sh|bash> --bin $V/bin/teamflow --json
+# 单位 ms；「拉起」= 这一行里 hook 拉起分离进程的次数；prompt:* 每次运行前重写缓存与会话状态（见 bench_hooks.py 文档串）。
+teamflow hook 基准  api=http://127.0.0.1:8194  n=50  执行方式=exec  spawn=on
+命令                 客户端          p50      p95      max     目标  有输出    拉起
+python -c pass     -           14.2     17.7     19.7      -
+session-start      claude    1073.2   1091.5   1091.8   1200  0      0    通过
+prompt             claude      16.9     22.6     27.0     30  0      0    通过
+prompt:stale       claude      17.4     23.6     41.9     30  0      0    通过
+prompt:emit        claude      19.0     25.2     27.6     30  50     0    通过
+prompt:stale+emit  claude      18.7     22.6     23.7     30  50     0    通过
+stop               claude      41.6     48.8     63.8    100  0      50   通过
+session-end        claude      37.5     47.3     57.5    100  0      50   通过
+mcp-headers        claude      15.7     37.9     45.1      -
+
+teamflow hook 基准  api=http://127.0.0.1:8194  n=50  执行方式=sh  spawn=on
+命令                 客户端          p50      p95      max     目标  有输出    拉起
+python -c pass     -           14.6     26.0     28.5      -
+session-start      codex     1078.5   1091.7   1100.7   1200  0      0    通过
+prompt             codex       19.5     26.1     35.1     30  0      0    通过
+prompt:stale       codex       19.2     26.5     33.8     30  0      0    通过
+prompt:emit        codex       20.6     28.4     30.4     30  50     0    通过
+prompt:stale+emit  codex       20.9     26.3     26.7     30  50     0    通过
+stop               codex       46.3     58.0     60.9    100  0      50   通过
+session-end        codex       41.3     52.6     56.8    100  0      50   通过
+mcp-headers        codex       19.1     39.2     45.0      -
+
+teamflow hook 基准  api=http://127.0.0.1:8194  n=50  执行方式=bash  spawn=on
+命令                 客户端          p50      p95      max     目标  有输出    拉起
+python -c pass     -           14.3     19.9     39.0      -
+session-start      codex     1082.9   1096.5   1104.2   1200  0      0    通过
+prompt             codex       19.7     27.6     35.5     30  0      0    通过
+prompt:stale       codex       19.5     27.7     37.4     30  0      0    通过
+prompt:emit        codex       22.1     32.3     50.8     30  50     0    超标
+prompt:stale+emit  codex       21.1     28.8     31.6     30  50     0    通过
+stop               codex       46.9     61.7     64.3    100  0      50   通过
+session-end        codex       40.5     54.8     59.8    100  0      50   通过
+mcp-headers        codex       22.9     42.8     47.1      -
+## bash -c（Codex）prompt:emit 在上表超标，同样条件只测 prompt 再跑 3 次（prompt 从不联网，服务端状态与它无关）
+### 复跑 1
+python -c pass     -           15.0     18.3     19.0      -
+prompt             codex       19.3     25.5     29.3     30  0      0    通过
+prompt:stale       codex       19.5     25.9     26.2     30  0      0    通过
+prompt:emit        codex       20.0     31.0     34.9     30  50     0    超标
+prompt:stale+emit  codex       20.3     25.6     26.8     30  50     0    通过
+### 复跑 2
+python -c pass     -           14.5     20.5     26.9      -
+prompt             codex       18.3     21.1     36.0     30  0      0    通过
+prompt:stale       codex       19.3     26.7     32.2     30  0      0    通过
+prompt:emit        codex       22.3     29.3     37.3     30  50     0    通过
+prompt:stale+emit  codex       20.7     28.1     33.8     30  50     0    通过
+### 复跑 3
+python -c pass     -           14.3     16.6     23.8      -
+prompt             codex       19.9     27.3     35.0     30  0      0    通过
+prompt:stale       codex       19.6     28.7     40.6     30  0      0    通过
+prompt:emit        codex       20.8     28.8     29.3     30  50     0    通过
+prompt:stale+emit  codex       20.6     28.9     32.6     30  50     0    通过

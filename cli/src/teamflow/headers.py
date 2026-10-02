@@ -12,12 +12,16 @@ import sys
 
 from teamflow import common
 
-SESSION_ENV = {"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_SESSION_ID"}
+# 不发 X-Teamflow-Session（M0 S3）：
+# - Claude Code 不给 headersHelper 设置 CLAUDE_CODE_SESSION_ID，helper 看到的是父进程原样的环境。嵌套运行
+#   （在 Claude Code 的 Bash 里跑 claude -p、脚本、workflow）时那是外层会话的 ID，会把子会话的 MCP 调用
+#   精确地记到外层会话上；顶层运行时根本没有这个变量。helper 也只在连接时跑一次，/clear 换了 ID 也不会更新。
+# - Codex 运行 helper 前 env_clear()，CODEX_SESSION_ID 本来就到不了这里；服务端改用 tools/call 的
+#   _meta["x-codex-turn-metadata"].session_id 匹配 hook 登记的会话（两者都来自 Codex 的 sess.session_id()）。
+# 所以两端的 MCP 请求头都只带身份，会话归属交给服务端；拿不到可信会话时服务端按成员级记账。
 
 
 def build(client: str, cred: str, ws_slug: str | None = None, env=None) -> dict:
-    from teamflow.hooks import valid_sid
-
     env = os.environ if env is None else env
     creds = common.load_creds(cred)
     wss = creds["workspaces"]
@@ -27,35 +31,11 @@ def build(client: str, cred: str, ws_slug: str | None = None, env=None) -> dict:
         _, ws = common.select_workspace(creds, os.getcwd())
     token = common.token_for(ws, client)
     hdr = {"Authorization": "Bearer " + token, "X-Teamflow-Client": common.WIRE_CLIENT[client]}
-    sid = valid_sid(env.get(SESSION_ENV[client]))
-    if sid:
-        hdr["X-Teamflow-Session"] = sid
     if env.get("TEAMFLOW_DEBUG") == "1":
-        # S3 用：只记录有没有拿到会话 ID，不记录值和 token
-        common.log("mcp-headers client=%s session_env=%s" % (client, "yes" if sid else "no"))
+        # S3 用：只记录有没有继承到会话变量（我们不会发它），不记录值和 token
+        var = "CLAUDE_CODE_SESSION_ID" if client == "claude" else "CODEX_SESSION_ID"
+        common.log("mcp-headers client=%s session_env=%s (not sent)" % (client, "yes" if env.get(var) else "no"))
     return hdr
-
-
-def _json_str(s: str) -> str:
-    out = ['"']
-    for c in s:
-        o = ord(c)
-        if c in '"\\' or o < 0x20 or o > 0x7E:
-            out.append("\\u%04x" % o if o <= 0xFFFF else "".join("\\u%04x" % u for u in _utf16(o)))
-        else:
-            out.append(c)
-    out.append('"')
-    return "".join(out)
-
-
-def _utf16(o):
-    o -= 0x10000
-    return (0xD800 + (o >> 10), 0xDC00 + (o & 0x3FF))
-
-
-def _json_obj(d: dict) -> str:
-    """只含字符串的扁平对象；手写编码，免得为一行输出导入 json。"""
-    return "{" + ",".join("%s:%s" % (_json_str(k), _json_str(v)) for k, v in d.items()) + "}"
 
 
 def run(client: str, cred: str, ws_slug: str | None = None) -> int:
@@ -75,6 +55,6 @@ def run(client: str, cred: str, ws_slug: str | None = None) -> int:
         sys.stderr.write("teamflow mcp-headers：%s\n" % e)
         common.log("mcp-headers cred error: %s" % e)
         return 1
-    sys.stdout.write(_json_obj(hdr))
+    sys.stdout.write(common.dumps(hdr))
     sys.stdout.flush()
     return 0

@@ -6,7 +6,7 @@ import json
 import re
 import time
 
-from .conftest import ALICE, BOB, auth, dev_headers, read_log
+from .conftest import ALICE, BOB, BOB_CX2, auth, dev_headers, read_log
 
 SESSION_START_KEYS = {"v", "me", "doing", "todo", "to_accept", "help_me", "fwd", "proposed", "pool_new", "repo_hint", "cursor"}
 ID = re.compile(r"^[TB]-\d{1,6}$")
@@ -68,10 +68,15 @@ async def test_session_start_alice_and_repo_hint(client):
 
 async def test_session_hijack_ignored(client, svc):
     await client.post("/api/v1/hooks/session-start", headers=auth(BOB), json={"client": "codex", "session": "shared"})
-    await client.post("/api/v1/hooks/session-start", headers=auth(ALICE), json={"client": "codex", "session": "shared", "repo": "evil"})
+    # 另一枚同 client 的 token（bob 的第二台机器）拿同一个会话 ID：忽略并写审计
+    await client.post("/api/v1/hooks/session-start", headers=auth(BOB_CX2), json={"client": "codex", "session": "shared", "repo": "evil"})
     s = svc.sessions[("codex", "shared")]
     assert s.handle == "bob" and s.repo is None
     assert svc.audit[-1]["action"] == "session.token_mismatch"
+    # 别的 client 的 token 自称 codex：client 强制取 token 的 client，碰不到 codex 那条会话
+    await client.post("/api/v1/hooks/session-start", headers=auth(ALICE), json={"client": "codex", "session": "shared", "repo": "evil2"})
+    assert svc.sessions[("codex", "shared")].repo is None
+    assert svc.sessions[("claude_code", "shared")].handle == "alice"
 
 
 async def test_batch_dedupe_mask_and_limits(client, svc):
@@ -100,7 +105,7 @@ async def test_batch_dedupe_mask_and_limits(client, svc):
     await client.post("/api/v1/hooks/batch", headers=auth(BOB), json={"items": [{"key": "k6", "type": "start", "session_id": "s1", "client": "codex"}]})
     assert svc.sessions[("codex", "s1")].ended_at is None
     r = await client.post("/api/v1/hooks/batch", headers=auth(BOB), json={"items": [{"key": f"x{i}", "type": "turn_end"} for i in range(101)]})
-    assert r.status_code == 413 and r.json()["err"] == "too_many"
+    assert r.status_code == 413 and r.json()["error"] == "too_many"
 
 
 async def test_delta_cursor_and_etag(client):

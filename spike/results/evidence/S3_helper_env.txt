@@ -1,0 +1,22 @@
+# S3 修复前的实测（Claude Code 2.1.287，嵌套 claude -p，2026-10-02 上午）。原始文件 spike/out/s136/（不进 git）。
+# helper 只记录会话相关的环境变量，从不记录 token。
+## 修复前：helper 环境里的 CLAUDE_CODE_SESSION_ID 与 hook 拿到的对照（hh_env.jsonl × hook_record.jsonl × 服务端 sess）
+  运行                  hook.stdin.session_id                 helper 的 CLAUDE_CODE_SESSION_ID       服务端收到的 X-Teamflow-Session
+  s1_default            11111111-1111-4111-8111-111111111111  1a6941c0-21de-5c92-8067-c298f2345b24  ['1a6941c0-21de-5c92-8067-c298f2345b24']
+  s1_legacy             22222222-2222-4222-8222-222222222222  1a6941c0-21de-5c92-8067-c298f2345b24  ['1a6941c0-21de-5c92-8067-c298f2345b24']
+  s1_v1                 33333333-3333-4333-8333-333333333333  1a6941c0-21de-5c92-8067-c298f2345b24  ['1a6941c0-21de-5c92-8067-c298f2345b24']
+  s1_noslash            44444444-4444-4444-8444-444444444444  1a6941c0-21de-5c92-8067-c298f2345b24  ['1a6941c0-21de-5c92-8067-c298f2345b24']
+  s1_noallow            55555555-5555-4555-8555-555555555555  1a6941c0-21de-5c92-8067-c298f2345b24  ['1a6941c0-21de-5c92-8067-c298f2345b24']
+  s1_write              77777777-7777-4777-8777-777777777777  1a6941c0-21de-5c92-8067-c298f2345b24  ['1a6941c0-21de-5c92-8067-c298f2345b24']
+  s3_toplevel           88888888-8888-4888-8888-888888888888  None                                  （无此头）
+  s3_inherit_randomsid  b277b359-5d8c-42b8-8b14-1e799bcbad64  1a6941c0-21de-5c92-8067-c298f2345b24  ['1a6941c0-21de-5c92-8067-c298f2345b24']
+  helper 只多出：CLAUDE_CODE_MCP_SERVER_NAME=teamflow、CLAUDE_CODE_MCP_SERVER_URL=<url>；外层会话 = 1a6941c0-…
+## 对照：stdio MCP 进程拿到的是自己的会话 ID（s3_stdio_env*.summary.txt）
+  s3_stdio_env      {"CLAUDE_CODE_SESSION_ID":"eeeeeeee-0000-4000-8000-000000000001","CLAUDECODE":"1"}
+  s3_stdio_env_top  {"CLAUDE_CODE_SESSION_ID":"eeeeeeee-0000-4000-8000-000000000002","CLAUDECODE":"1"}
+## 可选方案的依据：_meta["claudecode/toolUseId"] == PostToolUse 的 tool_use_id
+  [v2 运行时 / 2026-07-28] _meta.claudecode/toolUseId=toolu_012HDfH2mEGmyGFoKMDw5GJw
+                      PostToolUse stdin: session_id=99999999-9999-4999-8999-999999999990 tool_use_id=toolu_012HDfH2mEGmyGFoKMDw5GJw tool_name=mcp__probe__echo_meta  相等=True
+  [v1 运行时 / 2025-11-25] _meta.claudecode/toolUseId=toolu_018mtaXS32pXAsBn1eDV31wG
+                      PostToolUse stdin: session_id=99999999-9999-4999-8999-999999999991 tool_use_id=toolu_018mtaXS32pXAsBn1eDV31wG tool_name=mcp__probe__echo_meta  相等=True
+  PostToolUse stdin 的键：cwd, duration_ms, effort, hook_event_name, mcp_server, permission_mode, prompt_id, scratchpad_dir, session_id, tool_input, tool_name, tool_response, tool_use_id, transcript_path

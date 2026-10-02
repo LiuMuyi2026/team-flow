@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable, Literal
 
 from . import config
 from .errors import DomainError
-from .sanitize import clean, ident_or_hash, mask, scan, sha256
+from .sanitize import clean, ident_or_hash, mask, scan, sha256, unsafe_title
 
 TZ = timezone(timedelta(hours=8))  # Asia/Shanghai，无夏令时
 WS = "team"
@@ -64,8 +64,9 @@ class Actor:
     client: str | None = None  # claude_code / codex / cli；人为 None
     token_id: str | None = None
     via: str = "mcp"  # mcp / rest / hook / dev / wechat / seed
-    session: str | None = None  # 精确归属到的会话 external_id
+    session: str | None = None  # 精确归属到的会话 external_id（必须经 resolve_session 校验）
     attribution: str = "member"  # exact / member
+    thread: str | None = None  # Codex 子线程（x-codex-turn-metadata.thread_id），只作记录，不参与归属
 
     @property
     def bk(self) -> str:
@@ -172,17 +173,28 @@ class Event:
     data: dict[str, Any] = field(default_factory=dict)
     token_id: str | None = None
     session: str | None = None
+    thread: str | None = None
 
 
 @dataclass
 class Acceptance:
+    """本人对某个对象的"看见"记录。
+
+    content_version / content_sha256 为 None 表示只"转发"过动态（推进了 through_event_id），从没接受过正文：
+    转发绝不授予或升级正文可见性（I1）。
+    """
+
     handle: str
     subject: str
-    content_version: int
-    content_sha256: str
+    content_version: int | None
+    content_sha256: str | None
     through_event_id: int
     via: str
     at: datetime
+
+    @property
+    def accepted(self) -> bool:
+        return self.content_version is not None
 
 
 @dataclass
@@ -290,6 +302,7 @@ class Service:
             data={k: v for k, v in data.items() if v is not None},
             token_id=actor.token_id if actor else None,
             session=actor.session if actor else None,
+            thread=actor.thread if actor else None,
         )
         self._next_event_id += 1
         self.events.append(ev)
@@ -335,6 +348,25 @@ class Service:
                 rule=hit.rule,
                 pos=hit.pos,
             )
+        return v
+
+    def _title(self, actor: Actor, value: str | None) -> str | None:
+        """标题：清洗、长度、扫描之外，agent 写的标题更严（plan 5.1 闸门表、I6）：
+        团队档下标题是唯一不经接受就跨人送到 agent 的自由文本，所以不许有网址、路径和命令片段。"""
+        v = self._text("title", value, required=True)
+        if actor.kind == "agent":
+            hit = unsafe_title(v)
+            if hit:
+                self._audit("title.rejected", actor, "invalid", rule=hit.rule)
+                raise DomainError(
+                    "invalid",
+                    f"agent 写的标题里不能有网址、~/ 或绝对路径、管道或重定向符（| > <）、反引号、$( 或 ${{，"
+                    f"这次是第 {hit.pos + 1} 个字符起的{hit.desc}。标题请用文字描述，"
+                    "网址、路径和命令写进正文（正文要对方本人接受后才会给对方的 agent）。",
+                    status=422,
+                    rule=hit.rule,
+                    pos=hit.pos,
+                )
         return v
 
     def _member(self, handle: str | None, *, what: str = "成员") -> Member:
@@ -405,21 +437,32 @@ class Service:
         return self.envelope(obj.title, obj.raised_by, obj.raised_by_kind, obj.raised_by_client, viewer)
 
     def can_see_content(self, viewer: str, obj: Task | Blocker) -> bool:
-        """本人是作者直接为真；否则要有 acceptance，且版本等于对象当前版本。start、get_item、闸门共用。"""
+        """本人是作者直接为真；否则要有接受过正文的 acceptance，且版本和 sha 都等于对象当前值。
+        start、get_item、闸门共用。只转发过动态（没接受正文）的记录不算。"""
         if obj.author == viewer:
             return True
         acc = self.acceptances.get((viewer, obj.id))
-        return acc is not None and acc.content_version == obj.content_version
+        return (
+            acc is not None
+            and acc.accepted
+            and acc.content_version == obj.content_version
+            and acc.content_sha256 == obj.content_sha256
+        )
 
     def _text_visible(self, viewer: str, ev: Event, obj: Task | Blocker) -> bool:
+        """评论类文字：人写的，接受过正文后都给，只转发过的给到 through 为止；agent 写的只给到 through。"""
         if ev.actor == viewer:
             return True
         acc = self.acceptances.get((viewer, obj.id))
         if acc is None:
             return False
-        if ev.actor_kind == "human":
+        if ev.actor_kind == "human" and acc.accepted:
             return True
         return ev.id <= acc.through_event_id
+
+    def _content_acceptors(self, obj_id: str, me: str) -> list[Acceptance]:
+        """除我之外接受过正文的人（只转发过动态的不算）。"""
+        return [a for (h, s), a in self.acceptances.items() if s == obj_id and h != me and a.accepted]
 
     def _events_view(self, viewer: str, obj: Task | Blocker, limit: int) -> list[dict[str, Any]]:
         evs = [e for e in self.events if e.subject == obj.id and e.type != "commit"]
@@ -457,7 +500,12 @@ class Service:
             t = self.tasks.get(subject)
             return bool(t) and me in (t.assignee, t.created_by, t.assigned_by, t.steward)
         b = self.blockers.get(subject)
-        return bool(b) and me in (b.raised_by, b.needs, b.helper)
+        if not b:
+            return False
+        if me in (b.raised_by, b.helper):
+            return True
+        # agent 的点名只是提议（proposed）：主人确认（asked）之前，被点名的人的增量、fwd、收件箱里都没有它（plan 5.4）
+        return me == b.needs and b.need_state == "asked"
 
     def _relevant_events(self, me: str, after: int) -> list[Event]:
         return [e for e in self.events if e.id > after and e.actor != me and e.type != "commit" and self._related(e.subject, me)]
@@ -704,7 +752,7 @@ class Service:
             dkey, cached = self._dedupe(actor, "create_task", {"title": title, "body": body, "assignee": assignee, "project": project, "urgent": urgent, "parent": parent})
             if cached:
                 return cached
-            title_c = self._text("title", title, required=True)
+            title_c = self._title(actor, title)
             body_c = self._text("body", body)
             target = self._member(assignee, what="成员").handle if assignee else None
             if project and project not in self.projects:
@@ -848,10 +896,9 @@ class Service:
         t.claimed_at = t.claimed_at or now
         self._touch(t)
         self._emit("task.started", t.id, actor)
-        if actor.session and actor.attribution == "exact":
-            s = self.sessions.get((actor.client or "", actor.session))
-            if s and s.handle == actor.handle:
-                s.current_task = t.id
+        s = self._owned_session(actor)
+        if s is not None:
+            s.current_task = t.id
         self._check_task(t)
         return self._claim_summary(t, actor.handle)
 
@@ -881,7 +928,7 @@ class Service:
             if title is not None or body is not None:
                 if t.created_by != me:
                     raise DomainError("not_allowed", f"{t.id} 是 {t.created_by} 发布的，只有发布人可以编辑。可以用 comment 提建议。", id=t.id)
-                others = [a for (h, s), a in self.acceptances.items() if s == t.id and h != me]
+                others = self._content_acceptors(t.id, me)
                 if actor.kind == "agent" and others:
                     raise DomainError(
                         "not_allowed",
@@ -892,7 +939,7 @@ class Service:
                     raise DomainError("invalid", f"{t.id} 已结束，不能编辑。", id=t.id)
                 changed = False
                 if title is not None:
-                    tc = self._text("title", title, required=True)
+                    tc = self._title(actor, title)
                     if tc != t.title:
                         t.title, changed = tc or t.title, True
                 if body is not None:
@@ -938,7 +985,7 @@ class Service:
                 elif status == "canceled":
                     if t.created_by != me:
                         raise DomainError("not_allowed", f"{t.id} 是 {t.created_by} 发布的，只有发布人可以取消。", id=t.id)
-                    others = [a for (h, s), a in self.acceptances.items() if s == t.id and h != me]
+                    others = self._content_acceptors(t.id, me)
                     if actor.kind == "agent" and others:
                         raise DomainError("not_allowed", f"{t.id} 已被 {others[0].handle} 接受过，agent 不能取消；请用户在手机上操作。", id=t.id)
                     if not note_c:
@@ -994,7 +1041,7 @@ class Service:
             dkey, cached = self._dedupe(actor, "report_blocker", {"title": title, "detail": detail, "tried": tried, "task": task, "need": need})
             if cached:
                 return cached
-            title_c = self._text("title", title, required=True)
+            title_c = self._title(actor, title)
             detail_c = self._text("detail", detail)
             tried_c = self._text("tried", tried)
             t = self._task(task) if task else None
@@ -1029,12 +1076,11 @@ class Service:
                 self._notify(needs, "blocker_needs_you", b.id, f"{actor.handle} 请您帮忙看 {b.id}", actor, f"asked:{b.id}")
             if t:
                 self._touch(t)
-            repo = None
-            if actor.session:
-                s = self.sessions.get((actor.client or "", actor.session))
-                repo = s.repo if s else None
+            s = self._owned_session(actor)
+            repo = s.repo if s else None
             result = {
                 "id": b.id,
+                "st": b.status,
                 "need_state": b.need_state,
                 "suggest": self._suggest(actor.handle, project=b.project, exclude=set(), repo=repo),
             }
@@ -1072,67 +1118,136 @@ class Service:
         if actor.kind != "human":
             raise DomainError("human_only", "这个操作只能由本人在手机微信里完成，agent 和命令行都不行。")
 
+    @staticmethod
+    def _need_version(v: Any, sha: Any, seq: Any = 0, *, with_seq: bool = False) -> None:
+        """人类动作必须带上页面渲染时看到的版本（H3）。缺了就是请求不合法，不是冲突。"""
+        missing = [n for n, x in (("v", v), ("sha", sha)) if x is None]
+        if with_seq and seq is None:
+            missing.append("seq")
+        if missing:
+            raise DomainError("invalid", f"缺少 {'、'.join(missing)}：要带上页面上看到的版本，内容被改过时才能发现。")
+
+    def _check_through(self, through: Any, *, required: bool) -> int | None:
+        """through_event_id：页面渲染时的最大事件 ID，不能超过当前最大事件 ID（不能"看见"还没发生的动态）。"""
+        if through is None:
+            if required:
+                raise DomainError("invalid", "缺少 through：要带上页面渲染时最大的动态编号。")
+            return None
+        if not isinstance(through, int) or isinstance(through, bool) or through < 0:
+            raise DomainError("invalid", "through 必须是非负整数。")
+        latest = self.latest_event_id()
+        if through > latest:
+            raise DomainError("invalid", f"through={through} 超过了当前最大的动态编号 {latest}。", latest=latest)
+        return through
+
+    def _version_conflict(self, obj: Task | Blocker, v: int, sha: str, seq: int | None = None) -> None:
+        stale = v != obj.content_version or sha != obj.content_sha256
+        if isinstance(obj, Task) and seq is not None and seq != obj.assign_seq:
+            stale = True
+        if stale:
+            raise DomainError(
+                "conflict",
+                "内容刚被修改，请重新查看。",
+                id=obj.id,
+                v=obj.content_version,
+                seq=obj.assign_seq if isinstance(obj, Task) else None,
+            )
+
+    def page_view(self, raw_id: str) -> dict[str, Any]:
+        """DEV ONLY：模拟手机详情页渲染时表单里带的值（v、sha、seq、through）。"""
+        with self.lock:
+            obj = self._obj(raw_id)
+            out: dict[str, Any] = {
+                "id": obj.id,
+                "v": obj.content_version,
+                "sha": obj.content_sha256,
+                "through": max((e.id for e in self.events if e.subject == obj.id), default=0),
+            }
+            if isinstance(obj, Task):
+                out["seq"] = obj.assign_seq
+            return out
+
     def human_accept(
         self,
         actor: Actor,
         raw_id: str,
-        v: int | None = None,
-        sha: str | None = None,
-        seq: int | None = None,
+        *,
+        v: int | None,
+        sha: str | None,
+        seq: int | None,
         through: int | None = None,
     ) -> dict[str, Any]:
+        """人在手机上点「接受」：v、sha、seq 必填，与当前不一致返回 409（plan 5.3、H3）。"""
         self._require_human(actor)
+        self._need_version(v, sha, seq, with_seq=True)
         with self.lock:
             t = self._task(raw_id)
+            through_c = self._check_through(through, required=False)
             if t.assignee != actor.handle or t.assign_state != "pending" or t.status not in ("open", "in_progress"):
                 raise DomainError("conflict", f"{t.id} 当前不是待您接受的状态（{t.label}）。", id=t.id)
-            if (v is not None and v != t.content_version) or (sha is not None and sha != t.content_sha256) or (
-                seq is not None and seq != t.assign_seq
-            ):
-                raise DomainError("conflict", "内容刚被修改，请重新查看。", id=t.id, v=t.content_version, seq=t.assign_seq)
+            self._version_conflict(t, v, sha, seq)  # type: ignore[arg-type]
             ev = self._emit("task.accepted", t.id, actor, v=t.content_version, seq=t.assign_seq)
             t.assign_state = "accepted"
-            self._write_acceptance(actor, t, through if through is not None else ev.id)
+            self._write_acceptance(actor, t, through_c if through_c is not None else ev.id)
             self._touch(t)
             self._check_task(t)
             if t.assigned_by:
                 self._notify(t.assigned_by, "task_reply", t.id, f"{actor.handle} 接受了 {t.id}", actor, f"accepted:{t.id}:{t.assign_seq}")
             return {"id": t.id, "st": t.label, "v": t.content_version}
 
-    def human_claim(self, actor: Actor, raw_id: str, v: int | None = None) -> dict[str, Any]:
-        """人在手机上点「认领」：同时完成认领和接受当前版本。之后任务是"待开始"，由本人或其 agent 开始。"""
+    def human_claim(
+        self, actor: Actor, raw_id: str, *, v: int | None, sha: str | None, through: int | None = None
+    ) -> dict[str, Any]:
+        """人在手机上点「认领」：同时完成认领和接受当前版本。v、sha 必填，不一致返回 409。
+        之后任务是"待开始"，由本人或其 agent 开始。"""
         self._require_human(actor)
+        self._need_version(v, sha)
         with self.lock:
             t = self._task(raw_id)
-            if v is not None and v != t.content_version:
-                raise DomainError("conflict", "内容刚被修改，请重新查看。", id=t.id, v=t.content_version)
+            through_c = self._check_through(through, required=False)
+            self._version_conflict(t, v, sha)  # type: ignore[arg-type]
             if not self._cas_claim(t, actor):
                 raise self._taken_error(t)
             ev = self._emit("task.claimed", t.id, actor)
-            self._write_acceptance(actor, t, ev.id)
+            self._write_acceptance(actor, t, through_c if through_c is not None else ev.id)
             self._check_task(t)
             return {"id": t.id, "st": t.label, "v": t.content_version}
 
-    def human_forward(self, actor: Actor, raw_id: str, through: int | None = None) -> dict[str, Any]:
-        """「转发给我的 agent」：把 through_event_id 推进到页面渲染时的最大事件 ID。"""
+    def human_forward(self, actor: Actor, raw_id: str, *, through: int | None) -> dict[str, Any]:
+        """「转发给我的 agent」：只把"已看到的动态位置"推进到页面渲染时的最大事件 ID。
+
+        through 必填，不能超过当前最大事件 ID；只增不减。绝不新建或升级正文的 acceptance：
+        没接受过正文的，转发之后 agent 拿到的仍是 withheld。
+        """
         self._require_human(actor)
         with self.lock:
             obj = self._obj(raw_id)
-            max_ev = max((e.id for e in self.events if e.subject == obj.id), default=0)
-            self._write_acceptance(actor, obj, min(through, max_ev) if through is not None else max_ev)
-            self._emit("acceptance.forwarded", obj.id, actor)
-            return {"id": obj.id, "through": self.acceptances[(actor.handle, obj.id)].through_event_id}
+            through_c = self._check_through(through, required=True)
+            assert through_c is not None
+            key = (actor.handle, obj.id)
+            prev = self.acceptances.get(key)
+            if prev is None:
+                self.acceptances[key] = Acceptance(actor.handle, obj.id, None, None, through_c, actor.via, self.now())
+            else:
+                prev.through_event_id = max(prev.through_event_id, through_c)
+            self._emit("acceptance.forwarded", obj.id, actor, through=through_c)
+            return {"id": obj.id, "through": self.acceptances[key].through_event_id}
 
-    def human_help(self, actor: Actor, raw_id: str) -> dict[str, Any]:
-        """人认领困难（帮忙）：WHERE status='open' AND helper IS NULL；同时写 acceptance。"""
+    def human_help(
+        self, actor: Actor, raw_id: str, *, v: int | None, sha: str | None, through: int | None = None
+    ) -> dict[str, Any]:
+        """人认领困难（帮忙）：WHERE status='open' AND helper IS NULL；同时写 acceptance。v、sha 必填，不一致返回 409。"""
         self._require_human(actor)
+        self._need_version(v, sha)
         with self.lock:
             b = self._blocker(raw_id)
+            through_c = self._check_through(through, required=False)
+            self._version_conflict(b, v, sha)  # type: ignore[arg-type]
             if b.status != "open" or b.helper is not None:
                 raise DomainError("taken", f"{b.id} 已经有 {b.helper} 在帮忙了。", id=b.id, by=b.helper)
             b.helper = actor.handle
             ev = self._emit("blocker.helped", b.id, actor)
-            self._write_acceptance(actor, b, ev.id)
+            self._write_acceptance(actor, b, through_c if through_c is not None else ev.id)
             self._notify(b.raised_by, "task_reply", b.id, f"{actor.handle} 来帮忙看 {b.id} 了", actor, f"helped:{b.id}")
             self._touch(b)
             return {"id": b.id, "helper": b.helper}
@@ -1150,6 +1265,7 @@ class Service:
             return {"id": b.id, "need_state": b.need_state}
 
     def _write_acceptance(self, actor: Actor, obj: Task | Blocker, through: int) -> None:
+        """写入"接受了正文"的 acceptance：绑定对象当前的 content_version 和 sha（调用方已在锁内核对过版本）。"""
         prev = self.acceptances.get((actor.handle, obj.id))
         self.acceptances[(actor.handle, obj.id)] = Acceptance(
             actor.handle,
@@ -1188,6 +1304,51 @@ class Service:
         s.last_seen_at = now
         return s
 
+    def resolve_session(
+        self,
+        handle: str,
+        client: str | None,
+        token_id: str | None,
+        raw_sid: str | None,
+        *,
+        source: str,
+        via: str = "mcp",
+    ) -> AgentSession | None:
+        """统一的会话归属（plan 6.5、H7）：请求里自称的会话必须存在、未结束、token_id 与当前 token 相同、
+        client 与 token 的 client 相同，才算精确归属；否则返回 None（降为成员级）并写审计。
+
+        source 只进审计：header（X-Teamflow-Session）、codex_meta（x-codex-turn-metadata.session_id）。
+        """
+        sid = ident_or_hash(str(raw_sid)) if raw_sid else None
+        if not sid:
+            return None
+        with self.lock:
+            s = self.sessions.get((client or "", sid))
+            if s is None:
+                reason = "unknown"
+            elif s.ended_at is not None:
+                reason = "ended"
+            elif s.token_id is None or s.token_id != token_id:
+                reason = "token_mismatch"
+            elif s.client != client:
+                reason = "client_mismatch"
+            elif s.handle != handle:
+                reason = "handle_mismatch"
+            else:
+                return s
+            who = Actor(handle, "agent", client, token_id, via)
+            self._audit("session.resolve", who, "member", reason=reason, source=source, client=client)
+            return None
+
+    def _owned_session(self, actor: Actor) -> AgentSession | None:
+        """写入时再核对一次：actor 带的精确归属会话仍属于这个 token（会话可能在请求途中结束或被换手）。"""
+        if not actor.session or actor.attribution != "exact":
+            return None
+        s = self.sessions.get((actor.client or "", actor.session))
+        if s and s.ended_at is None and s.token_id == actor.token_id and s.client == actor.client and s.handle == actor.handle:
+            return s
+        return None
+
     @staticmethod
     def _sid(d: dict[str, Any]) -> str | None:
         """会话 ID：CLI 发 session_id；也接受 session。标识类字段不匹配白名单的只存哈希。"""
@@ -1221,8 +1382,11 @@ class Service:
         }
 
     def hook_session_start(self, actor: Actor, payload: dict[str, Any]) -> dict[str, Any]:
-        """SessionStart：登记会话，返回结构化快照 + cursor（给后续 /me/delta 用）。不返回成段文字。"""
-        client = self.norm_client(payload.get("client")) or actor.client
+        """SessionStart：登记会话，返回结构化快照 + cursor（给后续 /me/delta 用）。不返回成段文字。
+
+        会话的 client 一律取 token 的 client，请求体里的 client 不作数（防止用一端的 token 登记另一端的会话）。
+        """
+        client = actor.client or self.norm_client(payload.get("client"))
         sid = self._sid(payload)
         if client is None:
             raise DomainError("invalid", "client 只能是 claude、codex 或 cli。")
@@ -1270,12 +1434,14 @@ class Service:
         条目：{"type": turn_end|commit|end|start, "key", "session_id", "client", "ts", ...}
         （也接受旧写法 ev / k / session）。turn_end 可带 commits[{sha,title}]（最多 5 条，只限本人邮箱）
         和 other_commits（他人提交只计数）。
-        返回 results[{key, status, st}]：status 是逐条 HTTP 语义（200 成功、409 重复、422 不合格），st 是枚举。
+        条目里的 client 强制等于 token 的 client；条目指向的会话属于别的 token 时，整条忽略（不记提交、
+        不改会话、end 也不清对方会话的 current_task），写审计，返回 403 ignored。
+        返回 results[{key, status, st}]：status 是逐条 HTTP 语义（200 成功、409 重复、422 不合格、403 忽略），st 是枚举。
         """
         if len(items) > 100:
             raise DomainError("too_many", "一次最多 100 条，请分批发送。", max=100)
         results: list[dict[str, Any]] = []
-        codes = {"ok": 200, "masked": 200, "dup": 409, "bad": 422}
+        codes = {"ok": 200, "masked": 200, "dup": 409, "bad": 422, "ignored": 403}
 
         def res(key: str | None, st: str, err: str | None = None) -> None:
             r: dict[str, Any] = {"key": key, "status": codes[st], "st": st}
@@ -1304,8 +1470,17 @@ class Service:
                 if typ not in self.HOOK_TYPES:
                     res(k, "bad", "type")
                     continue
-                client = self.norm_client(it.get("client")) or actor.client or "cli"
+                claimed_client = self.norm_client(it.get("client"))
+                client = actor.client or claimed_client or "cli"  # 强制等于 token 的 client
+                if claimed_client and claimed_client != client:
+                    self._audit("hook.client_mismatch", actor, "forced", claimed=claimed_client, client=client)
                 sid = self._sid(it)
+                if sid:
+                    owner = self.sessions.get((client, sid))
+                    if owner is not None and owner.token_id != actor.token_id:
+                        self._audit("session.token_mismatch", actor, "ignored", client=client, type=str(typ))
+                        res(k, "ignored", "session")
+                        continue
                 repo = ident_or_hash(it.get("repo"))
                 st = "ok"
                 if typ in ("turn_end", "start"):
@@ -1329,8 +1504,8 @@ class Service:
                 elif typ == "end":
                     if sid:
                         reason = it.get("reason") if isinstance(it.get("reason"), str) and self._REASON.match(it["reason"]) else "other"
-                        self._upsert_session(actor, client, sid, ended_at=now, end_reason=reason)
-                        self._clear_session_task(client, sid)
+                        if self._upsert_session(actor, client, sid, ended_at=now, end_reason=reason) is not None:
+                            self._clear_session_task(client, sid)
                 elif typ == "commit":
                     r = self._hook_commit(actor, repo, it.get("sha"), it.get("title"))
                     if r == "bad":

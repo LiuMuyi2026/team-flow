@@ -2,8 +2,13 @@
 
 - 工具名、描述、server instructions 都是常量，永不拼接用户内容（H8）。
 - tools/list 对所有人相同、顺序固定。
-- 结构化结果用短键；业务错误用 isError，structuredContent 里放 {err, msg, ...}，msg 是可操作的中文。
+- 结构化结果用短键；业务错误用 isError，structuredContent 里放 {err, msg, ...}，msg 是可操作的中文；
+  content 文本以错误码开头（``needs_human：…``），因为出错时模型只看得到 content（S1 实测），
+  instructions 又是按错误码下的指令。
 - 鉴权在 HTTP 层（gateway）完成，这里只从 scope["state"] 读身份。
+- 会话归属统一走 ``Service.resolve_session``（plan 6.5）。
+- 能力宣告只有 tools（两代都不宣告 listChanged、logging、prompts、resources、ui 扩展）；
+  ``server/discover`` 列出两代支持的全部版本。见 server/README.md「已知协议偏差」。
 """
 
 from __future__ import annotations
@@ -16,13 +21,19 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_request
 from fastmcp.tools import ToolResult
 from fastmcp.tools.function_tool import FunctionTool
+import mcp.types as mcp_types
 from mcp.types import ToolAnnotations
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
 
 from . import __version__
-from .errors import DomainError
+from .errors import DomainError, error_text
+from .gateway import CODEX_TURN_KEY, codex_turn_fields
 from .sanitize import ident_or_hash
 from .service import Actor, Service
+
+# 两代都支持的版本，新代在前（与规范示例 ["2026-07-28", "2025-11-25"] 同序：新到旧）
+SUPPORTED_VERSIONS: tuple[str, ...] = (*reversed(MODERN_PROTOCOL_VERSIONS), *reversed(HANDSHAKE_PROTOCOL_VERSIONS))
 
 SERVER_NAME = "teamflow"
 
@@ -88,30 +99,36 @@ class _Tool(FunctionTool):
         return dict(self.meta) if self.meta else None  # type: ignore[return-value]
 
 
-def _attribution(state: dict[str, Any], svc: Service, handle: str, client: str) -> tuple[str | None, str]:
-    """MCP 调用归属（plan 6.5）：Codex 的 _meta x-codex-turn-metadata → exact；X-Teamflow-Session 头 → 会话存在且属于本人时 exact；否则 member。"""
+def codex_turn(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """取出 _meta["x-codex-turn-metadata"]，只留 session_id、thread_id、turn_id（plan 6.5）。"""
+    return codex_turn_fields((meta or {}).get(CODEX_TURN_KEY)) or None
+
+
+def _attribution(state: dict[str, Any], svc: Service, tok: Any) -> tuple[str | None, str, str | None]:
+    """MCP 调用归属（plan 6.5），返回 (会话, exact|member, Codex 子线程)。
+
+    - Codex：用 _meta.x-codex-turn-metadata.session_id 匹配 hooks 登记的会话（hook 输入里的 session_id 来自
+      ``sess.session_id()``，与它相同）；thread_id 只记为子线程，子线程的 thread_id 本来就对不上 hook 会话（m3）。
+    - X-Teamflow-Session 请求头。
+    两者都要经 ``resolve_session`` 校验（存在、未结束、同 token、同 client）；都不成立就是成员级。
+    """
     rpc = state.get("tf_rpc") or {}
-    meta = rpc.get("meta") or {}
-    turn = meta.get("x-codex-turn-metadata")
-    if isinstance(turn, str):
-        try:
-            turn = json.loads(turn)
-        except ValueError:
-            turn = None
-    if isinstance(turn, dict) and (turn.get("thread_id") or turn.get("session_id")):
-        # Codex hook 输入里的 session_id 是 ThreadId，所以优先用 thread_id 对上 hooks 登记的会话
-        return ident_or_hash(str(turn.get("thread_id") or turn.get("session_id"))), "exact"
+    turn = codex_turn(rpc.get("meta"))
+    thread = ident_or_hash(turn.get("thread_id")) if turn and turn.get("thread_id") else None
+    if turn and turn.get("session_id"):
+        s = svc.resolve_session(tok.handle, tok.client, tok.token_id, turn["session_id"], source="codex_meta")
+        if s is not None:
+            return s.external_id, "exact", (thread if thread != s.external_id else None)
     sess = None
     try:
         sess = get_http_request().headers.get("x-teamflow-session")
     except RuntimeError:
         pass
     if sess:
-        sid = ident_or_hash(sess)
-        s = svc.sessions.get((client, sid or ""))
-        if s and s.handle == handle and s.ended_at is None:
-            return sid, "exact"
-    return None, "member"
+        s = svc.resolve_session(tok.handle, tok.client, tok.token_id, sess, source="header")
+        if s is not None:
+            return s.external_id, "exact", thread
+    return None, "member", thread
 
 
 def build_mcp(svc: Service) -> FastMCP:
@@ -123,15 +140,17 @@ def build_mcp(svc: Service) -> FastMCP:
         cache_scope="private",
     )
 
-    def _actor() -> tuple[Actor, dict[str, Any]]:
+    def _actor(write: bool) -> tuple[Actor, dict[str, Any]]:
         req = get_http_request()
         state = req.scope.get("state") or {}
         tok = state.get("tf_ident")
         if tok is None:  # gateway 已经挡掉；这里防御一下
             raise DomainError("not_allowed", "未鉴权。")
-        session, attribution = _attribution(state, svc, tok.handle, tok.client)
+        if not write:  # 读工具不产生事件，不做会话归属（也就不会每次读都写一条审计）
+            return Actor(tok.handle, "agent", tok.client, tok.token_id, "mcp"), state.get("tf_rpc") or {}
+        session, attribution, thread = _attribution(state, svc, tok)
         return (
-            Actor(tok.handle, "agent", tok.client, tok.token_id, "mcp", session, attribution),
+            Actor(tok.handle, "agent", tok.client, tok.token_id, "mcp", session, attribution, thread),
             state.get("tf_rpc") or {},
         )
 
@@ -139,11 +158,11 @@ def build_mcp(svc: Service) -> FastMCP:
         return ToolResult(structured_content=data)
 
     def _err(e: DomainError) -> ToolResult:
-        return ToolResult(content=e.msg, structured_content=e.to_dict(), is_error=True)
+        return ToolResult(content=e.text(), structured_content=e.to_dict(), is_error=True)
 
     def run(tool: str, args: dict[str, Any], fn: Callable[[Actor], dict[str, Any]]) -> ToolResult:
         try:
-            actor, rpc = _actor()
+            actor, rpc = _actor(tool in WRITE_TOOLS)
         except DomainError as e:
             return _err(e)
         call_id = (rpc.get("meta") or {}).get("callId")
@@ -155,7 +174,7 @@ def build_mcp(svc: Service) -> FastMCP:
             if state == "replay" and rec is not None:
                 is_error, payload = rec.response
                 if is_error:
-                    return ToolResult(content=payload.get("msg"), structured_content=payload, is_error=True)
+                    return ToolResult(content=error_text(payload.get("err"), payload.get("msg")), structured_content=payload, is_error=True)
                 return _ok(payload)
             if state == "in_flight":
                 return _err(DomainError("conflict", "同一个 callId 的请求还在处理中，请稍后再查结果。"))
@@ -267,4 +286,34 @@ def build_mcp(svc: Service) -> FastMCP:
                 output_schema=None,
             )
         )
+    _honest_capabilities(mcp)
     return mcp
+
+
+def server_capabilities() -> mcp_types.ServerCapabilities:
+    """两代共用的能力宣告：只有 tools。
+
+    - 不宣告 listChanged：工具清单是常量；旧代无状态 GET 返回 405，没有通知流，宣告了也收不到（m6）。
+    - 不宣告 logging、prompts、resources、completions、experimental、ui 扩展：都没实现，宣告了客户端每次连接
+      会多发 prompts/list、resources/list 两个请求。
+    """
+    return mcp_types.ServerCapabilities(tools=mcp_types.ToolsCapability())
+
+
+def _honest_capabilities(mcp: FastMCP) -> None:
+    """改写 FastMCP 底层 server 的能力宣告和 server/discover（FastMCP 4.0.10 没有公开的开关）。"""
+    low = mcp._mcp_server
+
+    def get_capabilities(*_args: Any, **_kwargs: Any) -> mcp_types.ServerCapabilities:
+        return server_capabilities()
+
+    low.get_capabilities = get_capabilities  # type: ignore[method-assign]
+
+    async def discover(_ctx: Any, _params: Any) -> mcp_types.DiscoverResult:
+        return mcp_types.DiscoverResult(
+            supported_versions=list(SUPPORTED_VERSIONS),
+            capabilities=server_capabilities(),
+            instructions=low.instructions,
+        )
+
+    low.add_request_handler("server/discover", mcp_types.RequestParams, discover)

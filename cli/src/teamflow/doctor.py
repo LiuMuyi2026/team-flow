@@ -9,19 +9,38 @@ import sys
 from teamflow import common, setup_cmd, spool
 
 
+RED = "\033[31m"
+RESET = "\033[0m"
+
+
+def _color_ok(stream) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return stream.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 class Report:
-    def __init__(self):
+    def __init__(self, out=None):
         self.failed = 0
+        self.out = out or sys.stdout
+        self.color = _color_ok(self.out)
+
+    def _p(self, line):
+        self.out.write(line + "\n")
 
     def ok(self, name, detail=""):
-        print("通过  %s%s" % (name, "：" + detail if detail else ""))
+        self._p("通过  %s%s" % (name, "：" + detail if detail else ""))
 
     def fail(self, name, fix):
         self.failed += 1
-        print("失败  %s\n      修复：%s" % (name, fix))
+        tag = RED + "失败" + RESET if self.color else "失败"
+        self._p("%s  %s\n      修复：%s" % (tag, name, fix))
 
     def info(self, name, detail):
-        print("提示  %s：%s" % (name, detail))
+        self._p("提示  %s：%s" % (name, detail))
 
 
 def _version(cmd):
@@ -43,6 +62,54 @@ def _shell_quiet(shell, flag):
     return out.stdout, None
 
 
+def _handler_cmd(h):
+    """一个 hook handler 的命令串：Claude Code exec form 是 (command, args)，Codex 是 command 字符串。"""
+    if not isinstance(h, dict):
+        return None
+    args = h.get("args")
+    return (h.get("command"), tuple(args) if isinstance(args, list) else None)
+
+
+def _check_group(r: Report, who: str, event: str, arr, want: dict, fix: str):
+    """检查「存在且命令串一致」；不要求在数组末尾（setup 原地替换，不挪位置）。"""
+    arr = arr if isinstance(arr, list) else []
+    ours = [g for g in arr if setup_cmd._is_teamflow_group(g)]
+    name = "%s %s hook" % (who, event)
+    if not ours:
+        r.fail(name, "没有 teamflow 的 hook；" + fix)
+        return
+    if len(ours) > 1:
+        r.fail(name, "有 %d 组 teamflow hook，会重复执行；%s" % (len(ours), fix))
+        return
+    have = [_handler_cmd(h) for h in ours[0].get("hooks") or []]
+    if have != [_handler_cmd(h) for h in want["hooks"]]:
+        r.fail(name + " 命令串", "与本机安装不一致；" + fix)
+        return
+    r.ok(name)
+
+
+def check_sandbox(r: Report, settings, platform: str | None = None, which=shutil.which):
+    """S6：Linux / WSL2 上沙箱靠 bubblewrap 和 socat；缺了 Claude Code 只警告一声就不带沙箱运行，
+    sandbox.credentials 的凭据屏蔽也就不生效（cc-sandboxing.md「Set up Linux and WSL2」）。"""
+    platform = sys.platform if platform is None else platform
+    sb = settings.get("sandbox") if isinstance(settings, dict) else None
+    if not (isinstance(sb, dict) and sb.get("enabled") is True):
+        r.info("Claude Code 沙箱", "没有开启；凭据文件只靠 deny 规则保护，而 deny 规则拦不住换个写法的命令")
+        return
+    if not platform.startswith("linux"):
+        r.ok("Claude Code 沙箱", "已开启（%s 不需要额外依赖）" % platform)
+        return
+    missing = [name for name in ("bwrap", "socat") if not which(name)]
+    if missing:
+        r.fail(
+            "Claude Code 沙箱依赖：缺少 %s" % "、".join(missing),
+            "沙箱不会生效，凭据保护等于没有（Claude Code 只提示一句就不带沙箱运行命令）。"
+            "安装：sudo apt-get install bubblewrap socat（Fedora：sudo dnf install bubblewrap socat），然后重启 Claude Code",
+        )
+    else:
+        r.ok("Claude Code 沙箱依赖", "bwrap、socat 都在")
+
+
 def check_claude(r: Report, paths: setup_cmd.Paths, bin_path: str):
     s = common.read_json(paths.claude_settings)
     if not isinstance(s, dict):
@@ -51,14 +118,8 @@ def check_claude(r: Report, paths: setup_cmd.Paths, bin_path: str):
     want = setup_cmd.claude_hook_groups(bin_path, paths.cred)
     hooks = s.get("hooks") if isinstance(s.get("hooks"), dict) else {}
     for event, grp in want.items():
-        arr = hooks.get(event) if isinstance(hooks.get(event), list) else []
-        ours = [g for g in arr if setup_cmd._is_teamflow_group(g)]
-        if not ours:
-            r.fail("Claude Code %s hook" % event, "运行 teamflow setup 重新写入")
-        elif ours[-1] != grp:
-            r.fail("Claude Code %s hook 命令串" % event, "与安装记录不一致，运行 teamflow setup 重新写入")
-        else:
-            r.ok("Claude Code %s hook" % event)
+        _check_group(r, "Claude Code", event, hooks.get(event), grp, "运行 teamflow setup 重新写入")
+    check_sandbox(r, s)
     allow = (s.get("permissions") or {}).get("allow") or []
     if setup_cmd.MCP_ALLOW in allow:
         r.ok("Claude Code 允许 mcp__teamflow__*")
@@ -109,13 +170,7 @@ def check_codex(r: Report, paths: setup_cmd.Paths, bin_path: str):
     want = setup_cmd.codex_hook_groups(bin_path, paths.cred)
     hooks = hj.get("hooks") if isinstance(hj.get("hooks"), dict) else {}
     for event, grp in want.items():
-        arr = hooks.get(event) if isinstance(hooks.get(event), list) else []
-        if arr and arr[-1] == grp:
-            r.ok("Codex %s hook（在数组末尾）" % event)
-        elif any(setup_cmd._is_teamflow_group(g) for g in arr):
-            r.fail("Codex %s hook" % event, "命令串不一致或不在数组末尾，运行 teamflow setup 后在 /hooks 重新信任")
-        else:
-            r.fail("Codex %s hook" % event, "运行 teamflow setup")
+        _check_group(r, "Codex", event, hooks.get(event), grp, "运行 teamflow setup，然后在 Codex 的 /hooks 重新信任")
     r.info("Codex 信任状态", "doctor 不读 Codex 的信任记录；请在 Codex 的 /hooks 确认 4 条 teamflow hook 都是 Trusted")
     if os.path.isdir(os.path.join(os.getcwd(), ".codex")):
         r.info("仓库级 .codex", "交互会话里仓库级 hooks 可能不触发（openai/codex#17532），teamflow 只装用户级")
@@ -183,6 +238,6 @@ def run(ns) -> int:
         r.fail("dead-letter %d 条" % c["dead"], "查看 %s 和日志 %s" % (os.path.join(spool.spool_dir(), "dead"), os.path.join(common.state_dir(), "log")))
     else:
         r.ok("dead-letter 0 条")
-    print("\n%s" % ("全部通过" if not r.failed else "%d 项失败" % r.failed))
+    r._p("\n%s" % ("全部通过" if not r.failed else "%d 项失败" % r.failed))
     sys.stdout.flush()
     return 0 if not r.failed else 1

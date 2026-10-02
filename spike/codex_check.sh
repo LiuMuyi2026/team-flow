@@ -2,7 +2,7 @@
 # M0 S2（Codex 部分）：成员在自己电脑上跑的自检脚本。
 #
 # 检查四件事：
-#   1. ~/.codex/hooks.json 里 4 条 teamflow hook 都在、在各事件数组末尾、命令串与 teamflow setup 生成的一致；
+#   1. ~/.codex/hooks.json 里 4 条 teamflow hook 都在、每个事件只有一组（位置不限，setup 原地替换）、命令串与 setup 生成的一致；
 #   2. ~/.codex/config.toml 的 [hooks.state] 里这 4 条都有 trusted_hash（即在 /hooks 里信任过）；
 #   3. $SHELL -c / -lc 的 stdout 为空（Codex 用会话 shell -c 跑 hook，没有会话 shell 时退回 $SHELL -lc）；
 #   4. 在临时 git 目录里跑一次 `codex exec --json`：模型能复述 teamflow 注入的第一行；hook 登记的会话
@@ -154,7 +154,11 @@ else:
             continue
         gi, hi, h = idx[-1]
         found[ev] = (gi, hi, h, label)
-        rep(gi == len(arr) - 1, "%s 的 teamflow 组在数组末尾" % ev, "第 %d/%d 组" % (gi + 1, len(arr)))
+        # 不要求在末尾（M0 评审 I7）：setup 已有组就原地替换、不挪位置，因为 Codex 的信任键带组序号；只要求只有一组
+        groups = sorted({g for g, _, _ in idx})
+        rep(len(groups) == 1, "%s 只有一组 teamflow hook" % ev,
+            ("第 %d/%d 组（位置不限）" % (gi + 1, len(arr))) if len(groups) == 1 else
+            ("有 %d 组（第 %s 组），会重复执行；重跑 teamflow setup 会合并成一组" % (len(groups), "、".join(str(g + 1) for g in groups))))
         want = setup_cmd.codex_hook_command(tf, sub, cred)
         same = h.get("command") == want
         rep(same if same else None, "%s 命令串与本机 teamflow setup 生成的一致" % ev,

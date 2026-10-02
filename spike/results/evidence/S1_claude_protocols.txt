@@ -1,0 +1,32 @@
+# S1 Claude Code 2.1.287 嵌套 claude -p，服务端 M0 原型（端口 8191）。原始文件在 spike/out/s136/（不进 git）。
+# token 已替换为 tf_pat_<redacted>；会话 1a6941c0-… 是外层容器会话（S3 的继承问题，见 S3_helper_env.txt）。
+## 每次运行服务端收到的全部请求（spike/out/s136/<label>.server.jsonl，节选键）
+[s1_default] 默认设置：6 条，状态码 [200]
+  {"m": "POST", "path": "/mcp/", "rpc": "server/discover", "pv": "2026-07-28", "route": "modern", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "inbox", "pv": "2026-07-28", "route": "modern", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "list_tasks", "pv": "2026-07-28", "route": "modern", "st": 200}
+[s1_legacy] MCP_PROTOCOL_NEGOTIATION=legacy：8 条，状态码 [200, 202, 405]
+  {"m": "POST", "path": "/mcp/", "rpc": "initialize", "pv": "2025-11-25", "route": "legacy", "st": 200}
+  {"m": "GET", "path": "/mcp/", "st": 405}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "inbox", "pv": "2025-11-25", "route": "legacy", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "list_tasks", "pv": "2025-11-25", "route": "legacy", "st": 200}
+[s1_v1] MCP_SDK_GENERATION=v1：8 条，状态码 [200, 202, 405]
+  {"m": "POST", "path": "/mcp/", "rpc": "initialize", "pv": "2025-11-25", "route": "legacy", "st": 200}
+  {"m": "GET", "path": "/mcp/", "st": 405}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "inbox", "pv": "2025-11-25", "route": "legacy", "st": 200}
+  {"m": "POST", "path": "/mcp/", "rpc": "tools/call", "tool": "list_tasks", "pv": "2025-11-25", "route": "legacy", "st": 200}
+[s1_noslash] URL 不带尾斜杠：6 条，状态码 [200]
+  {"m": "POST", "path": "/mcp", "rewritten": "/mcp/", "rpc": "server/discover", "pv": "2026-07-28", "route": "modern", "st": 200}
+  {"m": "POST", "path": "/mcp", "rewritten": "/mcp/", "rpc": "tools/call", "tool": "inbox", "pv": "2026-07-28", "route": "modern", "st": 200}
+  {"m": "POST", "path": "/mcp", "rewritten": "/mcp/", "rpc": "tools/call", "tool": "list_tasks", "pv": "2026-07-28", "route": "modern", "st": 200}
+## 审批：不配 allow 规则（s1_noallow.summary.txt）
+  RESULT subtype= success is_error= False num_turns= 2 permission_denials= [{'tool_name': 'mcp__teamflow__inbox', 'tool_use_id': 'toolu_016eqrRngWTRiwfU5PZWwgzq', 'tool_input': {}}]
+## 写工具不审批 + isError 只给 content（s1_write.summary.txt，修复前：content 没有错误码）
+  TOOL_RESULT is_error= True content= "T-51 是 bob 发布的，认领就是承诺，需要您本人决定。已发到您的微信，请在手机上点「认领」；认领后再调用 claim_task 开始。"
+  RESULT subtype= success is_error= False num_turns= 4 permission_denials= []
+## structuredContent 可见性（stdio 探针 s1_probe_auto.summary.txt）
+  探针（spike/cc_probe/probe_sc.py）：成功时 content=CONTENT-MARK-*、structuredContent=STRUCT-MARK-*；出错时 content=ERRTEXT-5521、structuredContent=STRUCTERR-8813
+  TOOL_RESULT is_error= None content= [{"type": "tool_reference", "tool_name": "mcp__probe__probe_plain"}, {"type": "tool_reference", "tool_name": "mcp__probe__probe_schema"}, {"type": "tool_reference",
+  TOOL_RESULT is_error= None content= "{\"marker\":\"STRUCT-MARK-4409\"}"
+  TOOL_RESULT is_error= None content= "{\"marker\":\"STRUCT-MARK-3318\"}"
+  TOOL_RESULT is_error= True content= "ERRTEXT-5521"

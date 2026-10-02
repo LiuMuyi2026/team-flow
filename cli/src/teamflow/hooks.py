@@ -3,7 +3,8 @@
 规则（plan 6.4）：
 - 永远 fail-open：任何异常都不输出、exit 0，错误写进状态目录的 log。
 - 输出只由 inbox.py 的常量模板生成；Claude Code 用固定形状 JSON，Codex 用纯文本（首行是哨兵）。
-- prompt 完全忽略 prompt 字段、永不联网；stop / session-end 只写本地 spool，再拉起分离的 flush。
+- prompt 完全忽略 prompt 字段、永不联网、永不拉起子进程（缓存由 Stop 每回合拉起的 flush --refresh 刷新）；
+  stop / session-end 只写本地 spool，再拉起分离的 flush。
 - 不上传 transcript_path、prompt、last_assistant_message、工具入参。
 """
 
@@ -24,7 +25,6 @@ END_REASONS = ("clear", "resume", "logout", "prompt_input_exit", "other")
 STDIN_MAX = 16 * 1024 * 1024
 SESSION_START_HTTP_TIMEOUT = 1.0
 CACHE_MAX_AGE = 24 * 3600
-CACHE_STALE = 60
 PROMPT_MIN_INTERVAL = 600
 SESSION_STATE_TTL = 7 * 24 * 3600
 _SID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:")
@@ -71,10 +71,8 @@ def emit(client: str, event: str, text: str | None) -> None:
     if not text:
         return
     if client == "claude":
-        out = common.dumps(
-            {"hookSpecificOutput": {"hookEventName": EVENT_NAMES[event], "additionalContext": text}},
-            separators=(", ", ": "),
-        )
+        # 手写的 common.dumps，不导入 json（UserPromptSubmit 输出路径也要守住 30ms）
+        out = common.dumps({"hookSpecificOutput": {"hookEventName": EVENT_NAMES[event], "additionalContext": text}})
     else:
         out = text
     data = out.encode("utf-8")
@@ -261,38 +259,22 @@ def _version():
 # ---------------------------------------------------------------- prompt
 
 
-def _maybe_spawn_refresh(slug, client, cred):
-    from teamflow import spool
-
-    marker = spool.cache_path(slug, client) + ".spawned"
-    try:
-        if time.time() - os.stat(marker).st_mtime < CACHE_STALE:
-            return
-    except OSError:
-        pass
-    try:
-        common.ensure_dir(os.path.dirname(marker))
-        with open(marker, "w"):
-            pass
-    except OSError:
-        return
-    _spawn_flush(client, cred, slug, refresh=True)
-
-
 def prompt(payload: dict, client: str, cred: str) -> None:
-    """只读本地缓存，永不联网；prompt 字段在 read_stdin 里就已丢弃。"""
-    from teamflow import inbox, spool
+    """只读本地缓存：永不联网，也永不拉起子进程（M0 复测：缓存过期时拉起 refresh 让 p95 到了约 70ms）。
+
+    缓存由 Stop 每回合拉起的 `flush --refresh` 和 SessionStart 刷新，这里读到的最多旧一个回合。
+    prompt 字段在 read_stdin 里就已丢弃。
+    """
+    from teamflow import inbox  # 不导入 spool：缓存路径在 common 里
 
     sid = valid_sid(payload.get("session_id"))
     cwd = _cwd(payload)
     creds = common.load_creds(cred)
     st = load_state(client, sid)
     slug, _ = _pick_ws(creds, st, cwd)
-    cache = common.read_json(spool.cache_path(slug, client))
+    cache = common.read_json(common.cache_path(slug, client))
     now = time.time()
     fetched = float(cache.get("fetched_at") or 0) if isinstance(cache, dict) else 0
-    if now - fetched > CACHE_STALE:
-        _maybe_spawn_refresh(slug, client, cred)
     if not isinstance(cache, dict) or not isinstance(cache.get("data"), dict) or now - fetched > CACHE_MAX_AGE:
         return
     keys = inbox.need_me_keys(inbox.validate(cache["data"]))

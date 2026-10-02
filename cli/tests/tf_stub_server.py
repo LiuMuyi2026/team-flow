@@ -28,6 +28,7 @@ class Stub:
         self.inbox = json.loads(json.dumps(SAMPLE_INBOX))
         self.delay = 0.0
         self.status = {}  # path → 强制返回的状态码
+        self.reply = {}  # path → (状态码, 响应体对象或 bytes)：完全自定义响应
         self.item_status = {}  # spool key → 逐条状态码
         self.requests = []
         self.etag = "W/\"1\""
@@ -58,7 +59,10 @@ class Stub:
                     return raw
 
             def _send(self, code, obj=None, headers=None):
-                data = b"" if obj is None else json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                if isinstance(obj, bytes):
+                    data = obj
+                else:
+                    data = b"" if obj is None else json.dumps(obj, ensure_ascii=False).encode("utf-8")
                 self.send_response(code)
                 for k, v in (headers or {}).items():
                     self.send_header(k, v)
@@ -82,6 +86,15 @@ class Stub:
                     time.sleep(stub.delay)
                 if path in stub.status:
                     return self._send(stub.status[path], {"error": "forced"})
+                if path in stub.reply:
+                    code, obj = stub.reply[path]
+                    return self._send(code, obj)
+                # 兜底写命令（跨包约定）：POST /api/v1/tasks/{id}:note|done、POST /api/v1/blockers
+                if method == "POST" and path.startswith("/api/v1/tasks/") and path.rsplit(":", 1)[-1] in ("note", "done"):
+                    tid, action = path[len("/api/v1/tasks/"):].rsplit(":", 1)
+                    return self._send(200, {"id": tid, "st": "doing" if action == "note" else "done"})
+                if method == "POST" and path == "/api/v1/blockers":
+                    return self._send(201, {"id": "B-9", "st": "proposed" if (body or {}).get("need") else "open"})
                 if method == "POST" and path == "/api/v1/hooks/session-start":
                     return self._send(200, stub.inbox)
                 if method == "POST" and path == "/api/v1/hooks/batch":
